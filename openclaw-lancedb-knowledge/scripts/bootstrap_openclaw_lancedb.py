@@ -26,6 +26,34 @@ def copytree(src: Path, dst: Path, overwrite: bool) -> None:
             shutil.copy2(item, target)
 
 
+SAFE_INSTALL_ENV_KEYS = (
+    "HOME",
+    "PATH",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+)
+
+
+def install_dependencies(target: Path, allow_package_scripts: bool = False) -> list[str]:
+    """Run a fixed npm install contract without a shell or dynamic arguments."""
+    npm_bin = shutil.which("npm")
+    if not npm_bin:
+        raise SystemExit("npm executable not found on PATH; dependencies were not installed.")
+    command = [str(Path(npm_bin).resolve()), "ci"]
+    env = {key: os.environ[key] for key in SAFE_INSTALL_ENV_KEYS if os.environ.get(key)}
+    if not allow_package_scripts:
+        command.append("--ignore-scripts")
+        env["npm_config_ignore_scripts"] = "true"
+    subprocess.run(command, cwd=target, check=True, shell=False, env=env)
+    return command
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create an OpenClaw-friendly LanceDB knowledge index project.")
     parser.add_argument("--target", default="~/.openclaw/workspace/knowledge-lancedb", help="Install target directory")
@@ -36,9 +64,12 @@ def main() -> int:
     parser.add_argument("--google-gemini", action="store_true", help="Use Google Gemini embeddings instead of local hash embeddings")
     parser.add_argument("--embedding-profile", choices=["balanced", "high-quality"], default="balanced", help="Balanced uses 768 Gemini dimensions; high-quality uses 3072 and requires a full rebuild")
     parser.add_argument("--approved-by", default="", help="Required note when enabling external embeddings")
-    parser.add_argument("--npm-install", action="store_true", help="Run npm install after copying files")
+    parser.add_argument("--npm-install", action="store_true", help="Run npm ci --ignore-scripts after copying files")
+    parser.add_argument("--allow-package-scripts", action="store_true", help="Explicitly allow npm lifecycle scripts; requires --npm-install and dependency review")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing template files in target")
     args = parser.parse_args()
+    if args.allow_package_scripts and not args.npm_install:
+        raise SystemExit("--allow-package-scripts requires --npm-install.")
 
     skill_dir = Path(__file__).resolve().parents[1]
     template = skill_dir / "assets" / "knowledge-lancedb-template"
@@ -90,16 +121,18 @@ def main() -> int:
 
     (target / "config" / "source-map.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
 
+    install_command = None
     if args.npm_install:
-        subprocess.run(["npm", "install"], cwd=target, check=True)
+        install_command = install_dependencies(target, args.allow_package_scripts)
 
     print(json.dumps({
         "ok": True,
         "target": str(target),
         "config": str(target / "config" / "source-map.json"),
+        "install_command": install_command,
         "next": [
             "cd " + str(target),
-            "npm install" if not args.npm_install else "npm test",
+            "npm ci --ignore-scripts" if not args.npm_install else "npm test",
             "npm run scan",
             "npm run index",
             "npm run search -- \"project status\" -- --limit 5",

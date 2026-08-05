@@ -21,9 +21,20 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: openclaw-lancedb-knowledge/assets/knowledge-lancedb-template/package-lock.json
-      - run: npm ci
+      - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm run postrun:check
       - name: Validate bootstrap script
         working-directory: .
-        run: python3 -m py_compile openclaw-lancedb-knowledge/scripts/bootstrap_openclaw_lancedb.py
+        run: python3 -m py_compile openclaw-lancedb-knowledge/scripts/bootstrap_openclaw_lancedb.py tests/test_bootstrap_security.py tests/test_skill_archive.py scripts/check_dangerous_exec.py scripts/build_skill_archive.py
+      - name: Test bootstrap execution boundary
+        working-directory: .
+        run: python3 tests/test_bootstrap_security.py
+      - name: Scan production execution surface
+        working-directory: .
+        run: python3 scripts/check_dangerous_exec.py
+      - name: Verify packaged skill matches source
+        working-directory: .
+        run: |
+          python3 tests/test_skill_archive.py
+          python3 scripts/build_skill_archive.py --check

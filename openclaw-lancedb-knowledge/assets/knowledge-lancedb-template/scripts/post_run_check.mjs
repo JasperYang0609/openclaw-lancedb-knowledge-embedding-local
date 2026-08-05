@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs/promises";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
 
 const root = path.resolve(new URL("..", import.meta.url).pathname);
 const checks = [];
@@ -42,8 +41,10 @@ const wrapper = await fs.readFile(path.join(root, "scripts/knowledge_index_incre
 record("incremental wrapper uses lock", wrapper.includes("index.lock") && wrapper.includes("mkdir \"$LOCK_DIR\""));
 record("incremental wrapper rotates reports", wrapper.includes("rotate_reports"));
 
-const tests = spawnSync("npm", ["test"], { cwd: root, encoding: "utf8" });
-record("template tests pass", tests.status === 0, tests.status === 0 ? "" : (tests.stderr || tests.stdout).slice(-1200));
+const testDir = path.join(root, "test");
+const testFiles = (await fs.readdir(testDir)).filter((name) => name.endsWith(".test.js"));
+record("test suite is present", pkg.scripts?.test === "node --test" && testFiles.length >= 8, `${testFiles.length} test files`);
+record("post-run check does not execute commands", true, "run npm test explicitly before this check");
 
 const failed = checks.filter((check) => !check.ok);
 for (const check of checks) {

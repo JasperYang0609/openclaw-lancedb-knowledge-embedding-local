@@ -28,6 +28,7 @@ https://github.com/JasperYang0609/openclaw-lancedb-knowledge-skill/raw/main/dist
 - Secret redaction before embedding/indexing, covering common API keys, cloud/chat platform tokens, PEM blocks, URL credentials, and Chinese credential labels
 - Incremental indexing and cron wrapper, with embedding-cache compaction and report/log rotation
 - Source-map examples for memory, backup summaries, project docs, and Obsidian-style vaults
+- Supply-chain-safe bootstrap: fixed `npm ci --ignore-scripts` by default, explicit lifecycle-script opt-in, and a non-executing post-run checker
 
 ## Quality and safety defaults
 

@@ -36,7 +36,7 @@ Design every client-facing instruction so a general LLM can follow it without kn
 2. **Bootstrap or inspect the project.** Use `scripts/bootstrap_openclaw_lancedb.py` for a new install, or inspect an existing `knowledge-lancedb/` folder.
 3. **Edit `config/source-map.json`.** Prefer summary/project/handoff markdown first; add raw chat or code only when needed.
 4. **Choose a quality profile.** Keep Gemini at `balanced`/768 unless a benchmark justifies the opt-in 3072-dimensional `high-quality` profile. Changing dimensions requires a full rebuild.
-5. **Run gates.** Run `npm install`, `npm test`, `npm run scan`, then `npm run index` or `npm run incremental`.
+5. **Run gates.** Run `npm ci --ignore-scripts`, `npm test`, `npm run scan`, then `npm run index` or `npm run incremental`.
 6. **Benchmark retrieval.** Maintain 20–50 source-grounded queries and run the release gate before adopting a quality change.
 7. **Use AI enrichment only as an optional second layer.** Deterministic fields remain authoritative; validate JSONL output and review low-confidence rows.
 8. **Search before answering historical/project-state questions.** Use project filters when possible and cite source paths in the answer.
@@ -55,6 +55,8 @@ python3 scripts/bootstrap_openclaw_lancedb.py \
   --project-name ClientProject \
   --npm-install
 ```
+
+`--npm-install` uses a fixed `npm ci --ignore-scripts` command and never invokes a shell. Only add `--allow-package-scripts` after reviewing the lockfile and dependency lifecycle scripts; that flag requires `--npm-install`. Run `npm test` explicitly before `npm run postrun:check` because the post-run check is intentionally non-executing.
 
 Use local-only embeddings by default. To enable Google Gemini embeddings:
 
