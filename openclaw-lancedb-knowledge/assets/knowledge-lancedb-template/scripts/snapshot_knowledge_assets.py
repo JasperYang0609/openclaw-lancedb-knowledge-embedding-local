@@ -6,9 +6,10 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -35,6 +36,7 @@ OPTIONAL_PATHS = (
 
 MANIFEST_NAME = "snapshot-manifest.json"
 CHECKSUM_NAME = "CHECKSUMS.sha256"
+DAILY_SNAPSHOT_RE = re.compile(r"^daily-(\d{4}-\d{2}-\d{2})$")
 
 
 def sha256(path: Path) -> str:
@@ -169,6 +171,56 @@ def create_snapshot(project: Path, backup_root: Path, snapshot_name: str) -> dic
     return {"ok": True, "created": True, **verification, "missingOptional": manifest["missingOptional"]}
 
 
+def prune_daily_snapshots(backup_root: Path, retention_days: int, reference_day: date) -> dict:
+    if retention_days < 1:
+        raise SystemExit("--retention-days must be at least 1")
+
+    snapshots_root = (backup_root / "snapshots").resolve()
+    cutoff = reference_day - timedelta(days=retention_days - 1)
+    removed: list[str] = []
+    retained: list[str] = []
+    ignored: list[str] = []
+
+    if not snapshots_root.exists():
+        return {
+            "retentionDays": retention_days,
+            "referenceDate": reference_day.isoformat(),
+            "cutoffDate": cutoff.isoformat(),
+            "removed": removed,
+            "retained": retained,
+            "ignored": ignored,
+        }
+
+    if snapshots_root.is_symlink() or not snapshots_root.is_dir():
+        raise SystemExit(f"Snapshot root must be a real directory: {snapshots_root}")
+
+    for candidate in sorted(snapshots_root.iterdir()):
+        match = DAILY_SNAPSHOT_RE.fullmatch(candidate.name)
+        if not match:
+            ignored.append(candidate.name)
+            continue
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise SystemExit(f"Daily snapshot must be a real directory: {candidate}")
+        snapshot_day = date.fromisoformat(match.group(1))
+        if snapshot_day < cutoff:
+            resolved = candidate.resolve()
+            if resolved.parent != snapshots_root:
+                raise SystemExit(f"Refusing to prune outside snapshot root: {resolved}")
+            shutil.rmtree(resolved)
+            removed.append(candidate.name)
+        else:
+            retained.append(candidate.name)
+
+    return {
+        "retentionDays": retention_days,
+        "referenceDate": reference_day.isoformat(),
+        "cutoffDate": cutoff.isoformat(),
+        "removed": removed,
+        "retained": retained,
+        "ignored": ignored,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Snapshot LanceDB, index state, embedding cache, metadata/tag rules, and restore config with SHA-256 verification."
@@ -177,10 +229,25 @@ def main() -> int:
     parser.add_argument("--backup-root", help="Backup root that will contain snapshots/<name>")
     parser.add_argument("--snapshot-name", default=date.today().isoformat())
     parser.add_argument("--verify-snapshot", help="Verify an existing snapshot instead of creating one")
+    parser.add_argument(
+        "--retention-days",
+        type=int,
+        help="After a successful create or verify, remove only daily-YYYY-MM-DD snapshots outside this rolling window",
+    )
+    parser.add_argument(
+        "--retention-reference-date",
+        help="Reference date for retention in YYYY-MM-DD format; defaults to the local calendar date",
+    )
     args = parser.parse_args()
 
+    reference_day = date.fromisoformat(args.retention_reference_date) if args.retention_reference_date else date.today()
+
     if args.verify_snapshot:
-        print(json.dumps(verify_snapshot(Path(args.verify_snapshot).expanduser().resolve()), ensure_ascii=False, indent=2))
+        snapshot = Path(args.verify_snapshot).expanduser().resolve()
+        result = verify_snapshot(snapshot)
+        if args.retention_days is not None:
+            result["retention"] = prune_daily_snapshots(snapshot.parent.parent, args.retention_days, reference_day)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if not args.backup_root:
         parser.error("--backup-root is required when creating a snapshot")
@@ -189,6 +256,12 @@ def main() -> int:
         Path(args.backup_root).expanduser().resolve(),
         args.snapshot_name,
     )
+    if args.retention_days is not None:
+        result["retention"] = prune_daily_snapshots(
+            Path(args.backup_root).expanduser().resolve(),
+            args.retention_days,
+            reference_day,
+        )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

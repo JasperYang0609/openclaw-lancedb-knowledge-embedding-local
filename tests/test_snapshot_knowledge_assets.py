@@ -53,6 +53,29 @@ def main() -> None:
         assert verify.returncode == 0, verify.stderr
         assert json.loads(verify.stdout)["ok"] is True
 
+        snapshots_root = backup / "snapshots"
+        for name in (
+            "daily-2026-01-01",
+            "daily-2026-01-02",
+            "daily-2026-01-30",
+            "daily-2026-01-31",
+            "manual-2026-01-01",
+        ):
+            (snapshots_root / name).mkdir()
+        retained = run(
+            "--verify-snapshot", str(snapshot),
+            "--retention-days", "30",
+            "--retention-reference-date", "2026-01-31",
+        )
+        assert retained.returncode == 0, retained.stderr
+        retention = json.loads(retained.stdout)["retention"]
+        assert retention["cutoffDate"] == "2026-01-02"
+        assert retention["removed"] == ["daily-2026-01-01"]
+        assert (snapshots_root / "daily-2026-01-02").is_dir()
+        assert (snapshots_root / "daily-2026-01-30").is_dir()
+        assert (snapshots_root / "daily-2026-01-31").is_dir()
+        assert (snapshots_root / "manual-2026-01-01").is_dir()
+
         (snapshot / "src/metadata.js").write_text("tampered\n", encoding="utf-8")
         verify = run("--verify-snapshot", str(snapshot))
         assert verify.returncode != 0

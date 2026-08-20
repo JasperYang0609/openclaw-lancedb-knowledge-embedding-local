@@ -30,6 +30,7 @@ https://github.com/JasperYang0609/openclaw-lancedb-knowledge-skill/raw/main/dist
 - Source-map examples for memory, backup summaries, opt-in Discord raw history, project docs, and Obsidian-style vaults
 - A read-only exact coverage audit for source chunks, metadata/tags, and embedding identity
 - Checksummed restore snapshots containing LanceDB, index state, embedding cache, tag rules, enrichment, and config
+- Safe rolling retention for daily snapshots; manual snapshots are never pruned
 - Supply-chain-safe bootstrap: fixed `npm ci --ignore-scripts` by default, explicit lifecycle-script opt-in, and a non-executing post-run checker
 
 ## Quality and safety defaults

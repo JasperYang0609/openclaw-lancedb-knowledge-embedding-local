@@ -108,6 +108,8 @@ A partial `index --project NAME --append` or `index --limit N --append` run merg
 
 `npm run snapshot:backup -- --backup-root <PATH>` creates a checksummed restore set containing the LanceDB table, index state, embedding cache, validated enrichment when present, source-map config, deterministic tag/security rules, package lock, and latest manifests. The snapshot is staged and verified before publication. Existing snapshot names are never overwritten; choose a new `--snapshot-name` for another run on the same date.
 
+Daily deployments should name snapshots `daily-YYYY-MM-DD` and pass `--retention-days 30`. Pruning happens only after successful creation or verification, preserves the current date plus the previous 29 calendar days, and ignores every snapshot that does not match the daily naming convention.
+
 ## Embedding cache maintenance
 
 `npm run compact-cache` rewrites the JSONL embedding cache, keeping only vectors for chunks the current sources still produce plus query vectors that match the current model/dimensions. It never calls the embedding API, so it is safe to run at any time. The cache key is derived from the same `project\ntitle\nheading\nchunk_text` embedding input used at index time.

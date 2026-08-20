@@ -85,7 +85,10 @@ npm run audit
 npm run search -- "VASO 文件中心做到哪" -- --project VASO --limit 5
 npm run incremental
 npm run profile
-npm run snapshot:backup -- --backup-root "$HOME/Desktop/<伺服器名稱>備份/LanceDB知識庫備份"
+npm run snapshot:backup -- \
+  --backup-root "$HOME/Desktop/<伺服器名稱>備份/LanceDB知識庫備份" \
+  --snapshot-name "daily-$(date +%F)" \
+  --retention-days 30
 npm run postrun:check
 ```
 
@@ -97,6 +100,8 @@ The snapshot command writes `snapshots/<YYYY-MM-DD>/snapshot-manifest.json` and 
 python3 scripts/snapshot_knowledge_assets.py \
   --verify-snapshot "$HOME/Desktop/<伺服器名稱>備份/LanceDB知識庫備份/snapshots/<YYYY-MM-DD>"
 ```
+
+For daily automation, use `daily-YYYY-MM-DD` names with `--retention-days 30`. Retention runs only after the current snapshot is created or verified successfully, removes only matching daily snapshot directories older than the 30-calendar-day window, and never removes manually named snapshots.
 
 ## Optional AI enrichment
 
