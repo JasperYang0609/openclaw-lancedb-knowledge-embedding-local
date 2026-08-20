@@ -65,6 +65,23 @@ def main() -> None:
         assert default_args[3] == "ignore_scripts=true"
         payload = json.loads(result.stdout)
         assert payload["install_command"] == [str(fake_npm.resolve()), "ci", "--ignore-scripts"]
+        default_config = json.loads((default_target / "config/source-map.json").read_text(encoding="utf-8"))
+        assert all(source.get("sourceType") != "discord_raw" for source in default_config["sources"])
+
+        raw_target = tmp / "raw-install"
+        result = run_bootstrap(
+            raw_target,
+            env,
+            "--backup-root",
+            str(tmp / "discord-backup"),
+            "--include-discord-raw",
+        )
+        assert result.returncode == 0, result.stderr
+        raw_config = json.loads((raw_target / "config/source-map.json").read_text(encoding="utf-8"))
+        raw_sources = [source for source in raw_config["sources"] if source.get("sourceType") == "discord_raw"]
+        assert len(raw_sources) == 1
+        assert raw_sources[0]["include"] == ["**/raw/**/*.md"]
+        assert raw_sources[0]["root"] == str((tmp / "discord-backup").resolve())
 
         allow_log = tmp / "npm-allow.log"
         make_fake_npm(bin_dir, allow_log)

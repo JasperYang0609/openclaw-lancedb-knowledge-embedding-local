@@ -20,8 +20,8 @@ Create a local semantic retrieval layer for OpenClaw so old decisions, project p
 - DB: local LanceDB file store at `data/lancedb`
 - Table: `knowledge_chunks`
 - Primary command: `node src/cli.js`
-- Commands: `scan`, `index`, `incremental`, `sync-state`, `status`, `search`, `compact-cache`, `prepare-enrichment`, `validate-enrichment`, `benchmark`, `profile`
-- Default source types: `memory`, `backup_summary`, `project_doc`, `ops_doc`
+- Commands: `scan`, `index`, `incremental`, `sync-state`, `status`, `audit`, `search`, `compact-cache`, `prepare-enrichment`, `validate-enrichment`, `benchmark`, `profile`
+- Default source types: `memory`, `backup_summary`, `project_doc`, `ops_doc`; `discord_raw` is an explicit opt-in
 - Production embedding used by Ansai after Jasper approval: Google Gemini `gemini-embedding-001`, 768 dimensions
 - Safe default for new clients: `local-hash-v1`, 384 dimensions, no external API calls
 
@@ -101,6 +101,12 @@ Use `npm run incremental` after backup jobs. The wrapper script creates a lock d
 If the table or state file is missing, the row schema is legacy, or vector dimensions changed, incremental falls back to a full index.
 
 A partial `index --project NAME --append` or `index --limit N --append` run merges only the touched paths into `data/index-state.json`; overwrite runs rewrite the state in full to mirror the rebuilt table.
+
+## Coverage audit and restore snapshots
+
+`npm run audit` rebuilds the expected chunks from current sources, validates every row's content hash, deterministic metadata/tags, optional AI fields, embedding provider/model/dimensions, and reports row counts by `source_type`. It is read-only and fails when sources and table diverge.
+
+`npm run snapshot:backup -- --backup-root <PATH>` creates a checksummed restore set containing the LanceDB table, index state, embedding cache, validated enrichment when present, source-map config, deterministic tag/security rules, package lock, and latest manifests. The snapshot is staged and verified before publication. Existing snapshot names are never overwritten; choose a new `--snapshot-name` for another run on the same date.
 
 ## Embedding cache maintenance
 

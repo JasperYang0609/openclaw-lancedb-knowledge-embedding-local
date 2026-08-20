@@ -58,7 +58,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Create an OpenClaw-friendly LanceDB knowledge index project.")
     parser.add_argument("--target", default="~/.openclaw/workspace/knowledge-lancedb", help="Install target directory")
     parser.add_argument("--workspace", default="~/.openclaw/workspace", help="OpenClaw workspace path")
-    parser.add_argument("--backup-root", default="", help="Discord/channel backup root containing summary/ markdown")
+    parser.add_argument("--backup-root", default="", help="Discord/channel backup root containing summary/ and optional raw/ markdown")
+    parser.add_argument("--include-discord-raw", action="store_true", help="Also index **/raw/**/*.md as sourceType=discord_raw; review privacy and corpus size first")
     parser.add_argument("--project-root", default="", help="Client/project docs root to index")
     parser.add_argument("--project-name", default="ClientProject", help="Project label stored in LanceDB rows")
     parser.add_argument("--google-gemini", action="store_true", help="Use Google Gemini embeddings instead of local hash embeddings")
@@ -100,6 +101,20 @@ def main() -> int:
         elif src["root"] == "__PROJECT_DOC_ROOT__":
             src["root"] = str(project_root)
             src["project"] = args.project_name
+
+    if args.include_discord_raw:
+        cfg["sources"].append({
+            "id": "discord-backup-raw",
+            "project": "DiscordBackups",
+            "sourceType": "discord_raw",
+            "root": str(backup_root),
+            "include": ["**/raw/**/*.md"],
+            "exclude": [
+                "**/summary/**", "**/legacy/**", "**/legacy_docs/**",
+                "**/.env*", "**/*secret*", "**/*token*",
+            ],
+            "priority": 1,
+        })
 
     if args.google_gemini:
         dimensions = 3072 if args.embedding_profile == "high-quality" else 768

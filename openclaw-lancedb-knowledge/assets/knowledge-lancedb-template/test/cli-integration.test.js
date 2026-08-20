@@ -37,6 +37,12 @@ test('CLI indexes deterministic metadata, validates optional enrichment, and pas
   const status = JSON.parse(run(root, ['status']));
   assert.equal(status.ok, true);
   assert.equal(status.rows, 3);
+  const initialAudit = JSON.parse(run(root, ['audit']));
+  assert.equal(initialAudit.ok, true);
+  assert.equal(initialAudit.rows, 3);
+  assert.equal(initialAudit.chunks, 3);
+  assert.equal(initialAudit.sourceTypes.project_doc, 3);
+  assert.equal(initialAudit.metadataExactMatch, true);
 
   const enrichmentInput = path.join(root, 'data/enrichment/input.jsonl');
   run(root, ['prepare-enrichment', '--output', enrichmentInput]);
@@ -67,6 +73,9 @@ test('CLI indexes deterministic metadata, validates optional enrichment, and pas
   config.enrichment.privacyApprovedBy = 'integration test fixture';
   fs.writeFileSync(path.join(root, 'config/source-map.json'), JSON.stringify(config, null, 2));
   run(root, ['index']);
+  const enrichedAudit = JSON.parse(run(root, ['audit']));
+  assert.equal(enrichedAudit.ok, true);
+  assert.equal(enrichedAudit.aiTagsNonEmpty, 1);
 
   const db = await lancedb.connect(path.join(root, 'data/lancedb'));
   const table = await db.openTable('knowledge_chunks');

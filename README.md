@@ -1,6 +1,6 @@
 # OpenClaw LanceDB Knowledge Skill
 
-OpenClaw skill for building a local LanceDB semantic knowledge layer over OpenClaw memory, Discord/channel backup summaries, Obsidian-style markdown vaults, handoff files, and client project docs. The skill is written to be readable by general LLM agents, including Claude Opus-class client agents, with explicit commands, privacy gates, and source-cited answer rules.
+OpenClaw skill for building a local LanceDB semantic knowledge layer over OpenClaw memory, Discord/channel backup summaries or opt-in raw history, Obsidian-style markdown vaults, handoff files, and client project docs. The skill is written to be readable by general LLM agents, including Claude Opus-class client agents, with explicit commands, privacy gates, and source-cited answer rules.
 
 ## Install
 
@@ -27,7 +27,9 @@ https://github.com/JasperYang0609/openclaw-lancedb-knowledge-skill/raw/main/dist
 - A source-grounded retrieval benchmark with Hit@K/MRR metrics and a 20-case release gate
 - Secret redaction before embedding/indexing, covering common API keys, cloud/chat platform tokens, PEM blocks, URL credentials, and Chinese credential labels
 - Incremental indexing and cron wrapper, with embedding-cache compaction and report/log rotation
-- Source-map examples for memory, backup summaries, project docs, and Obsidian-style vaults
+- Source-map examples for memory, backup summaries, opt-in Discord raw history, project docs, and Obsidian-style vaults
+- A read-only exact coverage audit for source chunks, metadata/tags, and embedding identity
+- Checksummed restore snapshots containing LanceDB, index state, embedding cache, tag rules, enrichment, and config
 - Supply-chain-safe bootstrap: fixed `npm ci --ignore-scripts` by default, explicit lifecycle-script opt-in, and a non-executing post-run checker
 
 ## Quality and safety defaults

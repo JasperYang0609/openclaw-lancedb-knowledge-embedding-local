@@ -26,12 +26,14 @@ record("required files exist", await exists("src/cli.js") && await exists("src/s
 
 const pkg = await readJson("package.json");
 record("package exposes post-run check", pkg.scripts?.["postrun:check"] === "node scripts/post_run_check.mjs");
-record("core scripts present", ["scan", "index", "search", "status", "test", "incremental", "sync-state", "compact-cache", "enrich:prepare", "enrich:validate", "benchmark", "profile"].every((key) => pkg.scripts?.[key]));
+record("core scripts present", ["scan", "index", "search", "status", "test", "incremental", "sync-state", "compact-cache", "enrich:prepare", "enrich:validate", "benchmark", "profile", "audit", "snapshot:backup"].every((key) => pkg.scripts?.[key]));
 
 const sourceMap = await readJson("config/source-map.example.json");
 record("source map has sources", Array.isArray(sourceMap.sources) && sourceMap.sources.length > 0);
 record("source map excludes common secret paths", JSON.stringify(sourceMap).includes("secret") && JSON.stringify(sourceMap).includes(".env"));
 record("AI enrichment is opt-in", sourceMap.enrichment?.enabled === false);
+record("Discord raw is opt-in", !sourceMap.sources.some((source) => source.sourceType === "discord_raw"));
+record("snapshot tool exists", await exists("scripts/snapshot_knowledge_assets.py"));
 
 const benchmark = await readJson("config/benchmark.example.json");
 record("release benchmark scaffold has at least 20 cases", Array.isArray(benchmark.cases) && benchmark.cases.length >= 20);

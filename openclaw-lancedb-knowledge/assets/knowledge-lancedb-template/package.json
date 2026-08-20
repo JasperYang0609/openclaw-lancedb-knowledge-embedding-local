@@ -1,6 +1,6 @@
 {
   "name": "knowledge-lancedb",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Local LanceDB knowledge index for OpenClaw project memory and backups",
@@ -17,6 +17,8 @@
     "enrich:validate": "node src/cli.js validate-enrichment",
     "benchmark": "node src/cli.js benchmark",
     "profile": "node src/cli.js profile",
+    "audit": "node src/cli.js audit",
+    "snapshot:backup": "python3 scripts/snapshot_knowledge_assets.py",
     "postrun:check": "node scripts/post_run_check.mjs"
   },
   "dependencies": {

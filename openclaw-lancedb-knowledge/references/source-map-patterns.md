@@ -38,6 +38,24 @@ Prefer summaries before raw messages.
 }
 ```
 
+## Discord raw history (explicit opt-in)
+
+Use this only when users need exact historical statements, examples, or message IDs that summaries cannot preserve. Confirm privacy and storage impact first. The bootstrap helper adds this source with `--include-discord-raw`.
+
+```json
+{
+  "id": "discord-backup-raw",
+  "project": "DiscordBackups",
+  "sourceType": "discord_raw",
+  "root": "/path/to/頻道紀錄",
+  "include": ["**/raw/**/*.md"],
+  "exclude": ["**/summary/**", "**/legacy/**", "**/legacy_docs/**", "**/.env*", "**/*secret*", "**/*token*"],
+  "priority": 1
+}
+```
+
+After indexing, run `npm run audit` and require `sourceTypes.discord_raw > 0` when raw history is expected. This validates that current raw chunks and deterministic metadata exactly match the LanceDB rows.
+
 ## Project docs / handoff files
 
 ```json

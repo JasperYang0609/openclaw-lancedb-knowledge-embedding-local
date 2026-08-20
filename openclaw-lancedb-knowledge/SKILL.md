@@ -34,13 +34,14 @@ Design every client-facing instruction so a general LLM can follow it without kn
 
 1. **Confirm scope and privacy.** Identify the workspace, backup summary root, and project-doc roots. If using external embeddings, get explicit approval because redacted private chunks leave the machine.
 2. **Bootstrap or inspect the project.** Use `scripts/bootstrap_openclaw_lancedb.py` for a new install, or inspect an existing `knowledge-lancedb/` folder.
-3. **Edit `config/source-map.json`.** Prefer summary/project/handoff markdown first; add raw chat or code only when needed.
+3. **Edit `config/source-map.json`.** Prefer summary/project/handoff markdown first. Use `--include-discord-raw` when complete Discord message retrieval is an explicit requirement and privacy/size have been reviewed.
 4. **Choose a quality profile.** Keep Gemini at `balanced`/768 unless a benchmark justifies the opt-in 3072-dimensional `high-quality` profile. Changing dimensions requires a full rebuild.
 5. **Run gates.** Run `npm ci --ignore-scripts`, `npm test`, `npm run scan`, then `npm run index` or `npm run incremental`.
 6. **Benchmark retrieval.** Maintain 20–50 source-grounded queries and run the release gate before adopting a quality change.
 7. **Use AI enrichment only as an optional second layer.** Deterministic fields remain authoritative; validate JSONL output and review low-confidence rows.
 8. **Search before answering historical/project-state questions.** Use project filters when possible and cite source paths in the answer.
 9. **Set daily incremental indexing** after OpenClaw backup jobs, using the bundled `knowledge_index_incremental.sh` wrapper or the platform's cron mechanism.
+10. **Back up the restore set.** Run `npm run snapshot:backup -- --backup-root <PATH>` so the LanceDB table, index state, embedding cache, deterministic tag rules, optional AI enrichment, and restore config are checksummed together.
 
 ## Bootstrap command
 
@@ -53,8 +54,11 @@ python3 scripts/bootstrap_openclaw_lancedb.py \
   --backup-root "$HOME/Desktop/<伺服器名稱>備份/頻道紀錄" \
   --project-root "$HOME/Desktop/Client_Project" \
   --project-name ClientProject \
+  --include-discord-raw \
   --npm-install
 ```
+
+Omit `--include-discord-raw` when summaries are sufficient. Raw Discord indexing is opt-in because it increases corpus size and may contain sensitive material; secret redaction still applies before embedding.
 
 `--npm-install` uses a fixed `npm ci --ignore-scripts` command and never invokes a shell. Only add `--allow-package-scripts` after reviewing the lockfile and dependency lifecycle scripts; that flag requires `--npm-install`. Run `npm test` explicitly before `npm run postrun:check` because the post-run check is intentionally non-executing.
 
@@ -77,10 +81,21 @@ cd ~/.openclaw/workspace/knowledge-lancedb
 npm run scan
 npm run index
 npm run status
+npm run audit
 npm run search -- "VASO 文件中心做到哪" -- --project VASO --limit 5
 npm run incremental
 npm run profile
+npm run snapshot:backup -- --backup-root "$HOME/Desktop/<伺服器名稱>備份/LanceDB知識庫備份"
 npm run postrun:check
+```
+
+`npm run audit` validates current source chunks against every indexed row, including deterministic metadata/tag fields and embedding identity. A mismatch fails closed with a full-index instruction.
+
+The snapshot command writes `snapshots/<YYYY-MM-DD>/snapshot-manifest.json` and `CHECKSUMS.sha256`. Verify a copied snapshot with:
+
+```bash
+python3 scripts/snapshot_knowledge_assets.py \
+  --verify-snapshot "$HOME/Desktop/<伺服器名稱>備份/LanceDB知識庫備份/snapshots/<YYYY-MM-DD>"
 ```
 
 ## Optional AI enrichment
@@ -129,6 +144,7 @@ If retrieval is weak, say so and run a narrower search with project/channel/date
 - AI enrichment is auxiliary and confidence-gated. Never use an AI tag as the only retrieval path or as authority over deterministic metadata.
 - Changing embedding model or dimensions requires full reindex.
 - Back up the LanceDB directory and embedding cache before a profile migration; 768- and 3072-dimensional vectors use separate caches and table schemas.
+- Keep metadata/tag rules and validated enrichment beside the database backup. Copying `data/lancedb` alone is insufficient for a reproducible restore.
 - Do not index raw Discord/chat backups first unless summaries are insufficient; raw data is noisy and privacy-heavy.
 
 ## Memory index health and provider migration

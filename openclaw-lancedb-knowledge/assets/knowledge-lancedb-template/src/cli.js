@@ -417,6 +417,42 @@ async function commandStatus(config) {
   console.log(JSON.stringify({ ok, tableName, rows: count, manifest }, null, 2));
 }
 
+async function commandAudit(config) {
+  const built = buildChunks(config);
+  const db = await openDb(config);
+  const tableName = config.tableName || 'knowledge_chunks';
+  let table;
+  try { table = await db.openTable(tableName); }
+  catch { throw new Error(`[audit] table ${tableName} is missing; run a full index rebuild`); }
+  await validateSyncStateTable(config, table, built);
+  const rows = await table.query().select([
+    'source_type', 'deterministic_tags_json', 'ai_tags_json', 'ai_enrichment_status'
+  ]).toArray();
+  const sourceTypes = {};
+  let deterministicTagsNonEmpty = 0;
+  let aiTagsNonEmpty = 0;
+  for (const row of rows) {
+    const sourceType = row.source_type || 'unknown';
+    sourceTypes[sourceType] = (sourceTypes[sourceType] || 0) + 1;
+    try { if (JSON.parse(row.deterministic_tags_json || '[]').length) deterministicTagsNonEmpty += 1; } catch {}
+    try {
+      if (row.ai_enrichment_status === 'valid' && JSON.parse(row.ai_tags_json || '[]').length) aiTagsNonEmpty += 1;
+    } catch {}
+  }
+  console.log(JSON.stringify({
+    ok: true,
+    tableName,
+    docs: built.docs.length,
+    chunks: built.chunks.length,
+    rows: rows.length,
+    sourceTypes,
+    deterministicTagsNonEmpty,
+    aiTagsNonEmpty,
+    metadataExactMatch: true,
+    embeddingIdentityMatch: true
+  }, null, 2));
+}
+
 
 function rankTerms(text) {
   const t = String(text || '').toLowerCase();
@@ -580,13 +616,14 @@ async function main() {
   if (cmd === 'incremental') return commandIncremental(config);
   if (cmd === 'sync-state') return commandSyncState(config);
   if (cmd === 'status') return commandStatus(config);
+  if (cmd === 'audit') return commandAudit(config);
   if (cmd === 'search') return commandSearch(config);
   if (cmd === 'compact-cache') return commandCompactCache(config);
   if (cmd === 'prepare-enrichment') return commandPrepareEnrichment(config);
   if (cmd === 'validate-enrichment') return commandValidateEnrichment(config);
   if (cmd === 'benchmark') return commandBenchmark(config);
   if (cmd === 'profile') return console.log(JSON.stringify({ embedding: config.embedding, chunking: config.chunking, enrichment: enrichmentState(config), fullReindexRequiredWhenDimensionsChange: true }, null, 2));
-  console.log(`knowledge-lancedb commands:\n  scan\n  index [--limit N] [--project NAME] [--append]\n  incremental\n  search "query" [--project NAME] [--limit N]\n  prepare-enrichment [--output FILE] [--limit N]\n  validate-enrichment --input FILE [--output FILE]\n  benchmark --file FILE [--release-gate]\n  profile\n  status\n  compact-cache`);
+  console.log(`knowledge-lancedb commands:\n  scan\n  index [--limit N] [--project NAME] [--append]\n  incremental\n  audit\n  search "query" [--project NAME] [--limit N]\n  prepare-enrichment [--output FILE] [--limit N]\n  validate-enrichment --input FILE [--output FILE]\n  benchmark --file FILE [--release-gate]\n  profile\n  status\n  compact-cache`);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
