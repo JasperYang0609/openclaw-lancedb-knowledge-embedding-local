@@ -19,6 +19,20 @@ function flag(name) { return process.argv.includes(`--${name}`); }
 function ensureDir(p) { fs.mkdirSync(p, { recursive: true }); }
 function nowStamp() { return new Date().toISOString().replace(/[:.]/g, '-'); }
 
+const RAW_APPROVAL_STATES = new Set(['NOT_CONFIRMED', 'APPROVED_EXTERNAL', 'LOCAL_ONLY']);
+const EXACT_VALIDATION_STATES = new Set(['REQUIRED', 'SKIPPED_PRIVACY_GATE']);
+
+export function privacyGate(config) {
+  const raw = config.privacy?.discordRawApproval || 'NOT_CONFIRMED';
+  const exact = config.privacy?.exactMessageIdValidation || 'SKIPPED_PRIVACY_GATE';
+  if (!RAW_APPROVAL_STATES.has(raw)) throw new Error(`Invalid privacy.discordRawApproval: ${raw}`);
+  if (!EXACT_VALIDATION_STATES.has(exact)) throw new Error(`Invalid privacy.exactMessageIdValidation: ${exact}`);
+  const rawConfigured = (config.sources || []).some((source) => source.sourceType === 'discord_raw');
+  if (rawConfigured && raw === 'NOT_CONFIRMED') throw new Error('discord_raw source requires APPROVED_EXTERNAL or LOCAL_ONLY');
+  if (!rawConfigured && exact !== 'SKIPPED_PRIVACY_GATE') throw new Error('exact message lookup must be SKIPPED_PRIVACY_GATE without discord_raw');
+  return { discordRawApproval: raw, exactMessageIdValidation: exact };
+}
+
 const INDEX_SCHEMA_VERSION = 2;
 
 function enrichmentState(config) {
@@ -403,6 +417,7 @@ async function commandCompactCache(config) {
 }
 
 async function commandStatus(config) {
+  const privacy = privacyGate(config);
   const db = await openDb(config);
   const tableName = config.tableName || 'knowledge_chunks';
   let count = 0;
@@ -414,10 +429,11 @@ async function commandStatus(config) {
   } catch {}
   const manifestPath = 'reports/index-manifest.latest.json';
   const manifest = fs.existsSync(manifestPath) ? JSON.parse(fs.readFileSync(manifestPath, 'utf8')) : null;
-  console.log(JSON.stringify({ ok, tableName, rows: count, manifest }, null, 2));
+  console.log(JSON.stringify({ ok, tableName, rows: count, manifest, privacy }, null, 2));
 }
 
 async function commandAudit(config) {
+  const privacy = privacyGate(config);
   const built = buildChunks(config);
   const db = await openDb(config);
   const tableName = config.tableName || 'knowledge_chunks';
@@ -448,6 +464,7 @@ async function commandAudit(config) {
     sourceTypes,
     deterministicTagsNonEmpty,
     aiTagsNonEmpty,
+    privacy,
     metadataExactMatch: true,
     embeddingIdentityMatch: true
   }, null, 2));
@@ -504,7 +521,14 @@ export function rerankRows(rows, query) {
 
 function escapeSqlString(s) { return s.replaceAll("'", "''"); }
 
-async function searchRows(config, query, { limit = 5, project = '' } = {}) {
+export function isRealDateSummaryRow(row) {
+  if (row.source_type !== 'backup_summary') return false;
+  const source = String(row.source_path || '').replace(/\\/g, '/');
+  if (/_inventory-index/i.test(source)) return false;
+  return /\/summary\/\d{4}-\d{2}-\d{2}\.md$/i.test(source);
+}
+
+async function searchRows(config, query, { limit = 5, project = '', realDateSummaryOnly = false } = {}) {
   const dims = config.embedding?.dimensions || 384;
   let queryVector;
   const embeddingProvider = config.embedding?.provider || 'local-hash-v1';
@@ -519,7 +543,9 @@ async function searchRows(config, query, { limit = 5, project = '' } = {}) {
   let search = table.search(queryVector);
   if (project) search = search.where(`project = '${escapeSqlString(project)}'`);
   const fetchLimit = Math.max(limit * 20, 80);
-  return rerankRows(await search.limit(fetchLimit).toArray(), query).slice(0, limit);
+  const rows = await search.limit(fetchLimit).toArray();
+  const eligible = realDateSummaryOnly ? rows.filter(isRealDateSummaryRow) : rows;
+  return rerankRows(eligible, query).slice(0, limit);
 }
 
 async function commandSearch(config) {
@@ -528,9 +554,11 @@ async function commandSearch(config) {
   if (!query) throw new Error('Usage: npm run search -- "query" [-- --project BeanGo --limit 5]');
   const limit = Number(arg('limit', '5')) || 5;
   const project = arg('project', '');
-  const rows = await searchRows(config, query, { limit, project });
+  const realDateSummaryOnly = flag('real-date-summary-only');
+  const rows = await searchRows(config, query, { limit, project, realDateSummaryOnly });
   console.log(`# Search: ${query}\n`);
   if (project) console.log(`Project filter: ${project}\n`);
+  if (realDateSummaryOnly) console.log('Validation filter: real-date summary files only; synthetic inventory indexes rejected.\n');
   rows.forEach((r, idx) => {
     const distance = typeof r._distance === 'number' ? r._distance.toFixed(4) : 'n/a';
     const rank = typeof r._rank_score === 'number' ? r._rank_score.toFixed(4) : 'n/a';

@@ -110,6 +110,12 @@ A partial `index --project NAME --append` or `index --limit N --append` run merg
 
 Daily deployments should name snapshots `daily-YYYY-MM-DD` and pass `--retention-days 30`. Pruning happens only after successful creation or verification, preserves the current date plus the previous 29 calendar days, and ignores every snapshot that does not match the daily naming convention.
 
+Final snapshot creation follows Raw backup, Core Backup, and LanceDB closeout. Pass those timezone-aware timestamps with repeated `--require-after`; a snapshot created at or before the latest closeout fails freshness. Verification uses an absolute path constrained by `--expected-snapshot-root`, then runs manifest/checksum, isolated restore, LanceDB open, and row-count equality gates.
+
+`incident-*` and `repair-*` share one transient retention pool: seven calendar days and at most ten unprotected snapshots combined. A `.keep` marker protects a transient snapshot. Daily retention remains thirty days and unrelated manual snapshots remain outside both policies.
+
+Discord raw approval is `NOT_CONFIRMED`, `APPROVED_EXTERNAL`, or `LOCAL_ONLY`. Exact message validation is `SKIPPED_PRIVACY_GATE` when raw is not configured; that partial result is a deliberate privacy gate. Summary search validation uses only `summary/YYYY-MM-DD.md` and rejects `_inventory-index*` synthetic rows.
+
 ## Embedding cache maintenance
 
 `npm run compact-cache` rewrites the JSONL embedding cache, keeping only vectors for chunks the current sources still produce plus query vectors that match the current model/dimensions. It never calls the embedding API, so it is safe to run at any time. The cache key is derived from the same `project\ntitle\nheading\nchunk_text` embedding input used at index time.

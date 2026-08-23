@@ -33,7 +33,10 @@ record("source map has sources", Array.isArray(sourceMap.sources) && sourceMap.s
 record("source map excludes common secret paths", JSON.stringify(sourceMap).includes("secret") && JSON.stringify(sourceMap).includes(".env"));
 record("AI enrichment is opt-in", sourceMap.enrichment?.enabled === false);
 record("Discord raw is opt-in", !sourceMap.sources.some((source) => source.sourceType === "discord_raw"));
+record("Discord raw privacy gate is explicit", sourceMap.privacy?.discordRawApproval === "NOT_CONFIRMED" && sourceMap.privacy?.exactMessageIdValidation === "SKIPPED_PRIVACY_GATE");
+record("synthetic summary indexes are excluded", JSON.stringify(sourceMap).includes("_inventory-index"));
 record("snapshot tool exists", await exists("scripts/snapshot_knowledge_assets.py"));
+record("cron tooling audit exists", await exists("scripts/audit_cron_tooling.py"));
 
 const benchmark = await readJson("config/benchmark.example.json");
 record("release benchmark scaffold has at least 20 cases", Array.isArray(benchmark.cases) && benchmark.cases.length >= 20);

@@ -115,6 +115,15 @@ def main() -> int:
             ],
             "priority": 1,
         })
+        cfg["privacy"] = {
+            "discordRawApproval": "APPROVED_EXTERNAL" if args.google_gemini else "LOCAL_ONLY",
+            "exactMessageIdValidation": "REQUIRED",
+        }
+    else:
+        cfg["privacy"] = {
+            "discordRawApproval": "NOT_CONFIRMED",
+            "exactMessageIdValidation": "SKIPPED_PRIVACY_GATE",
+        }
 
     if args.google_gemini:
         dimensions = 3072 if args.embedding_profile == "high-quality" else 768

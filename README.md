@@ -30,7 +30,10 @@ https://github.com/JasperYang0609/openclaw-lancedb-knowledge-skill/raw/main/dist
 - Source-map examples for memory, backup summaries, opt-in Discord raw history, project docs, and Obsidian-style vaults
 - A read-only exact coverage audit for source chunks, metadata/tags, and embedding identity
 - Checksummed restore snapshots containing LanceDB, index state, embedding cache, tag rules, enrichment, and config
-- Safe rolling retention for daily snapshots; manual snapshots are never pruned
+- Safe rolling retention for 30-day daily snapshots plus a combined 7-day/10-copy `incident-*` and `repair-*` set; unrelated manual snapshots are never pruned
+- Post-closeout snapshot gates for absolute-path verification, freshness, isolated restore, LanceDB open, and row-count readback
+- Explicit Discord raw privacy states and real-date summary validation that rejects synthetic inventory indexes
+- Cron preflight that rejects legacy `payload.toolsAllow`, requires `--clear-tools`, and verifies GPT/Codex shell access with a temporary isolated canary
 - Supply-chain-safe bootstrap: fixed `npm ci --ignore-scripts` by default, explicit lifecycle-script opt-in, and a non-executing post-run checker
 
 ## Quality and safety defaults

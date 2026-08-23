@@ -42,6 +42,7 @@ Design every client-facing instruction so a general LLM can follow it without kn
 8. **Search before answering historical/project-state questions.** Use project filters when possible and cite source paths in the answer.
 9. **Set daily incremental indexing** after OpenClaw backup jobs, using the bundled `knowledge_index_incremental.sh` wrapper or the platform's cron mechanism.
 10. **Back up the restore set.** Run `npm run snapshot:backup -- --backup-root <PATH>` so the LanceDB table, index state, embedding cache, deterministic tag rules, optional AI enrichment, and restore config are checksummed together.
+11. **Close out in order.** Create the final snapshot only after Raw backup, Core Backup, and LanceDB indexing closeouts. Pass every timestamp with `--require-after`, then require checksum verification, isolated restore, database open, row-count readback, and retention before reporting snapshot PASS.
 
 ## Bootstrap command
 
@@ -88,7 +89,9 @@ npm run profile
 npm run snapshot:backup -- \
   --backup-root "$HOME/Desktop/<伺服器名稱>備份/LanceDB知識庫備份" \
   --snapshot-name "daily-$(date +%F)" \
-  --retention-days 30
+  --retention-days 30 \
+  --transient-retention-days 7 --transient-max-count 10 \
+  --restore-canary --verify-db
 npm run postrun:check
 ```
 
@@ -101,7 +104,17 @@ python3 scripts/snapshot_knowledge_assets.py \
   --verify-snapshot "$HOME/Desktop/<伺服器名稱>備份/LanceDB知識庫備份/snapshots/<YYYY-MM-DD>"
 ```
 
-For daily automation, use `daily-YYYY-MM-DD` names with `--retention-days 30`. Retention runs only after the current snapshot is created or verified successfully, removes only matching daily snapshot directories older than the 30-calendar-day window, and never removes manually named snapshots.
+For daily automation, use `daily-YYYY-MM-DD` names with `--retention-days 30`. Use `--transient-retention-days 7 --transient-max-count 10` for the combined `incident-*` and `repair-*` set. Retention runs only after successful verification. A transient snapshot containing `.keep` is protected; unrelated manual snapshots are ignored.
+
+Cron verification must pass an absolute `--verify-snapshot` path. Add `--expected-snapshot-root` to prevent verification against the project directory or another backup root. Never verify from only a snapshot name or ambiguous relative path.
+
+For a final closeout, pass the Raw, Core Backup, and LanceDB completion timestamps as repeated `--require-after` values. Also pass `--restore-canary --verify-db --expected-row-count <AUDITED_ROWS>`. Snapshot PASS requires freshness, manifest/checksum, isolated restore, database open, row-count equality, and both retention policies.
+
+Keep customer reports compact: include snapshot path, file/byte counts, manifest SHA-256, gate results, and evidence paths. Never inline the manifest's per-file `assets` array into a chat/report; the manifest remains on disk for audit.
+
+Before enabling the cron, audit `openclaw cron list --all --json` with `scripts/audit_cron_tooling.py`. Any `payload.toolsAllow` field is invalid, including an empty array. Remove it with `openclaw cron edit <job-id> --clear-tools`, then run and delete a temporary isolated GPT/Codex canary that prints `TOOL_OK` from `pwd && echo TOOL_OK`.
+
+Use `npm run search -- "query" -- --real-date-summary-only` for summary validation. This mode accepts only `summary/YYYY-MM-DD.md` backup rows and rejects `_inventory-index*` synthetic coverage files.
 
 ## Optional AI enrichment
 
@@ -145,6 +158,7 @@ If retrieval is weak, say so and run a narrower search with project/channel/date
 - Do not index secrets intentionally. Keep `**/*secret*`, `**/*token*`, `.env`, `.git`, `node_modules`, builds, and media out by default.
 - Secret redaction is a guardrail, not permission to ingest credentials.
 - External embedding providers require explicit approval per client/project.
+- Record Discord raw policy as `NOT_CONFIRMED`, `APPROVED_EXTERNAL`, or `LOCAL_ONLY`. When raw is not approved/configured, exact message lookup must remain `SKIPPED_PRIVACY_GATE`; this is an expected partial privacy result, not a system failure.
 - Sending enrichment input to an external LLM requires a separate explicit approval; preparing or validating local JSONL does not upload it.
 - AI enrichment is auxiliary and confidence-gated. Never use an AI tag as the only retrieval path or as authority over deterministic metadata.
 - Changing embedding model or dimensions requires full reindex.
