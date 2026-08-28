@@ -7,6 +7,7 @@ import * as lancedb from '@lancedb/lancedb';
 import { loadConfig, buildChunks } from './sources.js';
 import { embedLocalHash } from './embed-local.js';
 import { getEmbedder, cacheKey as embeddingCacheKey, compactEmbeddingCache } from './embed-google.js';
+import { getQwenEmbedder } from './embed-qwen.js';
 import { loadEnrichmentCache, applyAuxiliaryEnrichment, validateEnrichmentJsonl } from './enrichment.js';
 import { evaluateBenchmark, benchmarkPasses } from './benchmark.js';
 
@@ -35,6 +36,22 @@ export function privacyGate(config) {
 
 const INDEX_SCHEMA_VERSION = 2;
 
+function embeddingIdentity(embedding = {}) {
+  return {
+    provider: embedding.provider ?? null,
+    model: embedding.model ?? null,
+    dimensions: embedding.dimensions ?? null,
+    documentTaskType: embedding.documentTaskType ?? null,
+    nativeDimensions: embedding.nativeDimensions ?? null,
+    quantization: embedding.quantization ?? null,
+    modelSha256: embedding.modelSha256 ?? null,
+    runtimeRevision: embedding.runtimeRevision ?? null,
+    pooling: embedding.pooling ?? null,
+    queryInstruction: embedding.queryInstruction ?? null,
+    normalization: embedding.normalization ?? null
+  };
+}
+
 function enrichmentState(config) {
   const loaded = loadEnrichmentCache(config.enrichment || {});
   return {
@@ -50,12 +67,7 @@ function enrichmentState(config) {
 function buildFingerprint(config) {
   const semantic = {
     schemaVersion: INDEX_SCHEMA_VERSION,
-    embedding: {
-      provider: config.embedding?.provider ?? null,
-      model: config.embedding?.model ?? null,
-      dimensions: config.embedding?.dimensions ?? null,
-      documentTaskType: config.embedding?.documentTaskType ?? null
-    },
+    embedding: embeddingIdentity(config.embedding),
     chunking: config.chunking || {},
     enrichment: enrichmentState(config)
   };
@@ -158,9 +170,17 @@ async function rowsForChunks(config, chunks) {
         if (p.phase === 'remote') console.error(`[embedding] remote embedded ${p.done}/${p.total} (+${p.batchSize})`);
       }
     );
-  } else {
+  } else if (embeddingProvider === 'qwen-local') {
+    const embedder = getQwenEmbedder(config.embedding);
+    vectors = await embedder.embedDocuments(
+      prepared.map((c) => chunkEmbedText(c)),
+      (progress) => console.error(`[embedding] local embedded ${progress.done}/${progress.total} (+${progress.batchSize})`)
+    );
+  } else if (embeddingProvider === 'local-hash-v1') {
     embeddingProvider = 'local-hash-v1';
     vectors = prepared.map((c) => embedLocalHash(chunkEmbedText(c), dims));
+  } else {
+    throw new Error(`Unsupported embedding provider: ${embeddingProvider}`);
   }
   return prepared.map((c, i) => ({
     ...c,
@@ -334,12 +354,7 @@ async function commandIncremental(config) {
     console.error(`[incremental] index schema ${state.version || 'legacy'} -> ${INDEX_SCHEMA_VERSION}; running a one-time full rebuild`);
     return commandIndex(config);
   }
-  const vectorFingerprint = (embedding = {}) => JSON.stringify({
-    provider: embedding.provider ?? null,
-    model: embedding.model ?? null,
-    dimensions: embedding.dimensions ?? null,
-    documentTaskType: embedding.documentTaskType ?? null
-  });
+  const vectorFingerprint = (embedding = {}) => JSON.stringify(embeddingIdentity(embedding));
   if (vectorFingerprint(state.embedding) !== vectorFingerprint(config.embedding)) {
     console.error('[incremental] embedding semantics changed; running a one-time full rebuild');
     return commandIndex(config);
@@ -535,8 +550,12 @@ async function searchRows(config, query, { limit = 5, project = '', realDateSumm
   if (embeddingProvider === 'google-gemini') {
     const embedder = getEmbedder(config.embedding);
     queryVector = await embedder.embedOne(query, config.embedding?.queryTaskType || 'RETRIEVAL_QUERY');
-  } else {
+  } else if (embeddingProvider === 'qwen-local') {
+    queryVector = await getQwenEmbedder(config.embedding).embedOne(query);
+  } else if (embeddingProvider === 'local-hash-v1') {
     queryVector = embedLocalHash(query, dims);
+  } else {
+    throw new Error(`Unsupported embedding provider: ${embeddingProvider}`);
   }
   const db = await openDb(config);
   const table = await db.openTable(config.tableName || 'knowledge_chunks');

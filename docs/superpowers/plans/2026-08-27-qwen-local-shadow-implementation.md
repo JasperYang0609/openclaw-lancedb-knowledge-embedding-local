@@ -1,22 +1,41 @@
 # Qwen 本機 Embedding Shadow 實作計畫
 
-## 階段 1：基礎保護與隔離 (Day 1)
-- [ ] 1.1 建立環境變數覆寫機制，確保 Shadow runner 使用 `LANCEDB_SHADOW_ROOT`，完全不碰 Production DB。
-- [ ] 1.2 建立 `tests/test_isolation.py` 驗證：
-  - Shadow runner 嘗試存取 Production DB 時必須拋出例外。
-  - Provider identifier 必須不等於 `gemini-embedding-001`。
-- [ ] 1.3 實作 Qwen Provider (`src/providers/qwen_local.py`)，先作 Dummy 回傳，通過隔離測試。
+狀態：`DAY_1_REAL_FULL_BUILD_RUNNING`
 
-## 階段 2：Sidecar 生命週期與安裝器 (Day 1)
-- [ ] 2.1 實作 `src/lifecycle/llama_server_manager.py` (啟動、停止、健康檢查)。
-- [ ] 2.2 實作 `src/installer/qwen_installer.py` (下載 GGUF, llama-server, 驗證 SHA-256)。
-- [ ] 2.3 加入生命週期與安裝器的 Unit Tests。
+## Day 1：產品路徑與全量重建
 
-## 階段 3：全量 Shadow 建立器 (Day 1)
-- [ ] 3.1 實作 `src/runner/shadow_builder.py` (讀取來源快照，切批，儲存 checkpoint，斷點續傳)。
-- [ ] 3.2 驗證對帳邏輯 (fingerprint, row count, chunk id 唯一性)。
-- [ ] 3.3 加入對應的端到端（小規模）整合測試。
+- [x] Git preflight、隔離分支與核准規格。
+- [x] 真實 `qwen-local` provider：loopback only、本機 credential、2560→768、L2 normalization、fail closed。
+- [x] 真實 macOS Apple Silicon 安裝器：artifact hash、固定 revision、權限、受管 manifest。
+- [x] 真實 `llama-server` lifecycle：last pooling、health＋embedding canary、PID 與 port 防呆。
+- [x] 真實 streaming shadow index：獨立 root/table、atomic checkpoint、resume、fingerprint 與 row reconciliation。
+- [x] 10-row canary 實際寫入 LanceDB 並完成對帳。
+- [x] 啟動 96,163-row frozen corpus 的背景全量重建；已驗證 PID、checkpoint 與 row growth。
+- [x] 每小時巡檢、每 10% 里程碑／完成／異常才主動回報 Discord。
 
-## 階段 4：啟動五日排程 (Day 1)
-- [ ] 4.1 撰寫 5 日排程腳本 `scripts/5day_validation_runner.sh` 或 Python entrypoint。
-- [ ] 4.2 開始啟動 Day 1 的全量資料索引 (94,800 chunks)，並在背景執行。
+## Day 2：完成全量與品質對帳
+
+- [ ] 確認全量 terminal checkpoint 與 96,163 unique rows。
+- [ ] 驗證單一 embedding fingerprint、768 維、有限向量、來源／state／manifest 對帳。
+- [ ] 執行 20 題 Qwen／Gemini read-only benchmark 與端到端 latency。
+
+## Day 3：故障與續跑
+
+- [ ] restart、SIGTERM、強制中斷、stale PID、port collision。
+- [ ] checkpoint resume 不重寫既有 rows。
+- [ ] 離線與增量 fixture 測試。
+
+## Day 4：穩定性
+
+- [ ] 週期性 read-only benchmark、查詢 p95、記憶體與長時間穩定性。
+- [ ] 記錄異常、恢復與殘留程序／資源。
+
+## Day 5：交付 Gate
+
+- [ ] fresh reinstall／uninstall／restore rehearsal。
+- [ ] OWASP A01–A10、供應鏈、secret、dependency 與攻擊者視角 review。
+- [ ] 完整測試、Git closeout、白話報告與是否申請 Production 切換建議。
+
+## 事故修正紀錄
+
+2026-08-28 回讀發現先前 `d9cf6c7` 的 Day 1 runner 只有模擬輸出，沒有真實 Qwen embedding、背景程序、checkpoint row growth 或 Day 2–5 排程。該紀錄已撤回，mock provider／runner／shell 已移除。之後只有同時具備真實 PID、健康 canary、durable checkpoint 與資料筆數成長，才可稱為「已啟動」。

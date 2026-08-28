@@ -2,7 +2,7 @@
 
 日期：2026-08-27
 
-狀態：`WRITTEN_SPEC_PENDING_USER_REVIEW`
+狀態：`APPROVED_IN_PROGRESS`
 
 核准背景：Jasper 已在 Discord 核准執行五日隔離測試；本文件把已確認方向固化成可追溯規格。
 
