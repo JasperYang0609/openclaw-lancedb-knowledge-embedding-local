@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-08-29",
+  "status": "PASS_SHADOW_ONLY",
+  "reconciliation": {
+    "rows": 96163,
+    "uniqueChunkIds": 96163,
+    "duplicateChunkIds": 0,
+    "vectorDimensions": 768,
+    "finiteVectors": 96163,
+    "nonFiniteValues": 0,
+    "identityCount": 1,
+    "eligibleSourceFiles": 4675,
+    "stateFileHashMismatches": 0,
+    "liveSourceDrift": {
+      "documentsAdded": 8,
+      "chunksAdded": 179,
+      "missingFrozenIds": 0
+    },
+    "passed": true
+  },
+  "benchmark": {
+    "cases": 20,
+    "qwen": {
+      "hitAt5": 0.9,
+      "mrr": 0.7666666666666666,
+      "passed": true
+    },
+    "gemini": {
+      "hitAt5": 0.95,
+      "mrr": 0.7083333333333334,
+      "passed": true
+    },
+    "qualityComparisonPassed": true
+  },
+  "endToEndLatency": {
+    "measurement": "fresh_cli_to_rendered_search_output",
+    "targetP95Ms": 1000,
+    "qwen": {
+      "p50Ms": 552.7453340000009,
+      "p95Ms": 634.3742499999996,
+      "meanMs": 570.2030251000003,
+      "maxMs": 777.106042,
+      "passed": true
+    },
+    "gemini": {
+      "p50Ms": 581.9382500000004,
+      "p95Ms": 660.7798749999994,
+      "meanMs": 607.8987646499999,
+      "maxMs": 1027.049875,
+      "passed": true
+    }
+  },
+  "productionBoundary": {
+    "geminiTableChanged": false,
+    "geminiStateChanged": false,
+    "geminiConfigChanged": false,
+    "temporaryQueryCacheRowsAdded": 20,
+    "temporaryQueryCacheRowsRestored": 20,
+    "remainingTemporaryRows": 0,
+    "findingStatus": "RESOLVED"
+  },
+  "productionCutoverApproved": false
+}

@@ -1,6 +1,6 @@
 # Qwen 本機 Embedding Shadow 實作計畫
 
-狀態：`DAY_1_REAL_FULL_BUILD_RUNNING`
+狀態：`DAY_2_COMPLETE_SHADOW_ONLY`
 
 ## Day 1：產品路徑與全量重建
 
@@ -15,9 +15,9 @@
 
 ## Day 2：完成全量與品質對帳
 
-- [ ] 確認全量 terminal checkpoint 與 96,163 unique rows。
-- [ ] 驗證單一 embedding fingerprint、768 維、有限向量、來源／state／manifest 對帳。
-- [ ] 執行 20 題 Qwen／Gemini read-only benchmark 與端到端 latency。
+- [x] 確認全量 terminal checkpoint 與 96,163 unique rows。
+- [x] 驗證單一 embedding fingerprint、768 維、有限向量、來源／state／manifest 對帳。
+- [x] 執行 20 題 Qwen／Gemini read-only benchmark 與端到端 latency。
 
 ## Day 3：故障與續跑
 
@@ -39,3 +39,5 @@
 ## 事故修正紀錄
 
 2026-08-28 回讀發現先前 `d9cf6c7` 的 Day 1 runner 只有模擬輸出，沒有真實 Qwen embedding、背景程序、checkpoint row growth 或 Day 2–5 排程。該紀錄已撤回，mock provider／runner／shell 已移除。之後只有同時具備真實 PID、健康 canary、durable checkpoint 與資料筆數成長，才可稱為「已啟動」。
+
+2026-08-29 Day 2 驗證發現既有 Gemini CLI benchmark 會在 cache miss 時追加 query embedding 到 Production cache。該 20 筆本輪新增列已先隔離備份，再依 exact query key 全數回復；其他同期新增列為 0，Production Gemini table／state／config 未變。Day 4 不得再直接使用 Production cache，必須改用隔離 query cache。
