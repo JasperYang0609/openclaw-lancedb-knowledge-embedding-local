@@ -138,7 +138,8 @@ class LlamaServerManager:
         raise RuntimeError("llama-server failed health and embedding canary before timeout")
 
     def stop(self, *, timeout_seconds: int = 30) -> None:
-        pid = self.process.pid if self.process and self.process.poll() is None else None
+        managed_process = self.process if self.process and self.process.poll() is None else None
+        pid = managed_process.pid if managed_process else None
         if pid is None and self.pid_file.is_file():
             try:
                 pid = int(json.loads(self.pid_file.read_text())["pid"])
@@ -154,15 +155,22 @@ class LlamaServerManager:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            deadline = time.time() + timeout_seconds
-            while time.time() < deadline:
+            if managed_process is not None:
                 try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    break
-                time.sleep(0.25)
+                    managed_process.wait(timeout=timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    managed_process.kill()
+                    managed_process.wait(timeout=5)
             else:
-                os.kill(pid, signal.SIGKILL)
+                deadline = time.time() + timeout_seconds
+                while time.time() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.25)
+                else:
+                    os.kill(pid, signal.SIGKILL)
         self.process = None
         self.pid_file.unlink(missing_ok=True)
 

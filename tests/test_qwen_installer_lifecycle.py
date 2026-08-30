@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -119,3 +121,35 @@ def test_lifecycle_refuses_broad_credential_permissions(tmp_path: Path) -> None:
     )
     with pytest.raises(PermissionError, match="permissions"):
         manager.command()
+
+
+def test_lifecycle_stop_reaps_a_managed_child_without_waiting_for_kill_timeout(tmp_path: Path) -> None:
+    model = artifact(tmp_path, "model.gguf", b"model")
+    key_file = artifact(tmp_path, "api-key", b"local-secret-value")
+    key_file.chmod(0o600)
+    manager = LlamaServerManager(
+        server_binary="/bin/sh",
+        model_path=model,
+        api_key_file=key_file,
+        state_dir=tmp_path / "state",
+    )
+    manager.state_dir.mkdir(parents=True)
+    manager.process = subprocess.Popen(
+        [
+            "/bin/sh",
+            "-c",
+            "trap 'exit 0' TERM; while :; do sleep 1; done",
+            "/bin/sh",
+            str(model.resolve()),
+        ],
+        start_new_session=True,
+    )
+    manager.pid_file.write_text(json.dumps({"schemaVersion": 1, "pid": manager.process.pid, "port": 18888}))
+    time.sleep(0.1)
+
+    started = time.monotonic()
+    manager.stop(timeout_seconds=2)
+
+    assert time.monotonic() - started < 2
+    assert manager.process is None
+    assert not manager.pid_file.exists()
