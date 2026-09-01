@@ -16,6 +16,13 @@ from .safe_archive import extract_verified_tar
 SCHEMA_VERSION = 2
 PROVIDER = "qwen-local"
 DEFAULT_TARGET = Path.home() / "Library/Application Support/OpenClaw/qwen-local"
+RUNTIME_VERSION_MARKER = "build 10625, commit 0cc5b1495"
+RUNTIME_PLATFORM_MARKER = "Darwin arm64"
+
+
+def validate_runtime_version_output(output: str) -> None:
+    if RUNTIME_VERSION_MARKER not in output or RUNTIME_PLATFORM_MARKER not in output:
+        raise RuntimeError("llama-server version does not match build 10625 for Darwin arm64")
 
 
 def atomic_json_write(file_path: Path, payload: dict) -> None:
@@ -52,7 +59,7 @@ class QwenInstaller:
         self.server_sha256 = server_sha256
         self.model_path = self.target_dir / "models" / QWEN_MODEL.filename
         self.runtime_path = self.target_dir / "runtime"
-        self.server_path = self.runtime_path / "bin" / "llama-server"
+        self.server_path = self.runtime_path / "llama-server"
         self.api_key_file = self.target_dir / "run" / "api-key"
         self.manifest_path = self.target_dir / "install-manifest.json"
 
@@ -99,20 +106,29 @@ class QwenInstaller:
         self._ensure_dirs()
         shutil.copy2(model, self.model_path)
         os.chmod(self.model_path, 0o600)
-        inventory = extract_verified_tar(archive, self.runtime_path)
-        candidates = list(self.runtime_path.rglob("llama-server"))
-        if len(candidates) != 1:
-            raise RuntimeError("Runtime archive must contain exactly one llama-server")
-        if candidates[0] != self.server_path:
-            self.server_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.replace(candidates[0], self.server_path)
-        os.chmod(self.server_path, 0o700)
-        version = subprocess.run(
-            [str(self.server_path), "--version"], shell=False, check=True,
-            capture_output=True, text=True, timeout=15,
-        )
-        if "b10625" not in (version.stdout + version.stderr):
-            raise RuntimeError("llama-server version does not match b10625")
+        candidate = self.target_dir / ".runtime-candidate"
+        if candidate.exists() or candidate.is_symlink():
+            if candidate.is_symlink() or not candidate.is_dir():
+                raise RuntimeError("Stale runtime candidate is unsafe")
+            shutil.rmtree(candidate)
+        if self.runtime_path.exists() or self.runtime_path.is_symlink():
+            raise RuntimeError("Unverified runtime path already exists; quarantine it before retrying")
+        try:
+            inventory = extract_verified_tar(archive, candidate)
+            candidate_server = candidate / "llama-server"
+            if not candidate_server.is_file() or candidate_server.is_symlink():
+                raise RuntimeError("Runtime archive must contain one safe top-level llama-server")
+            os.chmod(candidate_server, 0o700)
+            version = subprocess.run(
+                [str(candidate_server), "--version"], shell=False, check=True,
+                capture_output=True, text=True, timeout=60,
+            )
+            validate_runtime_version_output(version.stdout + version.stderr)
+            os.replace(candidate, self.runtime_path)
+        except Exception:
+            if candidate.exists() and candidate.is_dir() and not candidate.is_symlink():
+                shutil.rmtree(candidate)
+            raise
         self._ensure_key()
         manifest = self._manifest(inventory)
         atomic_json_write(self.manifest_path, manifest)
@@ -140,7 +156,7 @@ class QwenInstaller:
             shutil.copy2(server, self.server_path)
         os.chmod(self.server_path, 0o700)
         self._ensure_key()
-        inventory = [{"path": "bin/llama-server", "bytes": self.server_path.stat().st_size,
+        inventory = [{"path": "llama-server", "bytes": self.server_path.stat().st_size,
                       "sha256": sha256_file(self.server_path), "executable": True}]
         manifest = self._manifest(inventory, fixture=True, development_model_link=development_model_link)
         atomic_json_write(self.manifest_path, manifest)
@@ -223,7 +239,7 @@ class QwenInstaller:
         for file_path in tuple(allowed_files):
             allowed_dirs.update(file_path.parents)
         allowed_dirs.discard(Path("."))
-        allowed_files.add(Path("runtime/bin/llama-server"))
+        allowed_files.add(Path("runtime/llama-server"))
         actual = {path.relative_to(self.target_dir) for path in self.target_dir.rglob("*")}
         for path in actual:
             if (self.target_dir / path).is_symlink() and path != Path("models") / QWEN_MODEL.filename:

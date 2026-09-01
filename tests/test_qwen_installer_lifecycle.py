@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from src.installer.qwen_installer import QwenInstaller, sha256_file
+from src.installer.qwen_installer import QwenInstaller, sha256_file, validate_runtime_version_output
 from src.lifecycle.llama_server_manager import LlamaServerManager
 
 
@@ -23,6 +23,17 @@ def artifact(tmp_path: Path, name: str, data: bytes, executable: bool = False) -
     if executable:
         file_path.chmod(0o700)
     return file_path
+
+
+def test_runtime_version_gate_matches_official_build_and_platform() -> None:
+    validate_runtime_version_output(
+        "version: 0.3.0-dev (build 10625, commit 0cc5b1495)\n"
+        "built with AppleClang 21.0.0.21000101 for Darwin arm64\n"
+    )
+    with pytest.raises(RuntimeError, match="build 10625"):
+        validate_runtime_version_output("version: 0.3.0-dev (build 10624, commit attacker) for Darwin arm64")
+    with pytest.raises(RuntimeError, match="Darwin arm64"):
+        validate_runtime_version_output("version: 0.3.0-dev (build 10625, commit 0cc5b1495) for Linux x64")
 
 
 def test_installer_verifies_both_artifacts_and_writes_restricted_manifest(tmp_path: Path) -> None:

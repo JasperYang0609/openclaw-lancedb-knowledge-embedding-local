@@ -103,7 +103,7 @@ Repository：`JasperYang0609/openclaw-lancedb-knowledge-embedding-local`
 - 使用 macOS 系統 `curl`，以 `.part` 檔與 HTTP range 續傳；server 不支援 range 時安全重新下載。
 - artifact URL、release revision、檔名、大小與 SHA-256 固定在受版本控制的 manifest。
 - checksum 不符時 fail closed，保留可診斷的非敏感摘要，不執行 artifact。
-- archive extraction 先檢查 absolute path、`..` traversal、symlink、hardlink 與重複路徑，再解壓到 staging root；驗證後以原子 rename 安裝。
+- archive extraction 先檢查 absolute path、`..` traversal、hardlink 與重複路徑，再解壓到 staging root；固定 digest 官方 archive 的同目錄 dylib alias symlink 僅在有限深度 chain 最終指向 regular sibling member 時 materialize 為 regular file，輸出不得保留 symlink；驗證後以原子 rename 安裝。
 - runtime 只綁 `127.0.0.1`，Web UI 關閉，使用權限受限的本機隨機 credential。
 - installer target 必須通過 allowlist、owner、symlink 與 specificity 檢查；不允許 workspace root、home root、filesystem root 或 Gemini production path。
 
@@ -160,7 +160,7 @@ Repository：`JasperYang0609/openclaw-lancedb-knowledge-embedding-local`
 - 使用者裝錯版本：名稱、首屏說明、互相連結與 provider identity fail closed。
 - 拆分後仍殘留交叉 provider：runtime import scan、config scan、archive parity 與 negative tests。
 - 供應鏈 artifact 被替換：immutable revision、SHA-256、來源 allowlist、license inventory。
-- 路徑穿越或惡意 archive：staging、entry validation、symlink／hardlink 拒絕與原子安裝。
+- 路徑穿越或惡意 archive：staging、entry validation、hardlink 拒絕、受限 sibling alias materialization、輸出零 symlink 與原子安裝。
 - sidecar 被 LAN 或公網存取：loopback-only、Web UI 關閉、negative listener test、本機 credential。
 - 不完整安裝誤報成功：transaction state、manifest、health canary、terminal status 與冪等 resume。
 - uninstaller 誤刪資料：manifest identity、hash、allowlisted root、unknown-file 與 symlink fail closed。
