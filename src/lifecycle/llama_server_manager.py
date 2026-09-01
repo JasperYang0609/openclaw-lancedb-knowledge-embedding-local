@@ -5,11 +5,52 @@ import math
 import os
 import signal
 import socket
+import stat
 import subprocess
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+
+def _open_safe_append(path: Path):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise RuntimeError(f"Managed log path is unsafe: {path.name}") from error
+    metadata = os.fstat(descriptor)
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1):
+        os.close(descriptor)
+        raise RuntimeError(f"Managed log path is unsafe: {path.name}")
+    return os.fdopen(descriptor, "ab", buffering=0)
+
+
+def _atomic_json_state(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as error:
+        raise RuntimeError("PID staging path already exists or is unsafe") from error
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(json.dumps(payload, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _read_json_regular(path: Path) -> dict:
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("Managed PID file is missing or unsafe")
+    metadata = path.stat()
+    if metadata.st_uid != os.getuid() or metadata.st_nlink != 1 or not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError("Managed PID file ownership or link count is unsafe")
+    return json.loads(path.read_text())
 
 
 class LlamaServerManager:
@@ -25,7 +66,7 @@ class LlamaServerManager:
         self.server_binary = Path(server_binary).expanduser().resolve()
         self.model_path = Path(model_path).expanduser().resolve()
         self.api_key_file = Path(api_key_file).expanduser().resolve()
-        self.state_dir = Path(state_dir).expanduser().resolve()
+        self.state_dir = Path(os.path.abspath(Path(state_dir).expanduser()))
         self.port = int(port)
         if not 1024 <= self.port <= 65535:
             raise ValueError("Sidecar port must be from 1024 through 65535")
@@ -35,6 +76,9 @@ class LlamaServerManager:
         self.process: subprocess.Popen | None = None
 
     def validate_files(self) -> None:
+        for component in (self.state_dir, *self.state_dir.parents):
+            if component.is_symlink():
+                raise PermissionError("Managed state path must not contain symbolic links")
         if not self.server_binary.is_file():
             raise FileNotFoundError("llama-server binary is missing")
         if not self.model_path.is_file():
@@ -120,7 +164,7 @@ class LlamaServerManager:
         self.validate_files()
         if self.pid_file.is_file():
             try:
-                metadata = json.loads(self.pid_file.read_text())
+                metadata = _read_json_regular(self.pid_file)
                 recorded_pid = int(metadata["pid"])
             except (ValueError, KeyError, json.JSONDecodeError):
                 raise RuntimeError("Invalid llama-server pid file")
@@ -134,32 +178,37 @@ class LlamaServerManager:
         if self._is_port_in_use():
             raise RuntimeError(f"Loopback port {self.port} is already in use")
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        stdout_handle = self.stdout_log.open("ab")
-        stderr_handle = self.stderr_log.open("ab")
-        self.process = subprocess.Popen(
-            self.command(),
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_handle,
-            stderr=stderr_handle,
-            shell=False,
-            start_new_session=True,
-        )
+        stdout_handle = _open_safe_append(self.stdout_log)
+        try:
+            stderr_handle = _open_safe_append(self.stderr_log)
+        except Exception:
+            stdout_handle.close()
+            raise
+        try:
+            self.process = subprocess.Popen(
+                self.command(),
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                shell=False,
+                start_new_session=True,
+            )
+        finally:
+            stdout_handle.close()
+            stderr_handle.close()
         started = time.time()
         while time.time() - started < timeout_seconds:
             if self.process.poll() is not None:
                 raise RuntimeError(f"llama-server exited during startup with code {self.process.returncode}")
             if self.is_healthy() and self.embedding_canary():
-                temporary = self.pid_file.with_suffix(".tmp")
-                temporary.write_text(json.dumps({
+                _atomic_json_state(self.pid_file, {
                     "schemaVersion": 2,
                     "pid": self.process.pid,
                     "port": self.port,
                     "startedAtEpoch": time.time(),
                     "serverBinary": str(self.server_binary),
                     "modelPath": str(self.model_path),
-                }, indent=2) + "\n")
-                os.chmod(temporary, 0o600)
-                temporary.replace(self.pid_file)
+                })
                 return self.process.pid
             time.sleep(1)
         self.stop()
@@ -170,7 +219,7 @@ class LlamaServerManager:
         pid = managed_process.pid if managed_process else None
         if pid is None and self.pid_file.is_file():
             try:
-                metadata = json.loads(self.pid_file.read_text())
+                metadata = _read_json_regular(self.pid_file)
                 pid = int(metadata["pid"])
             except (ValueError, KeyError, json.JSONDecodeError):
                 raise RuntimeError("Invalid llama-server pid file")
@@ -212,8 +261,8 @@ class LlamaServerManager:
         metadata = None
         if self.pid_file.is_file():
             try:
-                metadata = json.loads(self.pid_file.read_text())
-            except (OSError, json.JSONDecodeError):
+                metadata = _read_json_regular(self.pid_file)
+            except (OSError, RuntimeError, json.JSONDecodeError):
                 metadata = None
         pid = int(metadata["pid"]) if metadata and isinstance(metadata.get("pid"), int) else None
         running = bool(pid and self._process_exists(pid) and self._pid_identity_matches(metadata)

@@ -13,6 +13,7 @@ class Artifact:
     sha256: str
     revision: str
     allowed_host: str
+    allowed_redirect_hosts: tuple[str, ...] = ()
 
     def validate(self) -> None:
         parsed = urlparse(self.url)
@@ -27,6 +28,14 @@ class Artifact:
         if self.size <= 0 or len(self.sha256) != 64:
             raise ValueError(f"{self.artifact_id} has an invalid size or digest")
 
+    def allows_download_host(self, hostname: str | None) -> bool:
+        if not hostname:
+            return False
+        return any(
+            hostname == entry or (entry.startswith(".") and hostname.endswith(entry))
+            for entry in (self.allowed_host, *self.allowed_redirect_hosts)
+        )
+
 
 QWEN_MODEL = Artifact(
     artifact_id="qwen3-embedding-4b-q5-k-m",
@@ -39,6 +48,7 @@ QWEN_MODEL = Artifact(
     sha256="9fd05563211c2d69d74abb8769fa92983a102d11575b2517a119b0037dff217c",
     revision="f4602530db1d980e16da9d7d3a70294cf5c190be",
     allowed_host="huggingface.co",
+    allowed_redirect_hosts=(".cdn.hf.co", "cas-bridge.xethub.hf.co"),
 )
 
 LLAMA_CPP = Artifact(
@@ -49,6 +59,7 @@ LLAMA_CPP = Artifact(
     sha256="f13c74d104c1ff2e37a14ecb2025afe5c9c4c148064badfd8116376018dd5159",
     revision="b10625",
     allowed_host="github.com",
+    allowed_redirect_hosts=("release-assets.githubusercontent.com",),
 )
 
 ARTIFACTS = (QWEN_MODEL, LLAMA_CPP)

@@ -28,9 +28,19 @@ def validate_runtime_version_output(output: str) -> None:
 def atomic_json_write(file_path: Path, payload: dict) -> None:
     file_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = file_path.with_suffix(file_path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-    os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)
-    os.replace(temporary, file_path)
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise RuntimeError("Manifest staging path already exists or is unsafe") from error
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, file_path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 class QwenInstaller:
@@ -99,13 +109,47 @@ class QwenInstaller:
     def _ensure_key(self) -> None:
         if self.api_key_file.is_symlink():
             raise RuntimeError("Local API credential must not be a symbolic link")
-        if not self.api_key_file.exists():
+        if self.api_key_file.exists():
+            metadata = self.api_key_file.stat()
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                    or metadata.st_nlink != 1):
+                raise RuntimeError("Local API credential has unsafe ownership or link count")
+        else:
             descriptor = os.open(self.api_key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "w") as handle:
                 handle.write(secrets.token_urlsafe(48) + "\n")
         os.chmod(self.api_key_file, 0o600)
 
-    def install_from_artifacts(self, *, model_source: str | Path, runtime_archive: str | Path) -> dict:
+    def _install_model(self, source: Path) -> None:
+        if self.model_path.exists() or self.model_path.is_symlink():
+            if self.model_path.is_symlink() or not self.model_path.is_file():
+                raise RuntimeError("Managed model path must be a regular file and not a symbolic link")
+            metadata = self.model_path.stat()
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                    or metadata.st_nlink != 1):
+                raise RuntimeError("Managed model path has unsafe ownership or link count")
+            self._verify(self.model_path, self.model_sha256, "existing Qwen model")
+            os.chmod(self.model_path, 0o600)
+            return
+        temporary = self.model_path.with_suffix(self.model_path.suffix + ".tmp")
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as error:
+            raise RuntimeError("Model staging path already exists or is unsafe") from error
+        try:
+            with source.open("rb") as input_handle, os.fdopen(descriptor, "wb") as output_handle:
+                shutil.copyfileobj(input_handle, output_handle, length=1024 * 1024)
+                output_handle.flush()
+                os.fsync(output_handle.fileno())
+            self._verify(temporary, self.model_sha256, "staged Qwen model")
+            os.replace(temporary, self.model_path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def install_from_artifacts(
+        self, *, model_source: str | Path, runtime_archive: str | Path, runtime_port: int = 18888
+    ) -> dict:
         model = Path(model_source).resolve()
         archive = Path(runtime_archive).resolve()
         self._verify(model, self.model_sha256, "Qwen model")
@@ -113,10 +157,7 @@ class QwenInstaller:
         if self.manifest_path.exists():
             return self.verify_installation()
         self._ensure_dirs()
-        if self.model_path.is_symlink() or (self.model_path.exists() and not self.model_path.is_file()):
-            raise RuntimeError("Managed model path must be a regular file and not a symbolic link")
-        shutil.copy2(model, self.model_path)
-        os.chmod(self.model_path, 0o600)
+        self._install_model(model)
         candidate = self.target_dir / ".runtime-candidate"
         if candidate.exists() or candidate.is_symlink():
             if candidate.is_symlink() or not candidate.is_dir():
@@ -141,12 +182,13 @@ class QwenInstaller:
                 shutil.rmtree(candidate)
             raise
         self._ensure_key()
-        manifest = self._manifest(inventory)
+        manifest = self._manifest(inventory, runtime_port=runtime_port)
         atomic_json_write(self.manifest_path, manifest)
         return manifest
 
     def install_from_verified_sources(
-        self, *, model_source: str | Path, server_source: str | Path, development_model_link: bool = False
+        self, *, model_source: str | Path, server_source: str | Path, development_model_link: bool = False,
+        runtime_port: int = 18888,
     ) -> dict:
         """Fixture-only compatibility helper; production install uses install_from_artifacts."""
         model = Path(model_source).resolve()
@@ -169,11 +211,18 @@ class QwenInstaller:
         self._ensure_key()
         inventory = [{"path": "llama-server", "bytes": self.server_path.stat().st_size,
                       "sha256": sha256_file(self.server_path), "executable": True}]
-        manifest = self._manifest(inventory, fixture=True, development_model_link=development_model_link)
+        manifest = self._manifest(
+            inventory, fixture=True, development_model_link=development_model_link, runtime_port=runtime_port
+        )
         atomic_json_write(self.manifest_path, manifest)
         return manifest
 
-    def _manifest(self, inventory: list[dict], *, fixture: bool = False, development_model_link: bool = False) -> dict:
+    def _manifest(
+        self, inventory: list[dict], *, fixture: bool = False, development_model_link: bool = False,
+        runtime_port: int = 18888,
+    ) -> dict:
+        if not 1024 <= int(runtime_port) <= 65535:
+            raise ValueError("Sidecar port must be from 1024 through 65535")
         manifest = {
             "schemaVersion": SCHEMA_VERSION,
             "provider": PROVIDER,
@@ -189,6 +238,7 @@ class QwenInstaller:
             "modelPath": str(self.model_path),
             "serverPath": str(self.server_path),
             "apiKeyFile": str(self.api_key_file),
+            "runtimePort": int(runtime_port),
             "developmentModelLink": development_model_link,
         }
         if fixture:
@@ -198,7 +248,11 @@ class QwenInstaller:
     def verify_installation(self) -> dict:
         if not self.manifest_path.is_file() or self.manifest_path.is_symlink():
             raise RuntimeError("Install manifest is missing or unsafe")
-        if self.manifest_path.stat().st_mode & 0o077:
+        manifest_metadata = self.manifest_path.stat()
+        if (not stat.S_ISREG(manifest_metadata.st_mode) or manifest_metadata.st_uid != os.getuid()
+                or manifest_metadata.st_nlink != 1):
+            raise RuntimeError("Install manifest ownership or link count is unsafe")
+        if manifest_metadata.st_mode & 0o077:
             raise RuntimeError("Install manifest permissions are too broad")
         manifest = json.loads(self.manifest_path.read_text())
         identity = {"schemaVersion": SCHEMA_VERSION, "provider": PROVIDER, "installRoot": str(self.target_dir),
@@ -208,6 +262,9 @@ class QwenInstaller:
                     "runtimeCommit": "0cc5b14959ee3a813bd787baaef50a170493547a"}
         if any(manifest.get(key) != value for key, value in identity.items()):
             raise RuntimeError("Install manifest identity does not match the managed installation")
+        runtime_port = manifest.get("runtimePort")
+        if not isinstance(runtime_port, int) or not 1024 <= runtime_port <= 65535:
+            raise RuntimeError("Install manifest runtime port is invalid")
         if self.model_path.is_symlink() and not manifest.get("developmentModelLink"):
             raise RuntimeError("Installed Qwen model must not be a symbolic link")
         self._verify(self.model_path, self.model_sha256, "installed Qwen model")
@@ -231,7 +288,11 @@ class QwenInstaller:
             raise RuntimeError("Local API credential must not be a symbolic link")
         if not self.api_key_file.is_file():
             raise RuntimeError("Local API credential is missing")
-        if self.api_key_file.stat().st_mode & 0o077:
+        key_metadata = self.api_key_file.stat()
+        if (not stat.S_ISREG(key_metadata.st_mode) or key_metadata.st_uid != os.getuid()
+                or key_metadata.st_nlink != 1):
+            raise RuntimeError("Local API credential ownership or link count is unsafe")
+        if key_metadata.st_mode & 0o077:
             raise RuntimeError("Local API credential permissions are too broad")
         key = self.api_key_file.read_text().strip()
         if len(key) < 32 or any(character.isspace() for character in key):

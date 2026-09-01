@@ -35,22 +35,34 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("command", choices=("install", "verify", "start", "stop", "status", "health", "uninstall"))
     root.add_argument("--target", default=str(DEFAULT_TARGET))
     root.add_argument("--artifact-cache", default=str(DEFAULT_TARGET.parent / "qwen-local-artifacts"))
-    root.add_argument("--port", type=int, default=18888)
+    root.add_argument("--port", type=int)
     return root
+
+
+def resolve_port(installer: QwenInstaller, requested_port: int | None) -> int:
+    if installer.manifest_path.exists():
+        installed_port = int(installer.verify_installation()["runtimePort"])
+        if requested_port is not None and requested_port != installed_port:
+            raise RuntimeError(
+                f"Requested port {requested_port} differs from installed port {installed_port}; reinstall to change it"
+            )
+        return installed_port
+    return 18888 if requested_port is None else requested_port
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     validate_manifest()
     installer = QwenInstaller(args.target)
-    manager = manager_for(installer, args.port)
     try:
+        port = resolve_port(installer, args.port)
+        manager = manager_for(installer, port)
         if args.command == "install":
             installer.system_preflight()
             downloader = ArtifactDownloader(args.artifact_cache)
             model = downloader.fetch(QWEN_MODEL)
             runtime = downloader.fetch(LLAMA_CPP)
-            installer.install_from_artifacts(model_source=model, runtime_archive=runtime)
+            installer.install_from_artifacts(model_source=model, runtime_archive=runtime, runtime_port=port)
             pid = manager.start()
             emit({"ok": True, "command": "install", "state": "installed_healthy", "pid": pid,
                   "provider": "qwen-local", "runtime": "b10625"})
@@ -66,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
             emit({"ok": True, "command": "stop", "running": False})
         elif args.command == "status":
             installed = installer.manifest_path.is_file()
-            state = manager.status() if installed else {"running": False, "healthy": False, "pid": None, "port": args.port}
+            state = manager.status() if installed else {"running": False, "healthy": False, "pid": None, "port": port}
             emit({"ok": True, "command": "status", "installed": installed, "provider": "qwen-local", **state})
         elif args.command == "health":
             installer.verify_installation()

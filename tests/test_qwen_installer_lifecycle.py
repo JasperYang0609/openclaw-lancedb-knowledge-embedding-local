@@ -10,8 +10,13 @@ from pathlib import Path
 
 import pytest
 
-from src.installer.qwen_installer import QwenInstaller, sha256_file, validate_runtime_version_output
-from src.lifecycle.llama_server_manager import LlamaServerManager
+from src.installer.qwen_installer import (
+    QwenInstaller,
+    atomic_json_write,
+    sha256_file,
+    validate_runtime_version_output,
+)
+from src.lifecycle.llama_server_manager import LlamaServerManager, _atomic_json_state, _open_safe_append
 
 
 def digest(data: bytes) -> str:
@@ -24,6 +29,55 @@ def artifact(tmp_path: Path, name: str, data: bytes, executable: bool = False) -
     if executable:
         file_path.chmod(0o700)
     return file_path
+
+
+@pytest.mark.parametrize("plant", ["symlink", "hardlink"])
+def test_atomic_manifest_write_refuses_preplanted_staging_link(tmp_path: Path, plant: str) -> None:
+    manifest = tmp_path / "install-manifest.json"
+    outside = artifact(tmp_path, "outside-user-file", b"do-not-overwrite")
+    temporary = manifest.with_suffix(".json.tmp")
+    if plant == "symlink":
+        temporary.symlink_to(outside)
+    else:
+        os.link(outside, temporary)
+
+    with pytest.raises(RuntimeError, match="staging path"):
+        atomic_json_write(manifest, {"provider": "qwen-local"})
+
+    assert outside.read_bytes() == b"do-not-overwrite"
+    assert not manifest.exists()
+
+
+@pytest.mark.parametrize("plant", ["symlink", "hardlink"])
+def test_pid_staging_write_refuses_preplanted_link(tmp_path: Path, plant: str) -> None:
+    pid_file = tmp_path / "llama-server.pid.json"
+    outside = artifact(tmp_path, "outside-pid-target", b"do-not-overwrite")
+    temporary = pid_file.with_suffix(".json.tmp")
+    if plant == "symlink":
+        temporary.symlink_to(outside)
+    else:
+        os.link(outside, temporary)
+
+    with pytest.raises(RuntimeError, match="PID staging"):
+        _atomic_json_state(pid_file, {"pid": 123})
+
+    assert outside.read_bytes() == b"do-not-overwrite"
+    assert not pid_file.exists()
+
+
+@pytest.mark.parametrize("plant", ["symlink", "hardlink"])
+def test_log_append_refuses_preplanted_link(tmp_path: Path, plant: str) -> None:
+    log = tmp_path / "llama-server.stdout.log"
+    outside = artifact(tmp_path, "outside-log-target", b"do-not-append")
+    if plant == "symlink":
+        log.symlink_to(outside)
+    else:
+        os.link(outside, log)
+
+    with pytest.raises(RuntimeError, match="log path"):
+        _open_safe_append(log)
+
+    assert outside.read_bytes() == b"do-not-append"
 
 
 def test_runtime_version_gate_matches_official_build_and_platform() -> None:
@@ -56,6 +110,7 @@ def test_installer_verifies_both_artifacts_and_writes_restricted_manifest(tmp_pa
     assert installer.api_key_file.stat().st_mode & 0o077 == 0
     assert installer.manifest_path.stat().st_mode & 0o077 == 0
     assert manifest["provider"] == "qwen-local"
+    assert manifest["runtimePort"] == 18888
     assert installer.verify_installation()["runtimeSha256"] == digest(server.read_bytes())
 
 
@@ -96,6 +151,21 @@ def test_installer_rejects_symlinked_api_key(tmp_path: Path) -> None:
     installer.api_key_file.symlink_to(real_key)
     with pytest.raises(RuntimeError, match="symbolic link"):
         installer.verify_installation()
+
+
+def test_installer_refuses_preplanted_api_key_hardlink_without_chmod(tmp_path: Path) -> None:
+    target = tmp_path / "managed" / "qwen"
+    installer = QwenInstaller(target)
+    installer._ensure_dirs()
+    outside = artifact(tmp_path, "outside-api-key", b"outside-user-value")
+    outside.chmod(0o644)
+    os.link(outside, installer.api_key_file)
+
+    with pytest.raises(RuntimeError, match="link count"):
+        installer._ensure_key()
+
+    assert outside.read_bytes() == b"outside-user-value"
+    assert outside.stat().st_mode & 0o777 == 0o644
 
 
 def test_installer_refuses_symlinked_runtime_without_mutating_source(tmp_path: Path) -> None:
@@ -140,6 +210,47 @@ def test_production_installer_refuses_preplanted_model_symlink(
         installer.install_from_artifacts(model_source=model, runtime_archive=archive)
 
     assert outside_file.read_bytes() == b"user-owned"
+
+
+def test_production_installer_refuses_preplanted_model_hardlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = artifact(tmp_path, "source-model.gguf", b"verified-model")
+    archive = artifact(tmp_path, "runtime.tar.gz", b"verified-runtime")
+    outside = artifact(tmp_path, "outside-user-model", b"do-not-overwrite")
+    target = tmp_path / "managed" / "qwen"
+    (target / "models").mkdir(parents=True)
+    os.link(outside, target / "models" / "Qwen3-Embedding-4B-Q5_K_M.gguf")
+    installer = QwenInstaller(target)
+    monkeypatch.setattr(installer, "_verify", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="link count"):
+        installer.install_from_artifacts(model_source=model, runtime_archive=archive)
+
+    assert outside.read_bytes() == b"do-not-overwrite"
+
+
+@pytest.mark.parametrize("plant", ["symlink", "hardlink"])
+def test_production_installer_refuses_preplanted_model_staging_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plant: str
+) -> None:
+    model = artifact(tmp_path, "source-model.gguf", b"verified-model")
+    archive = artifact(tmp_path, "runtime.tar.gz", b"verified-runtime")
+    outside = artifact(tmp_path, "outside-model-stage", b"do-not-overwrite")
+    target = tmp_path / "managed" / "qwen"
+    (target / "models").mkdir(parents=True)
+    temporary = target / "models" / "Qwen3-Embedding-4B-Q5_K_M.gguf.tmp"
+    if plant == "symlink":
+        temporary.symlink_to(outside)
+    else:
+        os.link(outside, temporary)
+    installer = QwenInstaller(target)
+    monkeypatch.setattr(installer, "_verify", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="Model staging"):
+        installer.install_from_artifacts(model_source=model, runtime_archive=archive)
+
+    assert outside.read_bytes() == b"do-not-overwrite"
 
 
 def test_uninstaller_removes_only_verified_managed_artifacts(tmp_path: Path) -> None:
