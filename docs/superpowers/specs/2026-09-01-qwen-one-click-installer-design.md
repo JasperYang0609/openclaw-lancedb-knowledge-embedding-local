@@ -2,7 +2,7 @@
 
 日期：2026-09-01
 
-狀態：`WRITTEN_PENDING_USER_REVIEW`
+狀態：`APPROVED_2026-09-01`
 
 核准背景：Jasper 已核准採方案 A，以 llama.cpp 官方 `b10625` macOS ARM64 預編譯包完成 D5-01。本文只補齊已簽收的自動下載／續傳與單一 CLI，不授權 Production Gemini 切換。
 
@@ -73,10 +73,11 @@ Bundled command：`python3 scripts/qwen_local.py <command>`。
 ## 安全解壓與安裝
 
 - runtime archive hash 通過後才可讀取。
-- 拒絕 absolute path、`..` traversal、symlink、hardlink、device、FIFO 與非預期頂層目錄。
+- 拒絕 absolute path、`..` traversal、hardlink、device、FIFO 與非預期頂層目錄。官方固定 digest 的 macOS archive 所含「同目錄 dylib alias」symlink 只在有限深度 chain 最終指向同一 archive 內的 regular sibling member 時接受，且安裝時必須 materialize 成 regular file；輸出目錄不得保留任何 symlink。absolute、跨目錄、循環、過深、missing-target 或 non-regular terminal target 一律拒絕。
 - 只接受固定 `llama-b10625/` inventory；必須包含 `llama-server`、LICENSE 與其 runtime dylibs。
 - 解壓到同檔案系統 staging directory；每個 regular file 記錄相對路徑、bytes、SHA-256 與 executable bit。
-- 完成 inventory／Mach-O architecture／`llama-server --version` 驗證後才 atomic promote。
+- 保留官方 runtime 的同層 binary／dylib layout；不得把 `llama-server` 搬離其 dylib 目錄。version Gate 必須在 candidate 目錄完成後才原子 promote，失敗時不留下 partial runtime。
+- 完成 inventory／Mach-O architecture／`llama-server --version` 的 official build 10625、commit prefix `0cc5b1495` 與 Darwin arm64 驗證後才 atomic promote。
 - manifest 綁定 archive digest、release commit、完整 inventory、model identity、platform、install root 與 schema version。
 - 不修改 PATH、shell rc、LaunchAgent、OpenClaw Production config、Gemini cache／DB 或現行排程。
 

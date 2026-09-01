@@ -8,8 +8,8 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "openclaw-lancedb-knowledge"
-OUTPUT = ROOT / "dist" / "openclaw-lancedb-knowledge.skill"
+SOURCE = ROOT / "openclaw-lancedb-knowledge-local"
+OUTPUT = ROOT / "dist" / "openclaw-lancedb-knowledge-local.skill"
 EXCLUDED_PARTS = {"node_modules", "__pycache__", "data", "reports"}
 FIXED_TIME = (1980, 1, 1, 0, 0, 0)
 
@@ -20,21 +20,35 @@ def normalized_archive_mode(mode: int) -> int:
 
 
 def source_files() -> list[Path]:
-    return sorted(
+    skill_files = sorted(
         path
         for path in SOURCE.rglob("*")
         if path.is_file()
         and not any(part in EXCLUDED_PARTS for part in path.relative_to(SOURCE).parts)
         and path.suffix != ".pyc"
     )
+    runtime_files = [
+        ROOT / "LICENSE",
+        ROOT / "qwen-local",
+        ROOT / "requirements.txt",
+        ROOT / "scripts/qwen_local.py",
+        *sorted((ROOT / "src/installer").glob("*.py")),
+        *sorted((ROOT / "src/lifecycle").glob("*.py")),
+    ]
+    return skill_files + [path for path in runtime_files if path.is_file()]
+
+
+def archive_name(path: Path) -> Path:
+    if path.is_relative_to(SOURCE):
+        return Path(SOURCE.name) / path.relative_to(SOURCE)
+    return Path(SOURCE.name) / path.relative_to(ROOT)
 
 
 def build(output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in source_files():
-            archive_name = Path(SOURCE.name) / path.relative_to(SOURCE)
-            info = zipfile.ZipInfo(str(archive_name), date_time=FIXED_TIME)
+            info = zipfile.ZipInfo(str(archive_name(path)), date_time=FIXED_TIME)
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = normalized_archive_mode(path.stat().st_mode) << 16
             archive.writestr(info, path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
@@ -63,7 +77,7 @@ def main() -> None:
             candidate = Path(tmp_dir) / OUTPUT.name
             build(candidate)
             if not OUTPUT.exists() or archive_manifest(candidate) != archive_manifest(OUTPUT):
-                raise SystemExit("dist/openclaw-lancedb-knowledge.skill is stale; rebuild it")
+                raise SystemExit("dist/openclaw-lancedb-knowledge-local.skill is stale; rebuild it")
         print(f"PASS skill archive matches {len(source_files())} source files")
         return
 
