@@ -1,7 +1,7 @@
 # Qwen 與 Gemini Embedding 隔離對照測試設計
 
-日期：2026-08-25  
-狀態：Jasper 已在 Discord 核准進行隔離測試  
+日期：2026-08-25
+狀態：Jasper 已在 Discord 核准進行隔離測試
 目標：用安賽現有知識資料與 20 題人工基準，判斷本機 Qwen3-Embedding-4B 是否能在搜尋品質與速度上取代 Gemini Embedding。
 
 ## 範圍與不可變邊界
