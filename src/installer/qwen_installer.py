@@ -105,6 +105,8 @@ class QwenInstaller:
         else:
             shutil.copy2(model_source_path, self.model_path)
 
+        if self.server_path.is_symlink():
+            raise RuntimeError("Managed llama-server path must not be a symbolic link")
         if not self.server_path.exists():
             shutil.copy2(server_source_path, self.server_path)
         self._verify(self.model_path, self.model_sha256, "installed Qwen model")
@@ -137,9 +139,26 @@ class QwenInstaller:
     def verify_installation(self) -> dict:
         if not self.manifest_path.is_file():
             raise RuntimeError("Install manifest is missing")
+        if self.manifest_path.is_symlink() or self.server_path.is_symlink():
+            raise RuntimeError("Install manifest and runtime must not be symbolic links")
+        if self.manifest_path.stat().st_mode & 0o077:
+            raise RuntimeError("Install manifest permissions are too broad")
         if self.api_key_file.is_symlink():
             raise RuntimeError("Local API credential must not be a symbolic link")
         manifest = json.loads(self.manifest_path.read_text())
+        expected_identity = {
+            "schemaVersion": 1,
+            "provider": "qwen-local",
+            "modelRevision": QWEN_REVISION,
+            "modelSha256": self.model_sha256,
+            "runtimeRevision": LLAMA_CPP_REVISION,
+            "runtimeSha256": self.server_sha256,
+            "modelPath": str(self.model_path),
+            "serverPath": str(self.server_path),
+            "apiKeyFile": str(self.api_key_file),
+        }
+        if any(manifest.get(key) != value for key, value in expected_identity.items()):
+            raise RuntimeError("Install manifest identity does not match the managed installation")
         self._verify(self.model_path, manifest["modelSha256"], "installed Qwen model")
         self._verify(self.server_path, manifest["runtimeSha256"], "installed llama-server")
         key_stat = self.api_key_file.stat()
@@ -149,3 +168,35 @@ class QwenInstaller:
         if len(key) < 32 or any(character.isspace() for character in key):
             raise RuntimeError("Local API credential is invalid")
         return manifest
+
+    def uninstall(self) -> dict:
+        """Remove only a verified installation with no unknown files."""
+        managed_directories = {Path("models"), Path("bin"), Path("run")}
+        if any((self.target_dir / relative).is_symlink() for relative in managed_directories):
+            raise RuntimeError("Refusing to uninstall through a symbolic-link directory")
+        self.verify_installation()
+        allowed_files = {
+            Path("models/Qwen3-Embedding-4B-Q5_K_M.gguf"),
+            Path("bin/llama-server"),
+            Path("run/api-key"),
+            Path("run/llama-server.stdout.log"),
+            Path("run/llama-server.stderr.log"),
+            Path("install-manifest.json"),
+        }
+        actual = {path.relative_to(self.target_dir) for path in self.target_dir.rglob("*")}
+        unexpected = sorted(str(path) for path in actual - allowed_files - managed_directories)
+        if unexpected:
+            raise RuntimeError(f"Refusing to uninstall a target with unexpected files: {unexpected[:5]}")
+
+        removed = []
+        for relative in sorted(allowed_files, key=lambda item: len(item.parts), reverse=True):
+            path = self.target_dir / relative
+            if path.exists() or path.is_symlink():
+                path.unlink()
+                removed.append(str(relative))
+        for relative in sorted(managed_directories, key=lambda item: len(item.parts), reverse=True):
+            path = self.target_dir / relative
+            if path.exists():
+                path.rmdir()
+        self.target_dir.rmdir()
+        return {"status": "uninstalled", "removedManagedFiles": len(removed)}

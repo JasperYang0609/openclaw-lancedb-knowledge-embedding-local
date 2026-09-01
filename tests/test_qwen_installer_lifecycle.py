@@ -86,6 +86,87 @@ def test_installer_rejects_symlinked_api_key(tmp_path: Path) -> None:
         installer.verify_installation()
 
 
+def test_installer_refuses_symlinked_runtime_without_mutating_source(tmp_path: Path) -> None:
+    model = artifact(tmp_path, "model.gguf", b"model")
+    server = artifact(tmp_path, "llama-server", b"server", executable=True)
+    target = tmp_path / "managed" / "qwen"
+    installer = QwenInstaller(
+        target,
+        model_sha256=digest(model.read_bytes()),
+        server_sha256=digest(server.read_bytes()),
+    )
+    installer.server_path.parent.mkdir(parents=True)
+    installer.server_path.symlink_to(server)
+    mode_before = server.stat().st_mode
+
+    with pytest.raises(RuntimeError, match="must not be a symbolic link"):
+        installer.install_from_verified_sources(model_source=model, server_source=server)
+
+    assert server.stat().st_mode == mode_before
+
+
+def test_uninstaller_removes_only_verified_managed_artifacts(tmp_path: Path) -> None:
+    model = artifact(tmp_path, "model.gguf", b"model")
+    server = artifact(tmp_path, "llama-server", b"server", executable=True)
+    target = tmp_path / "managed" / "qwen"
+    installer = QwenInstaller(
+        target,
+        model_sha256=digest(model.read_bytes()),
+        server_sha256=digest(server.read_bytes()),
+    )
+    installer.install_from_verified_sources(model_source=model, server_source=server)
+    (installer.target_dir / "run" / "llama-server.stdout.log").write_text("fixture log")
+
+    result = installer.uninstall()
+
+    assert result["status"] == "uninstalled"
+    assert not target.exists()
+    assert model.exists()
+    assert server.exists()
+
+
+def test_uninstaller_refuses_unknown_files_without_partial_deletion(tmp_path: Path) -> None:
+    model = artifact(tmp_path, "model.gguf", b"model")
+    server = artifact(tmp_path, "llama-server", b"server", executable=True)
+    target = tmp_path / "managed" / "qwen"
+    installer = QwenInstaller(
+        target,
+        model_sha256=digest(model.read_bytes()),
+        server_sha256=digest(server.read_bytes()),
+    )
+    installer.install_from_verified_sources(model_source=model, server_source=server)
+    unknown = target / "do-not-delete.txt"
+    unknown.write_text("user data")
+
+    with pytest.raises(RuntimeError, match="unexpected files"):
+        installer.uninstall()
+
+    assert unknown.read_text() == "user data"
+    assert installer.verify_installation()["provider"] == "qwen-local"
+
+
+def test_uninstaller_refuses_symlinked_managed_directory(tmp_path: Path) -> None:
+    model = artifact(tmp_path, "model.gguf", b"model")
+    server = artifact(tmp_path, "llama-server", b"server", executable=True)
+    target = tmp_path / "managed" / "qwen"
+    installer = QwenInstaller(
+        target,
+        model_sha256=digest(model.read_bytes()),
+        server_sha256=digest(server.read_bytes()),
+    )
+    installer.install_from_verified_sources(model_source=model, server_source=server)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    installer.api_key_file.unlink()
+    (target / "run").rmdir()
+    (target / "run").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symbolic-link directory"):
+        installer.uninstall()
+
+    assert outside.exists()
+
+
 def test_lifecycle_command_is_loopback_embedding_only_and_uses_last_pooling(tmp_path: Path) -> None:
     server = artifact(tmp_path, "llama-server", b"server", executable=True)
     model = artifact(tmp_path, "model.gguf", b"model")

@@ -189,6 +189,46 @@ def process_alive(pid: int) -> bool:
         return False
 
 
+def shadow_runner_alive(pid: int) -> bool:
+    if not process_alive(pid):
+        return False
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return "shadow-index.js" in result.stdout and "node" in result.stdout
+
+
+def reconcile_runner_state(paths: dict[str, Path]) -> dict | None:
+    """Convert a dead runner PID record into an explicit terminal state."""
+    runner_path = paths["runner_state"]
+    if not runner_path.is_file():
+        return None
+    runner = json.loads(runner_path.read_text())
+    runner_alive = shadow_runner_alive(int(runner["pid"]))
+    runner["alive"] = runner_alive
+    if runner_alive:
+        runner["status"] = "running"
+        return runner
+    checkpoint_path = paths["shadow"] / "checkpoint.json"
+    checkpoint = json.loads(checkpoint_path.read_text()) if checkpoint_path.is_file() else None
+    complete = bool(
+        checkpoint
+        and checkpoint.get("status") == "complete"
+        and int(checkpoint.get("completedRows") or 0) == int(checkpoint.get("totalRows") or -1)
+    )
+    runner["status"] = "complete" if complete else "interrupted"
+    runner["terminalAtEpoch"] = runner.get("terminalAtEpoch") or time.time()
+    atomic_json(runner_path, runner)
+    return runner
+
+
 def run_index(args: argparse.Namespace, *, background: bool) -> None:
     root = resolve_specific(args.root)
     paths = managed_paths(root, args.mode)
@@ -232,10 +272,7 @@ def status(args: argparse.Namespace) -> None:
     root = resolve_specific(args.root)
     paths = managed_paths(root, args.mode)
     sidecar = manager_for(root, args.port)
-    runner = None
-    if paths["runner_state"].is_file():
-        runner = json.loads(paths["runner_state"].read_text())
-        runner["alive"] = process_alive(int(runner["pid"]))
+    runner = reconcile_runner_state(paths)
     checkpoint = None
     checkpoint_path = paths["shadow"] / "checkpoint.json"
     if checkpoint_path.is_file():
