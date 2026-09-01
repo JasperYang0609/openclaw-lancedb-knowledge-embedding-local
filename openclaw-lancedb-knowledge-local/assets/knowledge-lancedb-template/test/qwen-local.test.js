@@ -5,6 +5,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { QwenLocalEmbedder, assertLoopbackEndpoint } from '../src/embed-qwen.js';
+import { resolveQualityConfig } from '../src/quality-profile.js';
 
 function nativeVector(seed, dimensions = 2560) {
   return Array.from({ length: dimensions }, (_, index) => ((index + seed) % 17) - 8);
@@ -42,6 +43,18 @@ test('Qwen endpoint is strictly loopback HTTP', () => {
   assert.throws(() => assertLoopbackEndpoint('https://example.com'), /loopback/i);
   assert.throws(() => assertLoopbackEndpoint('http://192.168.1.20:8080'), /loopback/i);
   assert.throws(() => assertLoopbackEndpoint('file:///tmp/socket'), /loopback/i);
+});
+
+test('Qwen quality profile binds query instruction and runtime supply-chain identity', () => {
+  const resolved = resolveQualityConfig({ embedding: {} }).embedding;
+  assert.equal(resolved.queryInstruction, 'Given a web search query, retrieve relevant passages that answer the query');
+  assert.equal(resolved.runtimeRevision, 'b10625');
+  assert.equal(resolved.runtimeCommit, '0cc5b14959ee3a813bd787baaef50a170493547a');
+  assert.equal(resolved.runtimeArchiveSha256, 'f13c74d104c1ff2e37a14ecb2025afe5c9c4c148064badfd8116376018dd5159');
+  assert.throws(
+    () => resolveQualityConfig({ embedding: { queryInstruction: 'changed default' } }),
+    /identity mismatch/i
+  );
 });
 
 test('Qwen embedder authenticates, preserves order, truncates to 768 and normalizes', async () => {

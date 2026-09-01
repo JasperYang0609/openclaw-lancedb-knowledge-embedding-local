@@ -117,6 +117,31 @@ def test_installer_refuses_symlinked_runtime_without_mutating_source(tmp_path: P
     assert server.stat().st_mode == mode_before
 
 
+@pytest.mark.parametrize("link_kind", ["models-directory", "model-file"])
+def test_production_installer_refuses_preplanted_model_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_kind: str
+) -> None:
+    model = artifact(tmp_path, "source-model.gguf", b"verified-model")
+    archive = artifact(tmp_path, "runtime.tar.gz", b"verified-runtime")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = artifact(outside, "do-not-overwrite.gguf", b"user-owned")
+    target = tmp_path / "managed" / "qwen"
+    target.mkdir(parents=True)
+    if link_kind == "models-directory":
+        (target / "models").symlink_to(outside, target_is_directory=True)
+    else:
+        (target / "models").mkdir()
+        (target / "models" / "Qwen3-Embedding-4B-Q5_K_M.gguf").symlink_to(outside_file)
+    installer = QwenInstaller(target)
+    monkeypatch.setattr(installer, "_verify", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="symbolic link"):
+        installer.install_from_artifacts(model_source=model, runtime_archive=archive)
+
+    assert outside_file.read_bytes() == b"user-owned"
+
+
 def test_uninstaller_removes_only_verified_managed_artifacts(tmp_path: Path) -> None:
     model = artifact(tmp_path, "model.gguf", b"model")
     server = artifact(tmp_path, "llama-server", b"server", executable=True)
@@ -273,3 +298,22 @@ def test_lifecycle_recovered_pid_still_requires_process_identity(tmp_path: Path,
 
     with pytest.raises(RuntimeError, match="not the managed llama-server"):
         manager.stop()
+
+
+def test_uninstall_refuses_unknown_listener_without_pid_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = artifact(tmp_path, "llama-server", b"server", executable=True)
+    model = artifact(tmp_path, "model.gguf", b"model")
+    key_file = artifact(tmp_path, "api-key", b"local-secret-value")
+    key_file.chmod(0o600)
+    manager = LlamaServerManager(
+        server_binary=server,
+        model_path=model,
+        api_key_file=key_file,
+        state_dir=tmp_path / "state",
+    )
+    monkeypatch.setattr(manager, "_is_port_in_use", lambda: True)
+
+    with pytest.raises(RuntimeError, match="without managed PID state"):
+        manager.stop_for_uninstall()

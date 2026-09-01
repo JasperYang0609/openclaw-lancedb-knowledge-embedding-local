@@ -4,15 +4,17 @@ Status: CUSTOMER_INSTALLER_AND_LIVE_ARTIFACT_REHEARSAL_PASS
 
 ## Passed
 
-- Python unit/integration: 33 passed after the live-artifact and cross-platform lifecycle fixes.
-- Node template: 27 passed.
+- Python unit/integration: 36 passed.
+- Node template: 28 passed.
 - Bootstrap, snapshot, cron tooling, dangerous-exec, postrun and deterministic archive parity: PASS.
 - npm production dependency audit: 0 vulnerabilities.
 - Runtime source negative scan: no cloud embedding endpoint, cloud credential read, cross-provider branch, local-hash product provider or shadow-index entry.
 - Secret-pattern and tracked/untracked file-size scans: PASS; model/corpus/vector/credential artifacts are absent.
 - Unified CLI uninstalled `status` smoke: PASS with redacted JSON.
+- Isolated-Python probe (`-I`) passed without user-site packages; the customer runtime now uses only the Python standard library.
+- The deterministic skill archive includes the repository MIT `LICENSE`.
 
-Final regression logs: `20260901_130050_local-qwen-final-regression-after-live.log`, `20260901_130124_local-qwen-final-security-scans-after-live.log`, and `20260901_130617_local-qwen-managed-child-identity-fix-r2.log` under the workspace tool-run log root. The deterministic archive contains 41 files, including the unified CLI, installer, lifecycle manager and dependency manifest.
+Final post-review regression logs: `20260901_132016_local-qwen-post-review-final-regression.log` and `20260901_132041_local-qwen-post-review-security-scans.log` under the workspace tool-run log root. The deterministic archive contains 42 files, including the unified CLI, installer, lifecycle manager, dependency manifest and MIT license.
 
 ## Live official-artifact evidence
 
@@ -23,7 +25,11 @@ Final regression logs: `20260901_130050_local-qwen-final-regression-after-live.l
 - The official executable must remain beside its dynamic libraries. Installation now verifies the runtime in a staging directory and only atomically promotes it after the exact build/commit/platform marker passes.
 - The pinned `b10625` runtime produced a finite 2560-dimensional native vector and a unit-normalized 768-dimensional product vector. Compared with the previously validated runtime, cosine similarity was `1.000000000000` and maximum absolute difference was `0`.
 - A fresh 20-query full-index rerun against the new runtime passed at Hit@5 `18/20` (`90%`) and MRR `0.7667`, identical to the signed Day 5 baseline. The local-only search path completed without a cloud provider or cloud fallback configuration.
+- The same 20-query end-to-end path measured fresh CLI process, query embedding, LanceDB retrieval and output rendering at p50 `526.8 ms`, p95 `565.7 ms`, mean `539.0 ms` and max `824.9 ms`; the signed p95 target of `1,000 ms` passed.
+- Production installation now rejects pre-planted target, model-directory and model-file symlinks before copying the model. An isolated negative test confirmed an outside user-owned file was unchanged.
+- When the sidecar port is live but the managed PID record is missing, uninstall fails closed and preserves the runtime. The live negative rehearsal passed before a restored managed stop/uninstall removed the isolated target.
+- The index fingerprint now binds the query instruction, runtime release, immutable runtime commit and runtime archive SHA-256 in addition to model identity.
 
-Live logs: `20260901_125133_qwen-local-live-install-round1-r6.log`, `20260901_125307_qwen-local-live-install-round2.log`, `20260901_125452_qwen-local-live-round2-verify-uninstall.log`, `20260901_125625_qwen-local-runtime-benchmark-install.log`, `20260901_125716_qwen-runtime-vector-parity.log`, and `20260901_125837_qwen-b10625-full-20-query-benchmark.log` under the workspace tool-run log root.
+Live logs: `20260901_125133_qwen-local-live-install-round1-r6.log`, `20260901_125307_qwen-local-live-install-round2.log`, `20260901_125452_qwen-local-live-round2-verify-uninstall.log`, `20260901_125625_qwen-local-runtime-benchmark-install.log`, `20260901_125716_qwen-runtime-vector-parity.log`, `20260901_125837_qwen-b10625-full-20-query-benchmark.log`, `20260901_131739_qwen-clean-python-live-install-after-review.log`, `20260901_131847_qwen-b10625-20-query-e2e-latency-p95.log`, and `20260901_131923_qwen-orphan-uninstall-live-negative.log` under the workspace tool-run log root.
 
 This report does not claim a Production cutover. PR, CI and merge evidence are recorded separately during repository closeout.

@@ -28,6 +28,7 @@ def source_files() -> list[Path]:
         and path.suffix != ".pyc"
     )
     runtime_files = [
+        ROOT / "LICENSE",
         ROOT / "qwen-local",
         ROOT / "requirements.txt",
         ROOT / "scripts/qwen_local.py",

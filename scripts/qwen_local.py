@@ -76,8 +76,7 @@ def main(argv: list[str] | None = None) -> int:
                   "embeddingCanary": canary})
             return 0 if canary else 1
         elif args.command == "uninstall":
-            if manager.pid_file.exists():
-                manager.stop()
+            manager.stop_for_uninstall()
             emit({"ok": True, "command": "uninstall", **installer.uninstall()})
         return 0
     except Exception as error:

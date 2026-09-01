@@ -41,7 +41,7 @@ def main() -> None:
         names = set(packaged.namelist())
         prefix = "openclaw-lancedb-knowledge-local/"
         for required in (
-            "qwen-local", "requirements.txt", "scripts/qwen_local.py",
+            "LICENSE", "qwen-local", "requirements.txt", "scripts/qwen_local.py",
             "src/installer/artifacts.py", "src/installer/downloader.py",
             "src/installer/safe_archive.py", "src/installer/qwen_installer.py",
             "src/lifecycle/llama_server_manager.py",

@@ -44,6 +44,8 @@ function embeddingIdentity(embedding = {}) {
     quantization: embedding.quantization ?? null,
     modelSha256: embedding.modelSha256 ?? null,
     runtimeRevision: embedding.runtimeRevision ?? null,
+    runtimeCommit: embedding.runtimeCommit ?? null,
+    runtimeArchiveSha256: embedding.runtimeArchiveSha256 ?? null,
     pooling: embedding.pooling ?? null,
     queryInstruction: embedding.queryInstruction ?? null,
     normalization: embedding.normalization ?? null

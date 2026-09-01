@@ -7,9 +7,9 @@ import signal
 import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
-
-import requests
 
 
 class LlamaServerManager:
@@ -73,28 +73,48 @@ class LlamaServerManager:
 
     def is_healthy(self) -> bool:
         try:
-            response = requests.get(f"http://127.0.0.1:{self.port}/health", timeout=1)
-            return response.status_code == 200
-        except requests.RequestException:
+            request = urllib.request.Request(f"http://127.0.0.1:{self.port}/health", method="GET")
+            with urllib.request.urlopen(request, timeout=1) as response:
+                return response.status == 200
+        except (urllib.error.URLError, TimeoutError, OSError):
             return False
 
     def embedding_canary(self) -> bool:
         try:
-            response = requests.post(
+            payload = json.dumps({
+                "input": ["local embedding health canary"],
+                "encoding_format": "float",
+            }).encode("utf-8")
+            request = urllib.request.Request(
                 f"http://127.0.0.1:{self.port}/v1/embeddings",
-                headers={"Authorization": f"Bearer {self._api_key()}"},
-                json={"input": ["local embedding health canary"], "encoding_format": "float"},
-                timeout=120,
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {self._api_key()}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
             )
-            if response.status_code != 200:
-                return False
-            data = response.json().get("data") or []
+            with urllib.request.urlopen(request, timeout=120) as response:
+                if response.status != 200:
+                    return False
+                data = json.loads(response.read().decode("utf-8")).get("data") or []
             vector = data[0].get("embedding") if len(data) == 1 else None
             return isinstance(vector, list) and len(vector) == 2560 and all(
                 isinstance(value, (int, float)) and math.isfinite(value) for value in vector
             ) and math.sqrt(sum(float(value) ** 2 for value in vector)) > 0
-        except (requests.RequestException, ValueError, TypeError, IndexError):
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError,
+                UnicodeDecodeError, ValueError, TypeError, IndexError):
             return False
+
+    def stop_for_uninstall(self) -> None:
+        """Stop a managed sidecar or refuse deletion when ownership is unknown."""
+        if self.pid_file.exists() or (self.process and self.process.poll() is None):
+            self.stop()
+            return
+        if self._is_port_in_use():
+            raise RuntimeError(
+                f"Refusing to uninstall while loopback port {self.port} is in use without managed PID state"
+            )
 
     def start(self, *, timeout_seconds: int = 180) -> int:
         self.validate_files()

@@ -44,16 +44,21 @@ class QwenInstaller:
         raw = Path(target_dir).expanduser()
         if raw == Path(raw.anchor) or len(raw.parts) < 4:
             raise ValueError("Installer target must be a specific managed directory")
-        self.target_dir = raw.resolve(strict=False)
+        self.target_dir = Path(os.path.abspath(raw))
         home = Path.home().resolve()
         workspace = (home / ".openclaw/workspace").resolve(strict=False)
         forbidden = {home, workspace, home / ".openclaw", Path("/")}
-        if self.target_dir in forbidden or self.target_dir.name in {"knowledge-lancedb", "openclaw-lancedb-knowledge-skill"}:
+        if self.target_dir.resolve(strict=False) in forbidden or self.target_dir.name in {
+            "knowledge-lancedb", "openclaw-lancedb-knowledge-skill"
+        }:
             raise ValueError("Installer target overlaps a protected root or Gemini product path")
-        parent = self.target_dir.parent
-        if parent.exists() and parent.is_symlink():
-            raise ValueError("Installer target parent must not be a symbolic link")
-        if parent.exists() and parent.stat().st_uid != os.getuid():
+        for component in (self.target_dir, *self.target_dir.parents):
+            if component.is_symlink():
+                raise ValueError("Installer target path must not contain symbolic links")
+        nearest_existing = next(
+            component for component in (self.target_dir, *self.target_dir.parents) if component.exists()
+        )
+        if nearest_existing != Path("/") and nearest_existing.stat().st_uid != os.getuid():
             raise ValueError("Installer target parent must be owned by the current user")
         self.model_sha256 = model_sha256
         self.server_sha256 = server_sha256
@@ -81,10 +86,14 @@ class QwenInstaller:
             raise RuntimeError(f"{label} SHA-256 mismatch")
 
     def _ensure_dirs(self) -> None:
-        if self.target_dir.exists() and self.target_dir.is_symlink():
-            raise RuntimeError("Managed target must not be a symbolic link")
         for directory in (self.target_dir, self.model_path.parent, self.api_key_file.parent):
+            if directory.is_symlink():
+                raise RuntimeError("Managed directories must not be symbolic links")
+            if directory.exists() and not directory.is_dir():
+                raise RuntimeError("Managed directory path must be a directory")
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if directory.stat().st_uid != os.getuid():
+                raise RuntimeError("Managed directories must be owned by the current user")
             os.chmod(directory, 0o700)
 
     def _ensure_key(self) -> None:
@@ -104,6 +113,8 @@ class QwenInstaller:
         if self.manifest_path.exists():
             return self.verify_installation()
         self._ensure_dirs()
+        if self.model_path.is_symlink() or (self.model_path.exists() and not self.model_path.is_file()):
+            raise RuntimeError("Managed model path must be a regular file and not a symbolic link")
         shutil.copy2(model, self.model_path)
         os.chmod(self.model_path, 0o600)
         candidate = self.target_dir / ".runtime-candidate"
@@ -197,6 +208,8 @@ class QwenInstaller:
                     "runtimeCommit": "0cc5b14959ee3a813bd787baaef50a170493547a"}
         if any(manifest.get(key) != value for key, value in identity.items()):
             raise RuntimeError("Install manifest identity does not match the managed installation")
+        if self.model_path.is_symlink() and not manifest.get("developmentModelLink"):
+            raise RuntimeError("Installed Qwen model must not be a symbolic link")
         self._verify(self.model_path, self.model_sha256, "installed Qwen model")
         if self.server_path.is_symlink() or not self.server_path.is_file():
             raise RuntimeError("Installed llama-server is missing or unsafe")
@@ -242,7 +255,7 @@ class QwenInstaller:
         allowed_files.add(Path("runtime/llama-server"))
         actual = {path.relative_to(self.target_dir) for path in self.target_dir.rglob("*")}
         for path in actual:
-            if (self.target_dir / path).is_symlink() and path != Path("models") / QWEN_MODEL.filename:
+            if (self.target_dir / path).is_symlink():
                 raise RuntimeError("Refusing to uninstall a target containing a symbolic link")
         unexpected = sorted(str(path) for path in actual - allowed_files - allowed_dirs)
         if unexpected:
