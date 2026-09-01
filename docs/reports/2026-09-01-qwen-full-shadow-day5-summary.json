@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-09-01",
+  "status": "PASS_SHADOW_ONLY_READY_FOR_CONTROLLED_CUTOVER_REVIEW",
+  "fullIndex": {
+    "rows": 96163,
+    "uniqueChunkIds": 96163,
+    "duplicateChunkIds": 0,
+    "vectorDimensions": 768,
+    "finiteVectors": 96163,
+    "buildDurationSeconds": 53959,
+    "passed": true
+  },
+  "quality": {
+    "cases": 20,
+    "qwen": {"hitAt5": 0.9, "mrr": 0.7666666667, "passed": true},
+    "gemini": {"hitAt5": 0.95, "mrr": 0.7083333333, "passed": true},
+    "comparisonPassed": true
+  },
+  "endToEndLatency": {
+    "targetP95Ms": 1000,
+    "qwenP95Ms": 744.735417,
+    "geminiIsolatedCacheHitP95Ms": 302.691375,
+    "passed": true
+  },
+  "day5": {
+    "freshInstallCanaryUninstall": "pass",
+    "restoreReinstallCanaryUninstall": "pass",
+    "sourceArtifactsPreserved": true,
+    "productionBoundaryUnchanged": true,
+    "runnerTerminalCleanupFinding": "resolved",
+    "pythonTests": {"passed": 22, "failed": 0},
+    "nodeTests": {"passed": 41, "failed": 0},
+    "postRunChecks": {"passed": 16, "failed": 0},
+    "npmHighCriticalVulnerabilities": 0
+  },
+  "findings": {
+    "securityP0": 0,
+    "securityP1": 0,
+    "productizationP1": ["automatic_artifact_acquisition_and_customer_cli_missing"],
+    "environmentP2": ["system_python_libressl_warning_for_future_https_downloader"]
+  },
+  "productionCutoverApproved": false,
+  "recommendedNextGate": "CONTROLLED_LOCAL_CUTOVER_PLAN"
+}
