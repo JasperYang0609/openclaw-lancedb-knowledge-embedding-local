@@ -2,7 +2,7 @@
 
 日期：2026-09-01
 
-狀態：`WRITTEN_PENDING_USER_REVIEW`
+狀態：`APPROVED_2026-09-01`
 
 核准背景：Jasper 已核准採方案 A，以 llama.cpp 官方 `b10625` macOS ARM64 預編譯包完成 D5-01。本文只補齊已簽收的自動下載／續傳與單一 CLI，不授權 Production Gemini 切換。
 

@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "dbPath": "./data/qwen-local-lancedb",
+  "tableName": "knowledge_chunks_qwen_local_768",
+  "privacy": {
+    "discordRawApproval": "NOT_CONFIRMED",
+    "exactMessageIdValidation": "SKIPPED_PRIVACY_GATE"
+  },
+  "embedding": {
+    "provider": "qwen-local",
+    "model": "Qwen3-Embedding-4B-Q5_K_M",
+    "dimensions": 768,
+    "nativeDimensions": 2560,
+    "quantization": "Q5_K_M",
+    "modelSha256": "9fd05563211c2d69d74abb8769fa92983a102d11575b2517a119b0037dff217c",
+    "runtimeRevision": "b10625",
+    "pooling": "last",
+    "normalization": "truncate-768-then-l2",
+    "endpoint": "http://127.0.0.1:18888",
+    "apiKeyFile": "~/Library/Application Support/OpenClaw/qwen-local/run/api-key",
+    "batchSize": 4,
+    "timeoutMs": 120000
+  },
+  "chunking": {
+    "maxChars": 3600,
+    "overlapChars": 350
+  },
+  "enrichment": {
+    "enabled": false,
+    "inputPath": "./data/enrichment/validated.jsonl",
+    "minConfidence": 0.75,
+    "privacyApprovedAt": null,
+    "privacyApprovedBy": null
+  },
+  "maxFileBytes": 1200000,
+  "sources": [
+    {
+      "id": "workspace-memory",
+      "project": "OpenClawOps",
+      "sourceType": "memory",
+      "root": "__OPENCLAW_WORKSPACE__/memory",
+      "include": ["**/*.md"],
+      "exclude": ["**/*.bak*", "**/*secret*", "**/*token*", "**/.env*"],
+      "priority": 0
+    },
+    {
+      "id": "discord-backup-summary",
+      "project": "DiscordBackups",
+      "sourceType": "backup_summary",
+      "root": "__DISCORD_BACKUP_ROOT__",
+      "include": ["**/summary/**/*.md", "**/*摘要*.md", "**/*summary*.md"],
+      "exclude": ["**/raw/**", "**/legacy/**", "**/legacy_docs/**", "**/summary/_inventory-index*.md", "**/_inventory-index*.md", "**/.env*", "**/*secret*", "**/*token*"],
+      "priority": 0
+    },
+    {
+      "id": "project-docs",
+      "project": "ClientProject",
+      "sourceType": "project_doc",
+      "root": "__PROJECT_DOC_ROOT__",
+      "include": ["**/*.md"],
+      "exclude": ["**/node_modules/**", "**/build/**", "**/.git/**", "**/dist/**", "**/.env*", "**/*secret*", "**/*token*"],
+      "priority": 1
+    }
+  ]
+}

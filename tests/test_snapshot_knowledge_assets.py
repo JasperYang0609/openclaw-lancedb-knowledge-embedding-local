@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "openclaw-lancedb-knowledge" / "assets" / "knowledge-lancedb-template" / "scripts" / "snapshot_knowledge_assets.py"
+SCRIPT = ROOT / "openclaw-lancedb-knowledge-local" / "assets" / "knowledge-lancedb-template" / "scripts" / "snapshot_knowledge_assets.py"
 
 
 def run(*args: str) -> subprocess.CompletedProcess[str]:

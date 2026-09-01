@@ -5,8 +5,8 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TEMPLATE = ROOT / "openclaw-lancedb-knowledge" / "assets" / "knowledge-lancedb-template"
-BOOTSTRAP = ROOT / "openclaw-lancedb-knowledge" / "scripts" / "bootstrap_openclaw_lancedb.py"
+TEMPLATE = ROOT / "openclaw-lancedb-knowledge-local" / "assets" / "knowledge-lancedb-template"
+BOOTSTRAP = ROOT / "openclaw-lancedb-knowledge-local" / "scripts" / "bootstrap_openclaw_lancedb.py"
 
 PRODUCTION_PATTERNS = {
     "node child process": re.compile(r"node:child_process|\b(?:exec|execFile|execSync|spawn|spawnSync)\s*\("),

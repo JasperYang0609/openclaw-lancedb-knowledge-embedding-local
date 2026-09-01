@@ -4,7 +4,7 @@ from datetime import date
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).parents[1] / "openclaw-lancedb-knowledge/assets/knowledge-lancedb-template/scripts/snapshot_knowledge_assets.py"
+SCRIPT = Path(__file__).parents[1] / "openclaw-lancedb-knowledge-local/assets/knowledge-lancedb-template/scripts/snapshot_knowledge_assets.py"
 spec = importlib.util.spec_from_file_location("snapshot_knowledge_assets_hardening", SCRIPT)
 snapshot = importlib.util.module_from_spec(spec)
 assert spec.loader is not None

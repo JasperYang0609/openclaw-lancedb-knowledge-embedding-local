@@ -13,20 +13,30 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: openclaw-lancedb-knowledge/assets/knowledge-lancedb-template
+        working-directory: openclaw-lancedb-knowledge-local/assets/knowledge-lancedb-template
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: openclaw-lancedb-knowledge/assets/knowledge-lancedb-template/package-lock.json
+          cache-dependency-path: openclaw-lancedb-knowledge-local/assets/knowledge-lancedb-template/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install Python test dependencies
+        working-directory: .
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run Python unit and integration tests
+        working-directory: .
+        run: python -m pytest -q
       - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm run postrun:check
       - name: Validate bootstrap script
         working-directory: .
-        run: python3 -m py_compile openclaw-lancedb-knowledge/scripts/bootstrap_openclaw_lancedb.py openclaw-lancedb-knowledge/assets/knowledge-lancedb-template/scripts/snapshot_knowledge_assets.py tests/test_bootstrap_security.py tests/test_snapshot_knowledge_assets.py tests/test_skill_archive.py scripts/check_dangerous_exec.py scripts/build_skill_archive.py
+        run: python3 -m py_compile openclaw-lancedb-knowledge-local/scripts/bootstrap_openclaw_lancedb.py openclaw-lancedb-knowledge-local/assets/knowledge-lancedb-template/scripts/snapshot_knowledge_assets.py tests/test_bootstrap_security.py tests/test_snapshot_knowledge_assets.py tests/test_skill_archive.py scripts/check_dangerous_exec.py scripts/build_skill_archive.py
       - name: Test bootstrap execution boundary
         working-directory: .
         run: python3 tests/test_bootstrap_security.py

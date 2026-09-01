@@ -100,11 +100,16 @@ class LlamaServerManager:
         self.validate_files()
         if self.pid_file.is_file():
             try:
-                recorded_pid = int(json.loads(self.pid_file.read_text())["pid"])
+                metadata = json.loads(self.pid_file.read_text())
+                recorded_pid = int(metadata["pid"])
             except (ValueError, KeyError, json.JSONDecodeError):
                 raise RuntimeError("Invalid llama-server pid file")
             if self._process_exists(recorded_pid):
-                raise RuntimeError("A managed llama-server process is already recorded")
+                if not self._pid_identity_matches(metadata) or not self._is_expected_process(recorded_pid):
+                    raise RuntimeError("Recorded PID does not match the managed llama-server identity")
+                if self.is_healthy() and self.embedding_canary():
+                    return recorded_pid
+                raise RuntimeError("Managed llama-server is running but unhealthy")
             self.pid_file.unlink()
         if self._is_port_in_use():
             raise RuntimeError(f"Loopback port {self.port} is already in use")
@@ -126,11 +131,14 @@ class LlamaServerManager:
             if self.is_healthy() and self.embedding_canary():
                 temporary = self.pid_file.with_suffix(".tmp")
                 temporary.write_text(json.dumps({
-                    "schemaVersion": 1,
+                    "schemaVersion": 2,
                     "pid": self.process.pid,
                     "port": self.port,
                     "startedAtEpoch": time.time(),
+                    "serverBinary": str(self.server_binary),
+                    "modelPath": str(self.model_path),
                 }, indent=2) + "\n")
+                os.chmod(temporary, 0o600)
                 temporary.replace(self.pid_file)
                 return self.process.pid
             time.sleep(1)
@@ -142,9 +150,12 @@ class LlamaServerManager:
         pid = managed_process.pid if managed_process else None
         if pid is None and self.pid_file.is_file():
             try:
-                pid = int(json.loads(self.pid_file.read_text())["pid"])
+                metadata = json.loads(self.pid_file.read_text())
+                pid = int(metadata["pid"])
             except (ValueError, KeyError, json.JSONDecodeError):
                 raise RuntimeError("Invalid llama-server pid file")
+            if not self._pid_identity_matches(metadata):
+                raise RuntimeError("Refusing to stop a process with mismatched PID metadata")
         if pid is not None:
             if not self._process_exists(pid):
                 pid = None
@@ -173,6 +184,34 @@ class LlamaServerManager:
                     os.kill(pid, signal.SIGKILL)
         self.process = None
         self.pid_file.unlink(missing_ok=True)
+
+    def status(self) -> dict:
+        metadata = None
+        if self.pid_file.is_file():
+            try:
+                metadata = json.loads(self.pid_file.read_text())
+            except (OSError, json.JSONDecodeError):
+                metadata = None
+        pid = int(metadata["pid"]) if metadata and isinstance(metadata.get("pid"), int) else None
+        running = bool(pid and self._process_exists(pid) and self._pid_identity_matches(metadata)
+                       and self._is_expected_process(pid))
+        return {
+            "running": running,
+            "healthy": bool(running and self.is_healthy()),
+            "pid": pid if running else None,
+            "port": self.port,
+            "endpoint": f"http://127.0.0.1:{self.port}",
+        }
+
+    def _pid_identity_matches(self, metadata: dict) -> bool:
+        if metadata.get("schemaVersion") == 1:
+            return metadata.get("port") == self.port
+        return (
+            metadata.get("schemaVersion") == 2
+            and metadata.get("port") == self.port
+            and metadata.get("serverBinary") == str(self.server_binary)
+            and metadata.get("modelPath") == str(self.model_path)
+        )
 
     @staticmethod
     def _process_exists(pid: int) -> bool:

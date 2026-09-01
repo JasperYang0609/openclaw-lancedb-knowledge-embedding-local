@@ -2,7 +2,7 @@
 
 日期：2026-09-01
 
-狀態：`WRITTEN_SPEC_PENDING_USER_REVIEW`
+狀態：`APPROVED_2026-09-01`
 
 ## 一句話目標
 

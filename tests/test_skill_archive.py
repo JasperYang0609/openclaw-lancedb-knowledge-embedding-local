@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import sys
+import json
+import subprocess
 import tempfile
 import warnings
 import zipfile
@@ -35,8 +37,28 @@ def write_single_member(path: Path, mode: int) -> None:
 
 
 def main() -> None:
+    with zipfile.ZipFile(OUTPUT, "r") as packaged:
+        names = set(packaged.namelist())
+        prefix = "openclaw-lancedb-knowledge-local/"
+        for required in (
+            "qwen-local", "requirements.txt", "scripts/qwen_local.py",
+            "src/installer/artifacts.py", "src/installer/downloader.py",
+            "src/installer/safe_archive.py", "src/installer/qwen_installer.py",
+            "src/lifecycle/llama_server_manager.py",
+        ):
+            assert prefix + required in names, f"missing packaged local runtime file: {required}"
     with tempfile.TemporaryDirectory(prefix="skill-archive-test-") as tmp_dir:
         tmp = Path(tmp_dir)
+        extracted = tmp / "extracted"
+        with zipfile.ZipFile(OUTPUT, "r") as packaged:
+            packaged.extractall(extracted)
+        installed = extracted / "openclaw-lancedb-knowledge-local"
+        result = subprocess.run(
+            [sys.executable, str(installed / "scripts/qwen_local.py"), "status", "--target",
+             str(tmp / "managed/qwen")], capture_output=True, text=True, check=True,
+        )
+        status = json.loads(result.stdout)
+        assert status["provider"] == "qwen-local" and status["installed"] is False
         differently_compressed = tmp / "stored.skill"
         repack(OUTPUT, differently_compressed)
         assert archive_manifest(OUTPUT) == archive_manifest(differently_compressed)

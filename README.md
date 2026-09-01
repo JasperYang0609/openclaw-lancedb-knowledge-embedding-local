@@ -1,50 +1,38 @@
-# OpenClaw LanceDB Knowledge Skill
+# OpenClaw LanceDB Knowledge — Qwen Local
 
-OpenClaw skill for building a local LanceDB semantic knowledge layer over OpenClaw memory, Discord/channel backup summaries or opt-in raw history, Obsidian-style markdown vaults, handoff files, and client project docs. The skill is written to be readable by general LLM agents, including Claude Opus-class client agents, with explicit commands, privacy gates, and source-cited answer rules.
+**macOS Apple Silicon local-only edition.** Documents and queries are embedded by a managed Qwen3-Embedding-4B sidecar bound to `127.0.0.1`; there is no cloud embedding fallback and no API key is required.
 
-## Install
+Requirements: Apple Silicon Mac, Python 3, system `curl`, at least 16 GiB RAM and 12 GiB free disk. The first install downloads about 2.70 GiB for the model plus a 10.4 MiB pinned llama.cpp runtime. Initial indexing time depends on corpus size.
+
+Intel Mac, Linux and Windows are not supported by the first installer release. For lower local resource use, use the separate [Gemini cloud edition](https://github.com/JasperYang0609/openclaw-lancedb-knowledge-skill); that edition sends embedding input to Google after its approval gate.
+
+## Install and manage the runtime
 
 ```bash
-npx skills add JasperYang0609/openclaw-lancedb-knowledge-skill@openclaw-lancedb-knowledge -g
+./qwen-local install
+./qwen-local status
+./qwen-local health
+./qwen-local stop
+./qwen-local start
+./qwen-local verify
+./qwen-local uninstall
 ```
 
-If your installer expects a packaged skill file, download:
+`install` pins Qwen model revision `f4602530...` and official llama.cpp `b10625`, resumes partial downloads, verifies size and SHA-256, safely extracts into staging, starts the loopback-only sidecar, and runs an embedding canary. `uninstall` removes only manifest-owned files and fails closed when unknown files or links are present.
 
-```text
-https://github.com/JasperYang0609/openclaw-lancedb-knowledge-skill/raw/main/dist/openclaw-lancedb-knowledge.skill
+The installer does not modify PATH, shell startup files, LaunchAgents, OpenClaw production configuration, existing Gemini indexes, schedules, caches, or source documents.
+
+## Install the skill archive
+
+The distribution artifact is `dist/openclaw-lancedb-knowledge-local.skill`. After installing it, bootstrap an isolated index project:
+
+```bash
+python3 openclaw-lancedb-knowledge-local/scripts/bootstrap_openclaw_lancedb.py \
+  --target ~/.openclaw/workspace/knowledge-lancedb-qwen-local \
+  --workspace ~/.openclaw/workspace \
+  --npm-install
 ```
 
-## What it includes
+Then run `npm test`, `npm run scan`, `npm run index`, and `npm run search -- "your query"`. The default table, data directory, cache identity and state are Qwen-specific and do not reuse Gemini vectors.
 
-- Model-agnostic / Opus-readable skill instructions
-- OpenClaw-specific LanceDB workflow instructions
-- Portable `knowledge-lancedb` Node template using `@lancedb/lancedb`
-- Local-only hash embedding default
-- Optional Google Gemini embedding mode after explicit privacy approval, with L2-normalized vectors and a local embedding cache
-- Stable `balanced` Gemini profile (768 dimensions) plus an opt-in `high-quality` profile (3072 dimensions, separate cache, full-reindex guard)
-- Paragraph-aware chunking and deterministic semantic metadata (`doc_type`, tags, importance) that never depends on an LLM
-- Model-agnostic, opt-in AI enrichment via a strict JSONL contract; AI fields are auxiliary, confidence-gated, and cannot overwrite authoritative source metadata
-- A source-grounded retrieval benchmark with Hit@K/MRR metrics and a 20-case release gate
-- Secret redaction before embedding/indexing, covering common API keys, cloud/chat platform tokens, PEM blocks, URL credentials, and Chinese credential labels
-- Incremental indexing and cron wrapper, with embedding-cache compaction and report/log rotation
-- Source-map examples for memory, backup summaries, opt-in Discord raw history, project docs, and Obsidian-style vaults
-- A read-only exact coverage audit for source chunks, metadata/tags, and embedding identity
-- Checksummed restore snapshots containing LanceDB, index state, embedding cache, tag rules, enrichment, and config
-- Safe rolling retention for 30-day daily snapshots plus a combined 7-day/10-copy `incident-*` and `repair-*` set; unrelated manual snapshots are never pruned
-- Post-closeout snapshot gates for absolute-path verification, freshness, isolated restore, LanceDB open, and row-count readback
-- Explicit Discord raw privacy states and real-date summary validation that rejects synthetic inventory indexes
-- Cron preflight that rejects legacy `payload.toolsAllow`, requires `--clear-tools`, and verifies GPT/Codex shell access with a temporary isolated canary
-- Supply-chain-safe bootstrap: fixed `npm ci --ignore-scripts` by default, explicit lifecycle-script opt-in, and a non-executing post-run checker
-
-## Quality and safety defaults
-
-- New installs stay local-only until an external embedding provider is explicitly approved.
-- Gemini uses 768 dimensions by default. Choose `--embedding-profile high-quality` only when you accept a one-time 3072-dimensional rebuild.
-- AI enrichment is disabled by default and no bundled command uploads private chunks. `enrich:prepare` creates a local redacted JSONL file; a human-approved model workflow produces output; `enrich:validate` rejects malformed rows and attempted core-field overrides.
-- Copy `config/benchmark.example.json` to `config/benchmark.json`, replace the 20 examples with corpus-specific ground truth, and run `npm run benchmark -- --release-gate` before claiming a quality improvement.
-
-## Maintainer use of Codex
-
-This project is maintained as part of the OpenClaw ecosystem. We plan to use Codex to review pull requests, improve LanceDB/OpenClaw compatibility, generate tests for indexing and retrieval behavior, and keep installation and source-map documentation current.
-
-API-assisted maintenance should focus on reusable open-source workflows: issue triage, regression checks, documentation updates, and release notes. Codex should not be used to index or inspect private customer memories, transcripts, backups, or project documents.
+Historical Qwen/Gemini comparison reports under `docs/reports/` are selection evidence only; they are not runtime dependencies.

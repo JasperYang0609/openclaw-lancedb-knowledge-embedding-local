@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BOOTSTRAP = ROOT / "openclaw-lancedb-knowledge" / "scripts" / "bootstrap_openclaw_lancedb.py"
+BOOTSTRAP = ROOT / "openclaw-lancedb-knowledge-local" / "scripts" / "bootstrap_openclaw_lancedb.py"
 
 
 def make_fake_npm(bin_dir: Path, log_path: Path) -> Path:

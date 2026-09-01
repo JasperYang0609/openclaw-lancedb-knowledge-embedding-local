@@ -2,7 +2,7 @@ import importlib.util
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).parents[1] / "openclaw-lancedb-knowledge/assets/knowledge-lancedb-template/scripts/audit_cron_tooling.py"
+SCRIPT = Path(__file__).parents[1] / "openclaw-lancedb-knowledge-local/assets/knowledge-lancedb-template/scripts/audit_cron_tooling.py"
 spec = importlib.util.spec_from_file_location("lancedb_cron_tooling", SCRIPT)
 cron = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
