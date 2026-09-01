@@ -159,7 +159,10 @@ class LlamaServerManager:
         if pid is not None:
             if not self._process_exists(pid):
                 pid = None
-            elif not self._is_expected_process(pid):
+            # A live Popen handle is the exact child this manager spawned. PID
+            # recovery after a restart has no such handle and must still pass
+            # the executable/model command-line identity check before signal.
+            elif managed_process is None and not self._is_expected_process(pid):
                 raise RuntimeError("Refusing to signal a PID that is not the managed llama-server")
         if pid is not None:
             try:

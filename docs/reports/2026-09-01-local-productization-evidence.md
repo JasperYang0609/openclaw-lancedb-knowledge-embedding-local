@@ -4,7 +4,7 @@ Status: CUSTOMER_INSTALLER_AND_LIVE_ARTIFACT_REHEARSAL_PASS
 
 ## Passed
 
-- Python unit/integration: 32 passed after the live-artifact fixes.
+- Python unit/integration: 33 passed after the live-artifact and cross-platform lifecycle fixes.
 - Node template: 27 passed.
 - Bootstrap, snapshot, cron tooling, dangerous-exec, postrun and deterministic archive parity: PASS.
 - npm production dependency audit: 0 vulnerabilities.
@@ -12,7 +12,7 @@ Status: CUSTOMER_INSTALLER_AND_LIVE_ARTIFACT_REHEARSAL_PASS
 - Secret-pattern and tracked/untracked file-size scans: PASS; model/corpus/vector/credential artifacts are absent.
 - Unified CLI uninstalled `status` smoke: PASS with redacted JSON.
 
-Final regression logs: `20260901_130050_local-qwen-final-regression-after-live.log` and `20260901_130124_local-qwen-final-security-scans-after-live.log` under the workspace tool-run log root. The deterministic archive contains 41 files, including the unified CLI, installer, lifecycle manager and dependency manifest.
+Final regression logs: `20260901_130050_local-qwen-final-regression-after-live.log`, `20260901_130124_local-qwen-final-security-scans-after-live.log`, and `20260901_130617_local-qwen-managed-child-identity-fix-r2.log` under the workspace tool-run log root. The deterministic archive contains 41 files, including the unified CLI, installer, lifecycle manager and dependency manifest.
 
 ## Live official-artifact evidence
 

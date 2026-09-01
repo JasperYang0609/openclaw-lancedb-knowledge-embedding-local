@@ -222,15 +222,18 @@ def test_lifecycle_stop_reaps_a_managed_child_without_waiting_for_kill_timeout(t
     key_file.chmod(0o600)
     tail = shutil.which("tail")
     assert tail is not None
+    server = tmp_path / "llama-server"
+    shutil.copyfile(tail, server)
+    server.chmod(0o700)
     manager = LlamaServerManager(
-        server_binary=tail,
+        server_binary=server,
         model_path=model,
         api_key_file=key_file,
         state_dir=tmp_path / "state",
     )
     manager.state_dir.mkdir(parents=True)
     manager.process = subprocess.Popen(
-        [tail, "-f", str(model.resolve())],
+        [str(server), "-f", str(model.resolve())],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -244,3 +247,29 @@ def test_lifecycle_stop_reaps_a_managed_child_without_waiting_for_kill_timeout(t
     assert time.monotonic() - started < 2
     assert manager.process is None
     assert not manager.pid_file.exists()
+
+
+def test_lifecycle_recovered_pid_still_requires_process_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    server = artifact(tmp_path, "llama-server", b"server", executable=True)
+    model = artifact(tmp_path, "model.gguf", b"model")
+    key_file = artifact(tmp_path, "api-key", b"local-secret-value")
+    key_file.chmod(0o600)
+    manager = LlamaServerManager(
+        server_binary=server,
+        model_path=model,
+        api_key_file=key_file,
+        state_dir=tmp_path / "state",
+    )
+    manager.state_dir.mkdir(parents=True)
+    manager.pid_file.write_text(json.dumps({
+        "schemaVersion": 2,
+        "pid": 4242,
+        "port": 18888,
+        "serverBinary": str(server.resolve()),
+        "modelPath": str(model.resolve()),
+    }))
+    monkeypatch.setattr(manager, "_process_exists", lambda _pid: True)
+    monkeypatch.setattr(manager, "_is_expected_process", lambda _pid: False)
+
+    with pytest.raises(RuntimeError, match="not the managed llama-server"):
+        manager.stop()
