@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -219,21 +220,19 @@ def test_lifecycle_stop_reaps_a_managed_child_without_waiting_for_kill_timeout(t
     model = artifact(tmp_path, "model.gguf", b"model")
     key_file = artifact(tmp_path, "api-key", b"local-secret-value")
     key_file.chmod(0o600)
+    tail = shutil.which("tail")
+    assert tail is not None
     manager = LlamaServerManager(
-        server_binary="/bin/sh",
+        server_binary=tail,
         model_path=model,
         api_key_file=key_file,
         state_dir=tmp_path / "state",
     )
     manager.state_dir.mkdir(parents=True)
     manager.process = subprocess.Popen(
-        [
-            "/bin/sh",
-            "-c",
-            "trap 'exit 0' TERM; while :; do sleep 1; done",
-            "/bin/sh",
-            str(model.resolve()),
-        ],
+        [tail, "-f", str(model.resolve())],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
     manager.pid_file.write_text(json.dumps({"schemaVersion": 1, "pid": manager.process.pid, "port": 18888}))
