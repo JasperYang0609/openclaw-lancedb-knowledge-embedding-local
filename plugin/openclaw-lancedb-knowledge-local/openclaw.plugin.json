@@ -4,24 +4,53 @@
   "name": "OpenClaw Local Knowledge Search",
   "description": "Read-only source-cited search over a managed Qwen-local LanceDB index.",
   "version": "0.1.0",
-  "contracts": { "tools": ["local_knowledge_search"] },
-  "activation": { "onStartup": true },
+  "activation": {
+    "onStartup": true
+  },
   "configSchema": {
     "type": "object",
-    "additionalProperties": false,
-    "required": ["projectRoot", "nodePath"],
+    "required": [
+      "projectRoot",
+      "nodePath"
+    ],
     "properties": {
-      "projectRoot": { "type": "string", "minLength": 1 },
-      "nodePath": { "type": "string", "minLength": 1 },
+      "projectRoot": {
+        "type": "string",
+        "minLength": 1
+      },
+      "nodePath": {
+        "type": "string",
+        "minLength": 1
+      },
       "allowedProjects": {
         "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._ -]{0,79}$"
+        },
         "maxItems": 100,
-        "uniqueItems": true,
-        "items": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[A-Za-z0-9][A-Za-z0-9._ -]{0,79}$" }
+        "uniqueItems": true
       },
-      "timeoutMs": { "type": "integer", "minimum": 1000, "maximum": 60000, "default": 30000 },
-      "maxOutputBytes": { "type": "integer", "minimum": 4096, "maximum": 524288, "default": 262144 }
-    }
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 60000,
+        "default": 30000
+      },
+      "maxOutputBytes": {
+        "type": "integer",
+        "minimum": 4096,
+        "maximum": 524288,
+        "default": 262144
+      }
+    },
+    "additionalProperties": false
   },
-  "toolMetadata": { "local_knowledge_search": { "optional": false } }
+  "contracts": {
+    "tools": [
+      "local_knowledge_search"
+    ]
+  }
 }

@@ -145,3 +145,33 @@ def test_runtime_sync_preserves_config_data_and_reports(tmp_path: Path, monkeypa
     assert (item.project_root / "src/cli.js").is_file()
     assert calls[0][0][-2:] == ["ci", "--ignore-scripts"]
     assert calls[0][1]["shell"] is False
+
+
+def test_plugin_is_packed_as_archive_without_lifecycle_scripts(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    item = paths(tmp_path)
+    fake_npm = tmp_path / "npm"
+    fake_npm.write_text("fixture")
+    fake_npm.chmod(0o700)
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        staging = Path(argv[argv.index("--pack-destination") + 1])
+        archive = staging / "openclaw-lancedb-knowledge-local-plugin-0.1.0.tgz"
+        archive.write_bytes(b"fixture")
+        return integration_core.subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps([{"filename": archive.name}]), stderr="",
+        )
+
+    monkeypatch.setattr(integration_core.shutil, "which", lambda name: str(fake_npm) if name == "npm" else None)
+    monkeypatch.setattr(integration_core.subprocess, "run", fake_run)
+    manager = IntegrationManager(paths=item, repo_root=Path(__file__).resolve().parents[1], cli=None,
+                                 node_path=Path(sys.executable))
+
+    archive = manager.package_plugin_archive()
+
+    assert archive.is_file()
+    assert calls[0][0][1:3] == ["pack", "--json"]
+    assert "--ignore-scripts" in calls[0][0]
+    assert calls[0][1]["shell"] is False

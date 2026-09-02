@@ -329,7 +329,13 @@ class IntegrationManager:
         os.replace(temporary, self.paths.launchd_plist)
 
     def configure_openclaw(self, allowed_projects: list[str]) -> None:
-        self.cli.run(["plugins", "install", str(self.plugin_source), "--force"], timeout=300)
+        plugin_archive = self.package_plugin_archive()
+        try:
+            self.cli.run(["plugins", "install", str(plugin_archive), "--force"], timeout=600)
+        finally:
+            staging = plugin_archive.parent
+            if staging.exists() and not staging.is_symlink():
+                shutil.rmtree(staging)
         self.cli.run(["plugins", "enable", PLUGIN_ID])
         plugin_config = {
             "projectRoot": str(self.paths.project_root), "nodePath": str(self.node_path),
@@ -345,6 +351,34 @@ class IntegrationManager:
             self.cli.run(["config", "set", "tools.allow", json.dumps(tool_allow), "--strict-json", "--replace"])
         self.cli.run(["skills", "install", str(self.skill_source), "--as", SKILL_ID, "--force", "--agent", self.agent], timeout=300)
         self.cli.run(["config", "validate", "--json"])
+
+    def package_plugin_archive(self) -> Path:
+        npm = shutil.which("npm")
+        if not npm:
+            raise RuntimeError("npm is required to package the OpenClaw plugin")
+        staging = self.paths.state_root / "plugin-package"
+        if staging.is_symlink():
+            raise RuntimeError("Plugin package staging path is unsafe")
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True, mode=0o700)
+        safe_env = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "TMP", "TEMP", "NO_PROXY")
+                    if os.environ.get(key)}
+        safe_env["npm_config_ignore_scripts"] = "true"
+        result = subprocess.run([
+            str(Path(npm).resolve()), "pack", "--json", "--ignore-scripts",
+            "--pack-destination", str(staging),
+        ], cwd=self.plugin_source, env=safe_env, shell=False, check=True, text=True,
+            capture_output=True, timeout=300)
+        try:
+            payload = json.loads(result.stdout)
+            filename = payload[0]["filename"]
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError) as error:
+            raise RuntimeError("npm pack returned an invalid plugin archive description") from error
+        archive = staging / str(filename)
+        if archive.resolve(strict=False).parent != staging.resolve() or archive.is_symlink() or not archive.is_file():
+            raise RuntimeError("Plugin archive path is unsafe")
+        return archive
 
     def create_incremental_cron(self) -> str:
         script = self.paths.project_root / "scripts/knowledge_index_incremental.sh"

@@ -33,7 +33,11 @@ jobs:
         run: python -m pytest -q
       - name: Test OpenClaw local knowledge plugin
         working-directory: plugin/openclaw-lancedb-knowledge-local
-        run: npm test
+        run: |
+          npm ci --ignore-scripts
+          npm audit --omit=dev
+          npm test
+          npm exec -- openclaw plugins validate --root . --entry ./index.js
       - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm run postrun:check
