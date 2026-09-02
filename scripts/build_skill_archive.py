@@ -34,6 +34,13 @@ def source_files() -> list[Path]:
         ROOT / "scripts/qwen_local.py",
         *sorted((ROOT / "src/installer").glob("*.py")),
         *sorted((ROOT / "src/lifecycle").glob("*.py")),
+        *sorted((ROOT / "src/openclaw_integration").glob("*.py")),
+        ROOT / "plugin/openclaw-lancedb-knowledge-local/README.md",
+        ROOT / "plugin/openclaw-lancedb-knowledge-local/index.js",
+        ROOT / "plugin/openclaw-lancedb-knowledge-local/openclaw.plugin.json",
+        ROOT / "plugin/openclaw-lancedb-knowledge-local/package.json",
+        ROOT / "plugin/openclaw-lancedb-knowledge-local/package-lock.json",
+        ROOT / "plugin/openclaw-lancedb-knowledge-local/src/search-tool.js",
     ]
     return skill_files + [path for path in runtime_files if path.is_file()]
 
