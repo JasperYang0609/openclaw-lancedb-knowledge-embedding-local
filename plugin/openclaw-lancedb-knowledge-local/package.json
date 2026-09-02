@@ -1,0 +1,16 @@
+{
+  "name": "openclaw-lancedb-knowledge-local-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Read-only OpenClaw tool for a managed Qwen-local LanceDB index",
+  "license": "MIT",
+  "private": true,
+  "peerDependencies": { "openclaw": ">=2026.7.1-2" },
+  "peerDependenciesMeta": { "openclaw": { "optional": true } },
+  "openclaw": { "extensions": ["./index.js"] },
+  "files": ["index.js", "src", "openclaw.plugin.json", "README.md"],
+  "scripts": {
+    "check": "node --check index.js && node --check src/search-tool.js",
+    "test": "node --test"
+  }
+}

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT="${OPENCLAW_LANCEDB_ROOT:-$HOME/.openclaw/workspace/knowledge-lancedb}"
+ROOT="${OPENCLAW_LANCEDB_ROOT:-$HOME/.openclaw/workspace/knowledge-lancedb-qwen-local}"
 LOG_DIR="$ROOT/reports/cron-logs"
 LOCK_DIR="$ROOT/data/index.lock"
 mkdir -p "$LOG_DIR" "$ROOT/data"
@@ -43,6 +43,7 @@ rotate_reports() {
 {
   echo "[knowledge-index] started_at=$(date +%Y-%m-%dT%H:%M:%S%z)"
   npm run incremental
+  node src/cli.js audit --mark-ready
   compact_cache_if_oversized || true
   rotate_reports || true
   echo "[knowledge-index] finished_at=$(date +%Y-%m-%dT%H:%M:%S%z)"
