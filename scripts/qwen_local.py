@@ -62,6 +62,14 @@ def integration_manager(args: argparse.Namespace) -> IntegrationManager:
         state_root=Path(args.integration_state).expanduser().resolve(),
         launchd_plist=home / "Library/LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
     )
+    openclaw = args.openclaw or shutil.which("openclaw")
+    node = args.node or shutil.which("node")
+    if not openclaw or not node:
+        raise RuntimeError("OpenClaw and Node.js executables are required for integration")
+    return IntegrationManager(
+        paths=paths, repo_root=ROOT, cli=OpenClawCli(openclaw, profile=args.profile or None),
+        node_path=Path(node), agent=args.agent,
+    )
 
 
 def integration_is_committed(args: argparse.Namespace) -> bool:
@@ -72,14 +80,6 @@ def integration_is_committed(args: argparse.Namespace) -> bool:
         return json.loads(manifest.read_text()).get("phase") == "committed"
     except (OSError, json.JSONDecodeError):
         return False
-    openclaw = args.openclaw or shutil.which("openclaw")
-    node = args.node or shutil.which("node")
-    if not openclaw or not node:
-        raise RuntimeError("OpenClaw and Node.js executables are required for integration")
-    return IntegrationManager(
-        paths=paths, repo_root=ROOT, cli=OpenClawCli(openclaw, profile=args.profile or None),
-        node_path=Path(node), agent=args.agent,
-    )
 
 
 def resolve_port(installer: QwenInstaller, requested_port: int | None) -> int:
@@ -91,6 +91,21 @@ def resolve_port(installer: QwenInstaller, requested_port: int | None) -> int:
             )
         return installed_port
     return 18888 if requested_port is None else requested_port
+
+
+def integrate_with_runtime_handoff(
+        *, runtime_manager: LlamaServerManager, integration: IntegrationManager,
+        runtime_manifest: dict,
+) -> dict:
+    runtime_was_running = bool(runtime_manager.status().get("running"))
+    if runtime_was_running:
+        runtime_manager.stop()
+    try:
+        return integration.integrate(runtime_manifest)
+    except Exception:
+        if runtime_was_running:
+            runtime_manager.start()
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -154,10 +169,11 @@ def main(argv: list[str] | None = None) -> int:
                 runtime = downloader.fetch(LLAMA_CPP)
                 installer.install_from_artifacts(model_source=model, runtime_archive=runtime, runtime_port=port)
             runtime_manifest = installer.verify_installation()
-            state = manager.status()
-            if state.get("running"):
-                manager.stop()
-            result = integration_manager(args).integrate(runtime_manifest)
+            result = integrate_with_runtime_handoff(
+                runtime_manager=manager,
+                integration=integration_manager(args),
+                runtime_manifest=runtime_manifest,
+            )
             emit({"ok": True, "command": "integrate-openclaw", **result})
         elif args.command == "verify-openclaw":
             result = integration_manager(args).verify()

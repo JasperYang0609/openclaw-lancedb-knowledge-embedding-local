@@ -331,7 +331,7 @@ class IntegrationManager:
     def configure_openclaw(self, allowed_projects: list[str]) -> None:
         plugin_archive = self.package_plugin_archive()
         try:
-            self.cli.run(["plugins", "install", str(plugin_archive), "--force"], timeout=600)
+            self.cli.run(["plugins", "install", str(plugin_archive)], timeout=600)
         finally:
             staging = plugin_archive.parent
             if staging.exists() and not staging.is_symlink():
