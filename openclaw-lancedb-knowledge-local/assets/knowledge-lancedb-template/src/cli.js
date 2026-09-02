@@ -80,6 +80,42 @@ function loadIndexState() {
   if (!fs.existsSync(p)) return null;
   return JSON.parse(fs.readFileSync(p, 'utf8'));
 }
+
+function readyStatePath() { return path.resolve('data/openclaw-ready.json'); }
+
+function writeJsonAtomic(targetPath, payload) {
+  ensureDir(path.dirname(targetPath));
+  const temporary = `${targetPath}.tmp-${process.pid}`;
+  fs.writeFileSync(temporary, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  fs.renameSync(temporary, targetPath);
+}
+
+function providerIdentity(config) {
+  const identity = embeddingIdentity(config.embedding);
+  return {
+    provider: identity.provider,
+    model: identity.model,
+    dimensions: identity.dimensions,
+    modelRevision: config.embedding?.modelRevision ?? null,
+    runtimeRevision: identity.runtimeRevision,
+    pooling: identity.pooling,
+    normalization: identity.normalization
+  };
+}
+
+function assertReadyState(config) {
+  const state = loadIndexState();
+  const markerPath = readyStatePath();
+  if (!state || !fs.existsSync(markerPath)) return null;
+  let marker;
+  try { marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')); }
+  catch { return null; }
+  if (marker?.schemaVersion !== 1 || marker?.ready !== true || marker?.provider !== 'qwen-local' ||
+      marker?.tableName !== state.tableName || marker?.buildFingerprint !== state.buildFingerprint ||
+      marker?.chunks !== state.chunks ||
+      JSON.stringify(marker.providerIdentity) !== JSON.stringify(providerIdentity(config))) return null;
+  return { state, marker };
+}
 function writeIndexState(config, built, extra = {}, { merge = false } = {}) {
   ensureDir(path.dirname(statePath()));
   const files = {};
@@ -435,7 +471,7 @@ async function commandAudit(config) {
       if (row.ai_enrichment_status === 'valid' && JSON.parse(row.ai_tags_json || '[]').length) aiTagsNonEmpty += 1;
     } catch {}
   }
-  console.log(JSON.stringify({
+  const report = {
     ok: true,
     tableName,
     docs: built.docs.length,
@@ -447,7 +483,25 @@ async function commandAudit(config) {
     privacy,
     metadataExactMatch: true,
     embeddingIdentityMatch: true
-  }, null, 2));
+  };
+  if (flag('mark-ready')) {
+    const state = loadIndexState();
+    if (!state || state.chunks !== rows.length || state.tableName !== tableName) {
+      throw new Error('[audit] index state does not reconcile; ready marker not written');
+    }
+    writeJsonAtomic(readyStatePath(), {
+      schemaVersion: 1,
+      ready: true,
+      markedAt: new Date().toISOString(),
+      provider: 'qwen-local',
+      providerIdentity: providerIdentity(config),
+      tableName,
+      buildFingerprint: state.buildFingerprint,
+      chunks: state.chunks
+    });
+    report.ready = true;
+  }
+  console.log(JSON.stringify(report, null, 2));
 }
 
 
@@ -547,6 +601,40 @@ async function commandSearch(config) {
   });
 }
 
+async function commandSearchJson(config) {
+  const query = String(arg('query', '')).trim();
+  const limit = Number(arg('limit', '5'));
+  const project = String(arg('project', ''));
+  if (!query || query.length > 2000) throw new Error('search-json query must contain 1 through 2000 characters');
+  if (!Number.isInteger(limit) || limit < 1 || limit > 10) throw new Error('search-json limit must be from 1 through 10');
+  if (project && !/^[A-Za-z0-9][A-Za-z0-9._ -]{0,79}$/.test(project)) throw new Error('search-json project is invalid');
+  const ready = assertReadyState(config);
+  if (!ready) {
+    console.log(JSON.stringify({ status: 'INDEX_BUILDING', providerIdentity: providerIdentity(config), results: [] }));
+    return;
+  }
+  const db = await openDb(config);
+  const table = await db.openTable(config.tableName || 'knowledge_chunks');
+  if (await table.countRows() !== ready.state.chunks) {
+    console.log(JSON.stringify({ status: 'INDEX_BUILDING', providerIdentity: providerIdentity(config), results: [] }));
+    return;
+  }
+  const results = await searchRows(config, query, { limit, project });
+  console.log(JSON.stringify({
+    status: results.length ? 'READY' : 'EMPTY',
+    providerIdentity: providerIdentity(config),
+    results: results.map((row) => ({
+      summary: String(row.chunk_text || '').replace(/\s+/g, ' ').slice(0, 700),
+      sourcePath: String(row.source_path || ''),
+      chunkId: String(row.id || ''),
+      project: String(row.project || ''),
+      title: String(row.title || ''),
+      heading: String(row.heading || ''),
+      rank: Number.isFinite(row._rank_score) ? Number(row._rank_score) : 0
+    }))
+  }));
+}
+
 async function commandPrepareEnrichment(config) {
   const built = buildChunks(config);
   const limit = Number(arg('limit', '0')) || 0;
@@ -620,12 +708,13 @@ async function main() {
   if (cmd === 'status') return commandStatus(config);
   if (cmd === 'audit') return commandAudit(config);
   if (cmd === 'search') return commandSearch(config);
+  if (cmd === 'search-json') return commandSearchJson(config);
   if (cmd === 'compact-cache') return commandCompactCache(config);
   if (cmd === 'prepare-enrichment') return commandPrepareEnrichment(config);
   if (cmd === 'validate-enrichment') return commandValidateEnrichment(config);
   if (cmd === 'benchmark') return commandBenchmark(config);
   if (cmd === 'profile') return console.log(JSON.stringify({ embedding: config.embedding, chunking: config.chunking, enrichment: enrichmentState(config), fullReindexRequiredWhenDimensionsChange: true }, null, 2));
-  console.log(`knowledge-lancedb commands:\n  scan\n  index [--limit N] [--project NAME] [--append]\n  incremental\n  audit\n  search "query" [--project NAME] [--limit N]\n  prepare-enrichment [--output FILE] [--limit N]\n  validate-enrichment --input FILE [--output FILE]\n  benchmark --file FILE [--release-gate]\n  profile\n  status\n  compact-cache`);
+  console.log(`knowledge-lancedb commands:\n  scan\n  index [--limit N] [--project NAME] [--append]\n  incremental\n  audit [--mark-ready]\n  search "query" [--project NAME] [--limit N]\n  search-json --query TEXT [--project NAME] [--limit N]\n  prepare-enrichment [--output FILE] [--limit N]\n  validate-enrichment --input FILE [--output FILE]\n  benchmark --file FILE [--release-gate]\n  profile\n  status\n  compact-cache`);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from scripts.qwen_local import resolve_port
+from src.openclaw_integration.core import IntegrationManager
+
+from scripts.qwen_local import integrate_with_runtime_handoff, integration_manager, resolve_port
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,3 +53,46 @@ def test_resolve_port_defaults_only_before_install(tmp_path: Path) -> None:
 
     assert resolve_port(InstallerFixture(), None) == 18888
     assert resolve_port(InstallerFixture(), 18890) == 18890
+
+
+def test_integration_manager_factory_returns_configured_manager(tmp_path: Path) -> None:
+    args = SimpleNamespace(
+        workspace=str(tmp_path / "workspace"),
+        target=str(tmp_path / "runtime/qwen-local"),
+        integration_state=str(tmp_path / "state/qwen-local-integration"),
+        openclaw=sys.executable,
+        node=sys.executable,
+        profile="isolated-test",
+        agent="main",
+    )
+
+    manager = integration_manager(args)
+
+    assert isinstance(manager, IntegrationManager)
+    assert manager.cli.profile == "isolated-test"
+    assert manager.paths.project_root.name == "knowledge-lancedb-qwen-local"
+
+
+def test_runtime_handoff_restores_manual_service_when_integration_fails() -> None:
+    events = []
+
+    class RuntimeFixture:
+        def status(self):
+            return {"running": True}
+
+        def stop(self):
+            events.append("stop")
+
+        def start(self):
+            events.append("start")
+
+    class IntegrationFixture:
+        def integrate(self, _manifest):
+            events.append("integrate")
+            raise RuntimeError("fixture failure")
+
+    with pytest.raises(RuntimeError, match="fixture failure"):
+        integrate_with_runtime_handoff(
+            runtime_manager=RuntimeFixture(), integration=IntegrationFixture(), runtime_manifest={"fixture": True},
+        )
+    assert events == ["stop", "integrate", "start"]

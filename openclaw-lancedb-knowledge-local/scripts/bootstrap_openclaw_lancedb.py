@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import urllib.parse
 from pathlib import Path
 
 SAFE_INSTALL_ENV_KEYS = ("HOME", "PATH", "TMPDIR", "TMP", "TEMP", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
@@ -58,8 +59,11 @@ def main() -> int:
     args = parser.parse_args()
     if args.allow_package_scripts and not args.npm_install:
         raise SystemExit("--allow-package-scripts requires --npm-install")
-    if args.endpoint != "http://127.0.0.1:18888":
-        raise SystemExit("The bundled product endpoint is fixed to loopback port 18888")
+    endpoint = urllib.parse.urlparse(args.endpoint)
+    if (endpoint.scheme != "http" or endpoint.hostname != "127.0.0.1" or endpoint.username or
+            endpoint.password or endpoint.query or endpoint.fragment or endpoint.path not in {"", "/"} or
+            endpoint.port is None or not 1024 <= endpoint.port <= 65535):
+        raise SystemExit("The Qwen endpoint must be loopback HTTP on an explicit unprivileged port")
 
     skill_dir = Path(__file__).resolve().parents[1]
     template = skill_dir / "assets/knowledge-lancedb-template"
@@ -85,6 +89,7 @@ def main() -> int:
                                "exclude": ["**/.env*", "**/*secret*", "**/*token*"], "priority": 1})
         cfg["privacy"] = {"discordRawApproval": "LOCAL_ONLY", "exactMessageIdValidation": "REQUIRED"}
     cfg["embedding"]["apiKeyFile"] = str(Path(args.api_key_file).expanduser().resolve())
+    cfg["embedding"]["endpoint"] = f"http://127.0.0.1:{endpoint.port}"
     (target / "config/source-map.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
     command = install_dependencies(target, args.allow_package_scripts) if args.npm_install else None
     print(json.dumps({"ok": True, "provider": "qwen-local", "target": str(target), "install_command": command,

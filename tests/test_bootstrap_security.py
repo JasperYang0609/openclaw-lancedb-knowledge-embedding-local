@@ -68,6 +68,17 @@ def main() -> None:
         default_config = json.loads((default_target / "config/source-map.json").read_text(encoding="utf-8"))
         assert all(source.get("sourceType") != "discord_raw" for source in default_config["sources"])
 
+        port_target = tmp / "port-install"
+        result = run_bootstrap(port_target, env, "--endpoint", "http://127.0.0.1:18889")
+        assert result.returncode == 0, result.stderr
+        port_config = json.loads((port_target / "config/source-map.json").read_text(encoding="utf-8"))
+        assert port_config["embedding"]["endpoint"] == "http://127.0.0.1:18889"
+        for unsafe in ("https://127.0.0.1:18889", "http://localhost:18889", "http://127.0.0.1:80",
+                       "http://127.0.0.1:18889/path", "http://user@127.0.0.1:18889"):
+            rejected = run_bootstrap(tmp / f"unsafe-{abs(hash(unsafe))}", env, "--endpoint", unsafe)
+            assert rejected.returncode != 0
+            assert "loopback HTTP" in (rejected.stderr + rejected.stdout)
+
         raw_target = tmp / "raw-install"
         result = run_bootstrap(
             raw_target,

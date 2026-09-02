@@ -45,6 +45,12 @@ def main() -> None:
             "src/installer/artifacts.py", "src/installer/downloader.py",
             "src/installer/safe_archive.py", "src/installer/qwen_installer.py",
             "src/lifecycle/llama_server_manager.py",
+            "src/openclaw_integration/core.py", "src/openclaw_integration/launchd.py",
+            "plugin/openclaw-lancedb-knowledge-local/index.js",
+            "plugin/openclaw-lancedb-knowledge-local/openclaw.plugin.json",
+            "plugin/openclaw-lancedb-knowledge-local/package.json",
+            "plugin/openclaw-lancedb-knowledge-local/package-lock.json",
+            "plugin/openclaw-lancedb-knowledge-local/src/search-tool.js",
         ):
             assert prefix + required in names, f"missing packaged local runtime file: {required}"
     with tempfile.TemporaryDirectory(prefix="skill-archive-test-") as tmp_dir:

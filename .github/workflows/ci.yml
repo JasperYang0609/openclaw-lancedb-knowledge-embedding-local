@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 22.22.3
           cache: npm
           cache-dependency-path: openclaw-lancedb-knowledge-local/assets/knowledge-lancedb-template/package-lock.json
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -31,12 +31,19 @@ jobs:
       - name: Run Python unit and integration tests
         working-directory: .
         run: python -m pytest -q
+      - name: Test OpenClaw local knowledge plugin
+        working-directory: plugin/openclaw-lancedb-knowledge-local
+        run: |
+          npm ci --ignore-scripts
+          npm audit --omit=dev
+          npm test
+          npm exec -- openclaw plugins validate --root . --entry ./index.js
       - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm run postrun:check
       - name: Validate bootstrap script
         working-directory: .
-        run: python3 -m py_compile openclaw-lancedb-knowledge-local/scripts/bootstrap_openclaw_lancedb.py openclaw-lancedb-knowledge-local/assets/knowledge-lancedb-template/scripts/snapshot_knowledge_assets.py tests/test_bootstrap_security.py tests/test_snapshot_knowledge_assets.py tests/test_skill_archive.py scripts/check_dangerous_exec.py scripts/build_skill_archive.py
+        run: python3 -m py_compile openclaw-lancedb-knowledge-local/scripts/bootstrap_openclaw_lancedb.py openclaw-lancedb-knowledge-local/assets/knowledge-lancedb-template/scripts/snapshot_knowledge_assets.py tests/test_bootstrap_security.py tests/test_snapshot_knowledge_assets.py tests/test_skill_archive.py scripts/check_dangerous_exec.py scripts/build_skill_archive.py scripts/qwen_local.py src/openclaw_integration/core.py src/openclaw_integration/launchd.py
       - name: Test bootstrap execution boundary
         working-directory: .
         run: python3 tests/test_bootstrap_security.py
