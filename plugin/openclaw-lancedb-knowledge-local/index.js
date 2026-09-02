@@ -10,8 +10,8 @@ export default defineToolPlugin({
   description: "Read-only source-cited search over a managed Qwen-local LanceDB index.",
   activation: { onStartup: true },
   configSchema: Type.Object({
-    projectRoot: Type.String({ minLength: 1 }),
-    nodePath: Type.String({ minLength: 1 }),
+    projectRoot: Type.Optional(Type.String({ minLength: 1 })),
+    nodePath: Type.Optional(Type.String({ minLength: 1 })),
     allowedProjects: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 80, pattern: projectPattern }), {
       maxItems: 100,
       uniqueItems: true,

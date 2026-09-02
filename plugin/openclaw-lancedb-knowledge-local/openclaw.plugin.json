@@ -9,10 +9,6 @@
   },
   "configSchema": {
     "type": "object",
-    "required": [
-      "projectRoot",
-      "nodePath"
-    ],
     "properties": {
       "projectRoot": {
         "type": "string",

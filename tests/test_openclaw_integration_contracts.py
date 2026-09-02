@@ -105,6 +105,7 @@ def test_allowlists_merge_without_removing_existing_entries() -> None:
         "message", "status_update_ui", PLUGIN_ID,
     ]
     assert merge_allowlist(None, PLUGIN_ID) is None
+    assert merge_allowlist(None, PLUGIN_ID, create_if_missing=True) == [PLUGIN_ID]
 
 
 def test_only_exact_owned_gemini_jobs_are_selected() -> None:

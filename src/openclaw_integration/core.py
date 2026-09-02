@@ -138,9 +138,9 @@ class TransactionStore:
         return payload
 
 
-def merge_allowlist(existing: Any, value: str) -> list[str] | None:
+def merge_allowlist(existing: Any, value: str, *, create_if_missing: bool = False) -> list[str] | None:
     if existing is None:
-        return None
+        return [value] if create_if_missing else None
     if not isinstance(existing, list) or any(not isinstance(item, str) for item in existing):
         raise RuntimeError("OpenClaw allowlist has an unexpected schema")
     return list(dict.fromkeys([*existing, value]))
@@ -343,7 +343,7 @@ class IntegrationManager:
         }
         self.cli.run(["config", "set", f"plugins.entries.{PLUGIN_ID}.config",
                       json.dumps(plugin_config, separators=(",", ":")), "--strict-json"])
-        plugin_allow = merge_allowlist(self.cli.config_get("plugins.allow"), PLUGIN_ID)
+        plugin_allow = merge_allowlist(self.cli.config_get("plugins.allow"), PLUGIN_ID, create_if_missing=True)
         if plugin_allow is not None:
             self.cli.run(["config", "set", "plugins.allow", json.dumps(plugin_allow), "--strict-json", "--replace"])
         tool_allow = merge_allowlist(self.cli.config_get("tools.allow"), TOOL_NAME)
