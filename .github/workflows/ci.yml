@@ -31,12 +31,15 @@ jobs:
       - name: Run Python unit and integration tests
         working-directory: .
         run: python -m pytest -q
+      - name: Test OpenClaw local knowledge plugin
+        working-directory: plugin/openclaw-lancedb-knowledge-local
+        run: npm test
       - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm run postrun:check
       - name: Validate bootstrap script
         working-directory: .
-        run: python3 -m py_compile openclaw-lancedb-knowledge-local/scripts/bootstrap_openclaw_lancedb.py openclaw-lancedb-knowledge-local/assets/knowledge-lancedb-template/scripts/snapshot_knowledge_assets.py tests/test_bootstrap_security.py tests/test_snapshot_knowledge_assets.py tests/test_skill_archive.py scripts/check_dangerous_exec.py scripts/build_skill_archive.py
+        run: python3 -m py_compile openclaw-lancedb-knowledge-local/scripts/bootstrap_openclaw_lancedb.py openclaw-lancedb-knowledge-local/assets/knowledge-lancedb-template/scripts/snapshot_knowledge_assets.py tests/test_bootstrap_security.py tests/test_snapshot_knowledge_assets.py tests/test_skill_archive.py scripts/check_dangerous_exec.py scripts/build_skill_archive.py scripts/qwen_local.py src/openclaw_integration/core.py src/openclaw_integration/launchd.py
       - name: Test bootstrap execution boundary
         working-directory: .
         run: python3 tests/test_bootstrap_security.py
