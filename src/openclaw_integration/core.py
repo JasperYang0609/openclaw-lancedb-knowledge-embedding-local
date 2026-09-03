@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import uuid
+import fcntl
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -353,18 +354,86 @@ class IntegrationManager:
             pass
         return Path(os.path.abspath(config_path))
 
-    def _remove_config_snapshot(self, backup: Path) -> None:
-        expected = Path(os.path.abspath(
-            self.paths.state_root / "snapshots/openclaw-config.preinstall"
-        ))
+    @contextmanager
+    def _integration_lock(self) -> Iterator[None]:
+        lock_fd: int | None = None
+        with self._open_private_directory(self.paths.state_root, create=True) as state_fd:
+            try:
+                lock_fd = os.open(
+                    "integration.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                    0o600, dir_fd=state_fd,
+                )
+                self._validate_private_config(os.fstat(lock_fd))
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise RuntimeError("Another OpenClaw integration transaction is active") from error
+                yield
+            except OSError as error:
+                raise RuntimeError("OpenClaw integration lock is missing or unsafe") from error
+            finally:
+                if lock_fd is not None:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(lock_fd)
+
+    @staticmethod
+    def _validate_snapshot_run_name(name: str) -> None:
+        if not name.startswith("run-"):
+            raise RuntimeError("Snapshot run identity is unsafe")
+        try:
+            parsed = uuid.UUID(name[4:])
+        except ValueError as error:
+            raise RuntimeError("Snapshot run identity is unsafe") from error
+        if str(parsed) != name[4:]:
+            raise RuntimeError("Snapshot run identity is unsafe")
+
+    def _remove_tree_at(self, parent_fd: int, name: str, expected_identity: tuple[int, int]) -> None:
+        directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            metadata = os.fstat(directory_fd)
+            self._validate_private_directory(metadata)
+            if (metadata.st_dev, metadata.st_ino) != expected_identity:
+                raise RuntimeError("Snapshot run changed before cleanup")
+            for child_name in os.listdir(directory_fd):
+                child = os.stat(child_name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISDIR(child.st_mode):
+                    self._remove_tree_at(directory_fd, child_name, (child.st_dev, child.st_ino))
+                else:
+                    os.unlink(child_name, dir_fd=directory_fd)
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != expected_identity:
+                raise RuntimeError("Snapshot run changed before cleanup")
+            os.rmdir(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _remove_snapshot_run(self, run_dir: Path, expected_identity: tuple[int, int]) -> None:
+        run_dir = Path(os.path.abspath(run_dir))
+        expected_parent = Path(os.path.abspath(self.paths.state_root / "snapshots"))
+        if run_dir.parent != expected_parent:
+            raise RuntimeError("Snapshot run cleanup identity is unsafe")
+        self._validate_snapshot_run_name(run_dir.name)
+        with self._open_private_directory(expected_parent) as snapshot_fd:
+            self._remove_tree_at(snapshot_fd, run_dir.name, expected_identity)
+
+    def _snapshot_run_from_backup(self, backup: Path) -> Path:
         backup = Path(os.path.abspath(backup))
-        if backup != expected:
-            raise RuntimeError("Config snapshot cleanup identity is unsafe")
-        with self._open_private_directory(backup.parent) as snapshot_fd:
-            metadata = os.stat(backup.name, dir_fd=snapshot_fd, follow_symlinks=False)
-            self._validate_private_config(metadata)
-            os.unlink(backup.name, dir_fd=snapshot_fd)
-            os.fsync(snapshot_fd)
+        snapshot_root = Path(os.path.abspath(self.paths.state_root / "snapshots"))
+        if backup.name != "openclaw-config.preinstall" or backup.parent.parent != snapshot_root:
+            raise RuntimeError("Snapshot config identity is unsafe")
+        self._validate_snapshot_run_name(backup.parent.name)
+        return backup.parent
+
+    def _remove_recorded_snapshot_run(self, backup: Path) -> None:
+        run_dir = self._snapshot_run_from_backup(backup)
+        with self._open_private_directory(run_dir.parent) as snapshot_fd:
+            metadata = os.stat(run_dir.name, dir_fd=snapshot_fd, follow_symlinks=False)
+            self._validate_restricted_directory(metadata)
+            identity = (metadata.st_dev, metadata.st_ino)
+        self._remove_snapshot_run(run_dir, identity)
 
     def _snapshot_other_assets(self, snapshot_dir: Path) -> dict[str, Any]:
         skill_target = self.paths.workspace / "skills" / SKILL_ID
@@ -377,41 +446,31 @@ class IntegrationManager:
         skill_existed = skill_target.exists()
         plist_existed = self.paths.launchd_plist.exists()
         project_existed = self.paths.project_root.exists()
-        try:
-            if skill_target.is_symlink():
-                raise RuntimeError("Existing local knowledge skill is a symbolic link")
-            if skill_existed:
-                shutil.copytree(skill_target, skill_backup)
-            if self.paths.launchd_plist.is_symlink():
-                raise RuntimeError("Existing launchd plist is a symbolic link")
-            if plist_existed:
-                shutil.copy2(self.paths.launchd_plist, plist_backup)
-                os.chmod(plist_backup, 0o600)
-            if project_existed:
-                if self.paths.project_root.is_symlink() or not self.paths.project_root.is_dir():
-                    raise RuntimeError("Existing Qwen project root is unsafe")
-                project_backup.mkdir(mode=0o700)
-                for relative in (Path("src"), Path("scripts"), Path("package.json"), Path("package-lock.json")):
-                    source = self.paths.project_root / relative
-                    if not source.exists():
-                        continue
-                    if source.is_symlink():
-                        raise RuntimeError("Existing Qwen project runtime contains a symbolic link")
-                    target = project_backup / relative
-                    if source.is_dir():
-                        shutil.copytree(source, target)
-                    else:
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(source, target)
-        except Exception:
-            for candidate in reversed(managed_backups):
-                if candidate.is_symlink():
-                    candidate.unlink()
-                elif candidate.is_dir():
-                    shutil.rmtree(candidate)
-                elif candidate.exists():
-                    candidate.unlink()
-            raise
+        if skill_target.is_symlink():
+            raise RuntimeError("Existing local knowledge skill is a symbolic link")
+        if skill_existed:
+            shutil.copytree(skill_target, skill_backup)
+        if self.paths.launchd_plist.is_symlink():
+            raise RuntimeError("Existing launchd plist is a symbolic link")
+        if plist_existed:
+            shutil.copy2(self.paths.launchd_plist, plist_backup)
+            os.chmod(plist_backup, 0o600)
+        if project_existed:
+            if self.paths.project_root.is_symlink() or not self.paths.project_root.is_dir():
+                raise RuntimeError("Existing Qwen project root is unsafe")
+            project_backup.mkdir(mode=0o700)
+            for relative in (Path("src"), Path("scripts"), Path("package.json"), Path("package-lock.json")):
+                source = self.paths.project_root / relative
+                if not source.exists():
+                    continue
+                if source.is_symlink():
+                    raise RuntimeError("Existing Qwen project runtime contains a symbolic link")
+                target = project_backup / relative
+                if source.is_dir():
+                    shutil.copytree(source, target)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target)
         return {
             "skillTargetPath": str(skill_target), "skillBackupPath": str(skill_backup),
             "skillExisted": skill_existed, "plistBackupPath": str(plist_backup), "plistExisted": plist_existed,
@@ -420,63 +479,60 @@ class IntegrationManager:
 
     def snapshot(self) -> dict[str, Any]:
         config = self._config_file()
-        snapshot_dir = self.paths.state_root / "snapshots"
-        backup = snapshot_dir / "openclaw-config.preinstall"
+        snapshot_root = self.paths.state_root / "snapshots"
+        run_dir = snapshot_root / f"run-{uuid.uuid4()}"
+        backup = run_dir / "openclaw-config.preinstall"
         temporary_name = backup.name + ".tmp"
         digest = hashlib.sha256()
-        with self._open_private_directory(snapshot_dir, create=True) as snapshot_fd:
-            os.fchmod(snapshot_fd, 0o700)
-            self._validate_restricted_directory(os.fstat(snapshot_fd))
-            try:
-                existing = os.stat(backup.name, dir_fd=snapshot_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                existing = None
-            if existing is not None:
-                raise RuntimeError(
-                    "Preinstall config snapshot already exists; rollback or remove the completed transaction first"
+        run_fd: int | None = None
+        run_identity: tuple[int, int] | None = None
+        try:
+            with self._open_private_directory(snapshot_root, create=True) as snapshot_fd:
+                os.fchmod(snapshot_fd, 0o700)
+                self._validate_restricted_directory(os.fstat(snapshot_fd))
+                os.mkdir(run_dir.name, mode=0o700, dir_fd=snapshot_fd)
+                run_fd = os.open(
+                    run_dir.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=snapshot_fd,
                 )
-            try:
-                stale = os.stat(temporary_name, dir_fd=snapshot_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                stale = None
-            if stale is not None:
-                self._validate_private_config(stale)
-                os.unlink(temporary_name, dir_fd=snapshot_fd)
-            descriptor: int | None = os.open(
-                temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600, dir_fd=snapshot_fd,
-            )
-            try:
-                with os.fdopen(descriptor, "wb", closefd=True) as target:
-                    descriptor = None
-                    with self._open_config_file(config) as source:
-                        before = os.fstat(source.fileno())
-                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                            target.write(chunk)
-                        after = os.fstat(source.fileno())
-                        self._assert_stable_file(before, after)
-                        target.flush()
-                        os.fsync(target.fileno())
-                os.replace(
-                    temporary_name, backup.name,
-                    src_dir_fd=snapshot_fd, dst_dir_fd=snapshot_fd,
+                run_metadata = os.fstat(run_fd)
+                self._validate_restricted_directory(run_metadata)
+                run_identity = (run_metadata.st_dev, run_metadata.st_ino)
+                descriptor: int | None = os.open(
+                    temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600, dir_fd=run_fd,
                 )
-                os.fsync(snapshot_fd)
-            except Exception:
                 try:
-                    os.unlink(temporary_name, dir_fd=snapshot_fd)
+                    with os.fdopen(descriptor, "wb", closefd=True) as target:
+                        descriptor = None
+                        with self._open_config_file(config) as source:
+                            before = os.fstat(source.fileno())
+                            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                                target.write(chunk)
+                            after = os.fstat(source.fileno())
+                            self._assert_stable_file(before, after)
+                            target.flush()
+                            os.fsync(target.fileno())
+                    os.replace(
+                        temporary_name, backup.name,
+                        src_dir_fd=run_fd, dst_dir_fd=run_fd,
+                    )
+                    os.fsync(run_fd)
+                finally:
+                    if descriptor is not None:
+                        os.close(descriptor)
+            other_assets = self._snapshot_other_assets(run_dir)
+        except Exception:
+            if run_identity is not None:
+                try:
+                    self._remove_snapshot_run(run_dir, run_identity)
                 except FileNotFoundError:
                     pass
-                raise
-            finally:
-                if descriptor is not None:
-                    os.close(descriptor)
-        try:
-            other_assets = self._snapshot_other_assets(snapshot_dir)
-        except Exception:
-            self._remove_config_snapshot(backup)
             raise
+        finally:
+            if run_fd is not None:
+                os.close(run_fd)
         return {
             "configPath": str(config), "configBackupPath": str(backup), "preConfigSha256": digest.hexdigest(),
             **other_assets,
@@ -579,11 +635,10 @@ class IntegrationManager:
         if self.store.manifest_path.is_file() and not self.store.manifest_path.is_symlink():
             prior = self.store.read()
             if prior.get("phase") == "rolled_back":
-                snapshots = self.paths.state_root / "snapshots"
-                if snapshots.exists():
-                    if snapshots.is_symlink():
-                        raise RuntimeError("Snapshot root is unsafe")
-                    shutil.rmtree(snapshots)
+                backup_path = prior.get("configBackupPath")
+                if not isinstance(backup_path, str) or not backup_path:
+                    raise RuntimeError("Rolled-back transaction is missing its snapshot identity")
+                self._remove_recorded_snapshot_run(Path(backup_path))
         self.preflight()
         snapshot = self.snapshot()
         payload = {
@@ -704,6 +759,10 @@ class IntegrationManager:
         }
 
     def integrate(self, runtime_manifest: dict[str, Any]) -> dict[str, Any]:
+        with self._integration_lock():
+            return self._integrate_locked(runtime_manifest)
+
+    def _integrate_locked(self, runtime_manifest: dict[str, Any]) -> dict[str, Any]:
         if self.store.manifest_path.is_file() and not self.store.manifest_path.is_symlink():
             existing = self.store.read()
             if existing.get("phase") == "committed":
@@ -743,7 +802,7 @@ class IntegrationManager:
             transaction["phase"] = "failed"
             self.store.write(transaction)
             try:
-                self.rollback(require_exact_post_config=False)
+                self._rollback_locked(require_exact_post_config=False)
             except Exception:
                 transaction["phase"] = "rollback_failed"
                 self.store.write(transaction)
@@ -766,11 +825,7 @@ class IntegrationManager:
     def _restore_config_file(self, source: Path, target: Path) -> None:
         source = Path(os.path.abspath(source))
         target = Path(os.path.abspath(target))
-        expected_source = Path(os.path.abspath(
-            self.paths.state_root / "snapshots/openclaw-config.preinstall"
-        ))
-        if source != expected_source:
-            raise RuntimeError("Rollback config identity is unsafe")
+        self._snapshot_run_from_backup(source)
         temporary_name = target.name + ".restore-tmp"
         source_fd: int | None = None
         target_fd: int | None = None
@@ -830,6 +885,10 @@ class IntegrationManager:
                 os.close(target_fd)
 
     def rollback(self, *, require_exact_post_config: bool = True) -> dict[str, Any]:
+        with self._integration_lock():
+            return self._rollback_locked(require_exact_post_config=require_exact_post_config)
+
+    def _rollback_locked(self, *, require_exact_post_config: bool = True) -> dict[str, Any]:
         transaction = self.store.read()
         config = Path(transaction["configPath"])
         if require_exact_post_config and transaction.get("postConfigSha256") and \

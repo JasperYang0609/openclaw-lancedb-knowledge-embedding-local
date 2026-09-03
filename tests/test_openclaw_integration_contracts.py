@@ -57,6 +57,12 @@ def manager_with_config_result(tmp_path: Path, payload: object) -> tuple[Integra
     return manager, config, calls
 
 
+def snapshot_run(manager: IntegrationManager) -> Path:
+    run_dir = manager.paths.state_root / "snapshots" / "run-00000000-0000-4000-8000-000000000001"
+    run_dir.mkdir(parents=True, mode=0o700)
+    return run_dir
+
+
 def test_config_file_uses_official_validate_json_path(tmp_path: Path) -> None:
     manager, config, calls = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
 
@@ -70,6 +76,15 @@ def test_config_file_uses_official_validate_json_path(tmp_path: Path) -> None:
 
     assert manager._config_file() == config
     assert calls == [manager.cli.command(["config", "validate", "--json"])]
+
+
+def test_integration_lock_rejects_concurrent_transaction(tmp_path: Path) -> None:
+    manager, _, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+
+    with manager._integration_lock():
+        with pytest.raises(RuntimeError, match="transaction is active"):
+            with manager._integration_lock():
+                pass
 
 
 @pytest.mark.parametrize("payload", [
@@ -313,8 +328,7 @@ def test_snapshot_source_open_failure_closes_fd_and_can_retry(tmp_path: Path) ->
     after = len(list(fd_root.iterdir()))
     assert after == before
     snapshot_dir = manager.paths.state_root / "snapshots"
-    assert not (snapshot_dir / "openclaw-config.preinstall").exists()
-    assert not (snapshot_dir / "openclaw-config.preinstall.tmp").exists()
+    assert not snapshot_dir.exists() or list(snapshot_dir.iterdir()) == []
 
     manager._open_config_file = original
     assert Path(manager.snapshot()["configBackupPath"]).is_file()
@@ -334,8 +348,7 @@ def test_snapshot_mid_read_failure_removes_partial_temp(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="changed while"):
         manager.snapshot()
     snapshot_dir = manager.paths.state_root / "snapshots"
-    assert not (snapshot_dir / "openclaw-config.preinstall").exists()
-    assert not (snapshot_dir / "openclaw-config.preinstall.tmp").exists()
+    assert list(snapshot_dir.iterdir()) == []
 
     manager._assert_stable_file = original
     assert Path(manager.snapshot()["configBackupPath"]).is_file()
@@ -361,10 +374,73 @@ def test_snapshot_later_failure_removes_all_backups_and_can_retry(tmp_path: Path
     assert Path(manager.snapshot()["configBackupPath"]).is_file()
 
 
+def test_snapshot_failure_preserves_foreign_run_directory(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    snapshot_root = manager.paths.state_root / "snapshots"
+    foreign = snapshot_root / "run-00000000-0000-4000-8000-000000000099"
+    foreign.mkdir(parents=True, mode=0o700)
+    marker = foreign / "foreign-data"
+    marker.write_text("preserve")
+    skill_target = manager.paths.workspace / "skills" / integration_core.SKILL_ID
+    skill_target.parent.mkdir(parents=True)
+    outside = tmp_path / "outside-skill"
+    outside.mkdir()
+    skill_target.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="skill is a symbolic link"):
+        manager.snapshot()
+
+    assert marker.read_text() == "preserve"
+    assert list(snapshot_root.iterdir()) == [foreign]
+
+
+def test_snapshot_partial_backup_cleanup_preserves_foreign_run(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    snapshot_root = manager.paths.state_root / "snapshots"
+    foreign = snapshot_root / "run-00000000-0000-4000-8000-000000000099"
+    foreign.mkdir(parents=True, mode=0o700)
+    marker = foreign / "foreign-data"
+    marker.write_text("preserve")
+    skill_target = manager.paths.workspace / "skills" / integration_core.SKILL_ID
+    (skill_target / "nested").mkdir(parents=True)
+    (skill_target / "nested/content.txt").write_text("existing skill")
+    outside_plist = tmp_path / "outside.plist"
+    outside_plist.write_text("foreign")
+    manager.paths.launchd_plist.symlink_to(outside_plist)
+
+    with pytest.raises(RuntimeError, match="plist is a symbolic link"):
+        manager.snapshot()
+
+    assert marker.read_text() == "preserve"
+    assert list(snapshot_root.iterdir()) == [foreign]
+
+
+def test_recorded_snapshot_cleanup_removes_only_manifest_run(tmp_path: Path) -> None:
+    manager, _, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    recorded = snapshot_run(manager)
+    backup = recorded / "openclaw-config.preinstall"
+    backup.write_text("recorded")
+    backup.chmod(0o600)
+    foreign = manager.paths.state_root / "snapshots" / "run-00000000-0000-4000-8000-000000000099"
+    foreign.mkdir(mode=0o700)
+    marker = foreign / "foreign-data"
+    marker.write_text("preserve")
+
+    manager._remove_recorded_snapshot_run(backup)
+
+    assert not recorded.exists()
+    assert marker.read_text() == "preserve"
+
+
 def test_restore_config_rejects_symlinked_target_parent(tmp_path: Path) -> None:
     manager, _, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
-    snapshot_dir = manager.paths.state_root / "snapshots"
-    snapshot_dir.mkdir(mode=0o700)
+    snapshot_dir = snapshot_run(manager)
     source = snapshot_dir / "openclaw-config.preinstall"
     source.write_text("original")
     source.chmod(0o600)
@@ -388,8 +464,9 @@ def test_restore_config_rejects_symlinked_source_parent(tmp_path: Path) -> None:
     outside_source = outside / "openclaw-config.preinstall"
     outside_source.write_text("outside")
     outside_source.chmod(0o600)
-    snapshot_dir = manager.paths.state_root / "snapshots"
-    snapshot_dir.symlink_to(outside, target_is_directory=True)
+    snapshot_root = manager.paths.state_root / "snapshots"
+    snapshot_root.symlink_to(outside, target_is_directory=True)
+    snapshot_dir = snapshot_root / "run-00000000-0000-4000-8000-000000000001"
 
     with pytest.raises(RuntimeError, match="Managed directory"):
         manager._restore_config_file(snapshot_dir / "openclaw-config.preinstall", config)
@@ -398,8 +475,7 @@ def test_restore_config_rejects_symlinked_source_parent(tmp_path: Path) -> None:
 
 def test_restore_config_atomically_replaces_custom_config_name(tmp_path: Path) -> None:
     manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
-    snapshot_dir = manager.paths.state_root / "snapshots"
-    snapshot_dir.mkdir(mode=0o700)
+    snapshot_dir = snapshot_run(manager)
     source = snapshot_dir / "openclaw-config.preinstall"
     source.write_text("original")
     source.chmod(0o600)
@@ -417,8 +493,7 @@ def test_restore_config_atomically_replaces_custom_config_name(tmp_path: Path) -
 def test_restore_config_copy_failure_preserves_target_and_cleans_temp(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
-    snapshot_dir = manager.paths.state_root / "snapshots"
-    snapshot_dir.mkdir(mode=0o700)
+    snapshot_dir = snapshot_run(manager)
     source = snapshot_dir / "openclaw-config.preinstall"
     source.write_text("original")
     source.chmod(0o600)
