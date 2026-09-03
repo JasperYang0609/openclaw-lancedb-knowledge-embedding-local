@@ -160,7 +160,7 @@ def resolve_tool_allowlist_update(tools_allow: Any, tools_also_allow: Any,
 
 
 def build_cron_add_args(*, project_root: Path, incremental_script: Path,
-                        schedule: str = "17 3 * * *", timezone: str = "Asia/Taipei") -> list[str]:
+                        schedule: str = "30 6 * * *", timezone: str = "Asia/Taipei") -> list[str]:
     project = Path(project_root).resolve(strict=False)
     script = Path(incremental_script).resolve(strict=False)
     if project not in script.parents or script.name != "knowledge_index_incremental.sh":

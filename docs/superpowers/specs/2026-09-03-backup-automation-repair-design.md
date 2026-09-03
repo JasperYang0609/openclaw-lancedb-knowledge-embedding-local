@@ -37,8 +37,9 @@ default to `data/lancedb`; new database-open checks use the validated recorded p
 Cron inventory parsing will support the current `payload.argv` schema and the legacy
 `payload.command.argv` schema. Verification will reject more than one enabled job
 whose resolved argv targets the managed Qwen incremental wrapper, even if only one has
-the declaration key. The local repair keeps the canonical declaration job, schedules
-it after Discord daily sync, and disables the unmanaged duplicate.
+the declaration key. New integrations default to 06:30 Asia/Taipei so indexing runs
+after Discord daily sync and outside the overnight backlog window. The local repair
+keeps the canonical declaration job at that time and disables the unmanaged duplicate.
 
 The daily Qwen snapshot uses a new Qwen-specific backup root. Existing Gemini daily
 snapshots remain immutable rollback evidence. Monthly workspace backup includes both

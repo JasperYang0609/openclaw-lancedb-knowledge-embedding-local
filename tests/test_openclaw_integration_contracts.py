@@ -724,6 +724,7 @@ def test_cron_contract_is_idempotent_fixed_argv_and_output_bounded(tmp_path: Pat
     script.write_text("fixture")
     args = build_cron_add_args(project_root=item.project_root, incremental_script=script)
     assert args[args.index("--declaration-key") + 1] == CRON_DECLARATION_KEY
+    assert args[args.index("--cron") + 1] == "30 6 * * *"
     assert json.loads(args[args.index("--command-argv") + 1]) == [str(script)]
     assert args[args.index("--command-cwd") + 1] == str(item.project_root)
     assert int(args[args.index("--output-max-bytes") + 1]) <= 65536
