@@ -303,9 +303,12 @@ class IntegrationManager:
                 current_fd = os.open(component, directory_flags, dir_fd=current_fd)
                 directory_fds.append(current_fd)
                 self._validate_private_directory(os.fstat(current_fd))
-            yield current_fd
         except OSError as error:
+            for descriptor in reversed(directory_fds):
+                os.close(descriptor)
             raise RuntimeError("Managed directory path is missing or unsafe") from error
+        try:
+            yield current_fd
         finally:
             for descriptor in reversed(directory_fds):
                 os.close(descriptor)
@@ -365,36 +368,56 @@ class IntegrationManager:
         config = self._config_file()
         snapshot_dir = self.paths.state_root / "snapshots"
         backup = snapshot_dir / "openclaw-config.preinstall"
+        temporary_name = backup.name + ".tmp"
         digest = hashlib.sha256()
         with self._open_private_directory(snapshot_dir, create=True) as snapshot_fd:
             os.fchmod(snapshot_fd, 0o700)
             self._validate_restricted_directory(os.fstat(snapshot_fd))
             try:
-                descriptor = os.open(
-                    backup.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600, dir_fd=snapshot_fd,
-                )
-            except FileExistsError as error:
+                existing = os.stat(backup.name, dir_fd=snapshot_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None:
                 raise RuntimeError(
                     "Preinstall config snapshot already exists; rollback or remove the completed transaction first"
-                ) from error
+                )
             try:
-                with self._open_config_file(config) as source, os.fdopen(descriptor, "wb") as target:
-                    before = os.fstat(source.fileno())
-                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                        target.write(chunk)
-                    after = os.fstat(source.fileno())
-                    self._assert_stable_file(before, after)
-                    target.flush()
-                    os.fsync(target.fileno())
+                stale = os.stat(temporary_name, dir_fd=snapshot_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                stale = None
+            if stale is not None:
+                self._validate_private_config(stale)
+                os.unlink(temporary_name, dir_fd=snapshot_fd)
+            descriptor: int | None = os.open(
+                temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600, dir_fd=snapshot_fd,
+            )
+            try:
+                with os.fdopen(descriptor, "wb", closefd=True) as target:
+                    descriptor = None
+                    with self._open_config_file(config) as source:
+                        before = os.fstat(source.fileno())
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                            target.write(chunk)
+                        after = os.fstat(source.fileno())
+                        self._assert_stable_file(before, after)
+                        target.flush()
+                        os.fsync(target.fileno())
+                os.replace(
+                    temporary_name, backup.name,
+                    src_dir_fd=snapshot_fd, dst_dir_fd=snapshot_fd,
+                )
                 os.fsync(snapshot_fd)
             except Exception:
                 try:
-                    os.unlink(backup.name, dir_fd=snapshot_fd)
+                    os.unlink(temporary_name, dir_fd=snapshot_fd)
                 except FileNotFoundError:
                     pass
                 raise
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
         skill_target = self.paths.workspace / "skills" / SKILL_ID
         skill_backup = snapshot_dir / "skill.preinstall"
         skill_existed = skill_target.exists()

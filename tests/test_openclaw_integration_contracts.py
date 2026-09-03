@@ -5,6 +5,7 @@ import os
 import plistlib
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -271,6 +272,54 @@ def test_snapshot_uses_secure_descriptor_and_matching_hash(tmp_path: Path) -> No
     assert backup.stat().st_mode & 0o077 == 0
 
 
+def test_snapshot_source_open_failure_closes_fd_and_can_retry(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    original = manager._open_config_file
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = len(list(fd_root.iterdir()))
+
+    @contextmanager
+    def failing_open(_: Path):
+        raise RuntimeError("simulated source race")
+        yield
+
+    manager._open_config_file = failing_open
+    with pytest.raises(RuntimeError, match="simulated source race"):
+        manager.snapshot()
+    after = len(list(fd_root.iterdir()))
+    assert after == before
+    snapshot_dir = manager.paths.state_root / "snapshots"
+    assert not (snapshot_dir / "openclaw-config.preinstall").exists()
+    assert not (snapshot_dir / "openclaw-config.preinstall.tmp").exists()
+
+    manager._open_config_file = original
+    assert Path(manager.snapshot()["configBackupPath"]).is_file()
+
+
+def test_snapshot_mid_read_failure_removes_partial_temp(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    original = manager._assert_stable_file
+
+    def changed(*_: object) -> None:
+        raise RuntimeError("changed while it was being read")
+
+    manager._assert_stable_file = changed
+    with pytest.raises(RuntimeError, match="changed while"):
+        manager.snapshot()
+    snapshot_dir = manager.paths.state_root / "snapshots"
+    assert not (snapshot_dir / "openclaw-config.preinstall").exists()
+    assert not (snapshot_dir / "openclaw-config.preinstall.tmp").exists()
+
+    manager._assert_stable_file = original
+    assert Path(manager.snapshot()["configBackupPath"]).is_file()
+
+
 def test_restore_config_rejects_symlinked_target_parent(tmp_path: Path) -> None:
     manager, _, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
     snapshot_dir = manager.paths.state_root / "snapshots"
@@ -291,6 +340,21 @@ def test_restore_config_rejects_symlinked_target_parent(tmp_path: Path) -> None:
     assert outside_config.read_text() == "outside"
 
 
+def test_restore_config_rejects_symlinked_source_parent(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    outside = tmp_path / "outside-source"
+    outside.mkdir(mode=0o700)
+    outside_source = outside / "openclaw-config.preinstall"
+    outside_source.write_text("outside")
+    outside_source.chmod(0o600)
+    snapshot_dir = manager.paths.state_root / "snapshots"
+    snapshot_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="Managed directory"):
+        manager._restore_config_file(snapshot_dir / "openclaw-config.preinstall", config)
+    assert config.read_text() == "{}"
+
+
 def test_restore_config_atomically_replaces_custom_config_name(tmp_path: Path) -> None:
     manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
     snapshot_dir = manager.paths.state_root / "snapshots"
@@ -307,6 +371,26 @@ def test_restore_config_atomically_replaces_custom_config_name(tmp_path: Path) -
     assert custom.read_text() == "original"
     assert custom.stat().st_mode & 0o077 == 0
     assert not custom.with_name("profile-config.json.restore-tmp").exists()
+
+
+def test_restore_config_copy_failure_preserves_target_and_cleans_temp(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    snapshot_dir = manager.paths.state_root / "snapshots"
+    snapshot_dir.mkdir(mode=0o700)
+    source = snapshot_dir / "openclaw-config.preinstall"
+    source.write_text("original")
+    source.chmod(0o600)
+
+    def fail_copy(source_handle: object, target_handle: object) -> None:
+        target_handle.write(b"partial")
+        raise OSError("simulated copy failure")
+
+    monkeypatch.setattr(integration_core.shutil, "copyfileobj", fail_copy)
+    with pytest.raises(RuntimeError, match="Rollback config"):
+        manager._restore_config_file(source, config)
+    assert config.read_text() == "{}"
+    assert not config.with_name("openclaw.json.restore-tmp").exists()
 
 
 def test_paths_reject_wrong_project_identity_and_symlink(tmp_path: Path) -> None:
