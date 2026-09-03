@@ -248,12 +248,23 @@ class IntegrationManager:
         return {"openclawCompatible": True, "pluginSource": True, "skillSource": True}
 
     def _config_file(self) -> Path:
-        result = self.cli.run(["config", "file"])
-        config_path = Path(result.stdout.strip()).expanduser().resolve(strict=False)
+        payload = self.cli.json(["config", "validate", "--json"])
+        if not isinstance(payload, dict) or payload.get("valid") is not True \
+                or not isinstance(payload.get("path"), str) or not payload["path"].strip():
+            raise RuntimeError("OpenClaw config validation JSON has an unexpected schema")
+        config_path = Path(payload["path"]).expanduser()
+        if not config_path.is_absolute():
+            raise RuntimeError("OpenClaw config validation JSON returned a relative path")
+        _assert_no_symlink_components(config_path)
         _assert_specific_child(config_path, self.paths.home, "OpenClaw config")
         if config_path.is_symlink() or not config_path.is_file():
             raise RuntimeError("OpenClaw config file is missing or unsafe")
-        return config_path
+        metadata = config_path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != os.getuid():
+            raise RuntimeError("OpenClaw config file ownership is unsafe")
+        if metadata.st_mode & 0o077:
+            raise RuntimeError("OpenClaw config file permissions are too broad")
+        return config_path.resolve(strict=True)
 
     def snapshot(self) -> dict[str, Any]:
         config = self._config_file()

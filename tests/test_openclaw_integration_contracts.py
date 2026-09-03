@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import plistlib
+import subprocess
 import sys
 from pathlib import Path
 
@@ -34,6 +35,90 @@ def paths(tmp_path: Path) -> IntegrationPaths:
         directory.mkdir(parents=True, exist_ok=True)
     return IntegrationPaths(home=home, workspace=workspace, project_root=project, runtime_root=runtime,
                             state_root=state, launchd_plist=plist)
+
+
+def manager_with_config_result(tmp_path: Path, payload: object) -> tuple[IntegrationManager, Path, list[list[str]]]:
+    item = paths(tmp_path)
+    config = item.home / ".openclaw/openclaw.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("{}")
+    config.chmod(0o600)
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
+
+    cli = integration_core.OpenClawCli(tmp_path / "openclaw", runner=runner)
+    manager = IntegrationManager(paths=item, repo_root=Path(__file__).resolve().parents[1], cli=cli,
+                                 node_path=Path(sys.executable))
+    return manager, config, calls
+
+
+def test_config_file_uses_official_validate_json_path(tmp_path: Path) -> None:
+    manager, config, calls = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+
+    def runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr="migration notice\n"
+        )
+
+    manager.cli.runner = runner
+
+    assert manager._config_file() == config
+    assert calls == [manager.cli.command(["config", "validate", "--json"])]
+
+
+@pytest.mark.parametrize("payload", [
+    {"valid": False, "path": "/tmp/openclaw.json"},
+    {"valid": True},
+    {"valid": True, "path": ""},
+    ["not", "an", "object"],
+])
+def test_config_file_rejects_untrusted_validate_json_schema(tmp_path: Path, payload: object) -> None:
+    manager, _, _ = manager_with_config_result(tmp_path, payload)
+    with pytest.raises(RuntimeError, match="validation JSON"):
+        manager._config_file()
+
+
+def test_config_file_rejects_broad_permissions_and_symlink(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    config.chmod(0o644)
+    with pytest.raises(RuntimeError, match="permissions"):
+        manager._config_file()
+
+    config.chmod(0o600)
+    link = config.with_name("linked-openclaw.json")
+    link.symlink_to(config)
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(link)}), stderr=""
+    )
+    with pytest.raises((RuntimeError, ValueError), match="symbolic"):
+        manager._config_file()
+
+
+def test_config_file_rejects_hardlink_and_outside_home(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    hardlink = config.with_name("hardlinked-openclaw.json")
+    os.link(config, hardlink)
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    with pytest.raises(RuntimeError, match="ownership"):
+        manager._config_file()
+
+    outside = tmp_path / "outside-openclaw.json"
+    outside.write_text("{}")
+    outside.chmod(0o600)
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(outside)}), stderr=""
+    )
+    with pytest.raises(ValueError, match="managed root"):
+        manager._config_file()
 
 
 def test_paths_reject_wrong_project_identity_and_symlink(tmp_path: Path) -> None:
