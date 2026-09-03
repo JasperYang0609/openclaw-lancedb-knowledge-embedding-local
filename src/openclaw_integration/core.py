@@ -256,6 +256,12 @@ class IntegrationManager:
             raise RuntimeError("OpenClaw config parent permissions are too broad")
 
     @staticmethod
+    def _validate_restricted_directory(metadata: os.stat_result) -> None:
+        IntegrationManager._validate_private_directory(metadata)
+        if metadata.st_mode & 0o077:
+            raise RuntimeError("OpenClaw integration state permissions are too broad")
+
+    @staticmethod
     def _validate_private_config(metadata: os.stat_result) -> None:
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != os.getuid():
             raise RuntimeError("OpenClaw config file ownership is unsafe")
@@ -263,42 +269,67 @@ class IntegrationManager:
             raise RuntimeError("OpenClaw config file permissions are too broad")
 
     @contextmanager
-    def _open_config_file(self, config_path: Path) -> Iterator[BinaryIO]:
-        absolute = Path(os.path.abspath(config_path))
+    def _open_private_directory(self, directory: Path, *, create: bool = False) -> Iterator[int]:
+        absolute = Path(os.path.abspath(directory))
         home = Path(os.path.abspath(self.paths.home))
-        if absolute == home or home not in absolute.parents:
-            raise ValueError("OpenClaw config must be a specific child of its managed root")
+        if absolute != home and home not in absolute.parents:
+            raise ValueError("Managed directory must remain inside the OpenClaw home")
         relative = absolute.relative_to(home)
-        if not relative.parts:
-            raise ValueError("OpenClaw config must be a specific child of its managed root")
-
         if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
             raise RuntimeError("Secure OpenClaw config traversal is unsupported on this platform")
         nofollow = os.O_NOFOLLOW
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
-        file_flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | nofollow
         directory_fds: list[int] = []
-        file_fd: int | None = None
         try:
             current_fd = os.open(home, directory_flags)
             directory_fds.append(current_fd)
             self._validate_private_directory(os.fstat(current_fd))
             for component in relative.parts[:-1]:
+                if create:
+                    try:
+                        os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
                 current_fd = os.open(component, directory_flags, dir_fd=current_fd)
                 directory_fds.append(current_fd)
                 self._validate_private_directory(os.fstat(current_fd))
-            file_fd = os.open(relative.parts[-1], file_flags, dir_fd=current_fd)
-            self._validate_private_config(os.fstat(file_fd))
-            with os.fdopen(file_fd, "rb", closefd=True) as handle:
-                file_fd = None
-                yield handle
+            if relative.parts:
+                component = relative.parts[-1]
+                if create:
+                    try:
+                        os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                current_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                directory_fds.append(current_fd)
+                self._validate_private_directory(os.fstat(current_fd))
+            yield current_fd
+        except OSError as error:
+            raise RuntimeError("Managed directory path is missing or unsafe") from error
+        finally:
+            for descriptor in reversed(directory_fds):
+                os.close(descriptor)
+
+    @contextmanager
+    def _open_config_file(self, config_path: Path) -> Iterator[BinaryIO]:
+        absolute = Path(os.path.abspath(config_path))
+        home = Path(os.path.abspath(self.paths.home))
+        if absolute == home or home not in absolute.parents:
+            raise ValueError("OpenClaw config must be a specific child of its managed root")
+        file_fd: int | None = None
+        try:
+            with self._open_private_directory(absolute.parent) as parent_fd:
+                file_flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_NOFOLLOW
+                file_fd = os.open(absolute.name, file_flags, dir_fd=parent_fd)
+                self._validate_private_config(os.fstat(file_fd))
+                with os.fdopen(file_fd, "rb", closefd=True) as handle:
+                    file_fd = None
+                    yield handle
         except OSError as error:
             raise RuntimeError("OpenClaw config path is missing or unsafe") from error
         finally:
             if file_fd is not None:
                 os.close(file_fd)
-            for descriptor in reversed(directory_fds):
-                os.close(descriptor)
 
     @staticmethod
     def _assert_stable_file(before: os.stat_result, after: os.stat_result) -> None:
@@ -333,26 +364,37 @@ class IntegrationManager:
     def snapshot(self) -> dict[str, Any]:
         config = self._config_file()
         snapshot_dir = self.paths.state_root / "snapshots"
-        snapshot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(snapshot_dir, 0o700)
         backup = snapshot_dir / "openclaw-config.preinstall"
-        if backup.exists() or backup.is_symlink():
-            raise RuntimeError("Preinstall config snapshot already exists; rollback or remove the completed transaction first")
-        descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         digest = hashlib.sha256()
-        try:
-            with self._open_config_file(config) as source, os.fdopen(descriptor, "wb") as target:
-                before = os.fstat(source.fileno())
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(chunk)
-                    target.write(chunk)
-                after = os.fstat(source.fileno())
-                self._assert_stable_file(before, after)
-                target.flush()
-                os.fsync(target.fileno())
-        except Exception:
-            backup.unlink(missing_ok=True)
-            raise
+        with self._open_private_directory(snapshot_dir, create=True) as snapshot_fd:
+            os.fchmod(snapshot_fd, 0o700)
+            self._validate_restricted_directory(os.fstat(snapshot_fd))
+            try:
+                descriptor = os.open(
+                    backup.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600, dir_fd=snapshot_fd,
+                )
+            except FileExistsError as error:
+                raise RuntimeError(
+                    "Preinstall config snapshot already exists; rollback or remove the completed transaction first"
+                ) from error
+            try:
+                with self._open_config_file(config) as source, os.fdopen(descriptor, "wb") as target:
+                    before = os.fstat(source.fileno())
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        target.write(chunk)
+                    after = os.fstat(source.fileno())
+                    self._assert_stable_file(before, after)
+                    target.flush()
+                    os.fsync(target.fileno())
+                os.fsync(snapshot_fd)
+            except Exception:
+                try:
+                    os.unlink(backup.name, dir_fd=snapshot_fd)
+                except FileNotFoundError:
+                    pass
+                raise
         skill_target = self.paths.workspace / "skills" / SKILL_ID
         skill_backup = snapshot_dir / "skill.preinstall"
         skill_existed = skill_target.exists()
@@ -675,6 +717,72 @@ class IntegrationManager:
             os.fsync(output_handle.fileno())
         os.replace(temporary, target)
 
+    def _restore_config_file(self, source: Path, target: Path) -> None:
+        source = Path(os.path.abspath(source))
+        target = Path(os.path.abspath(target))
+        expected_source = Path(os.path.abspath(
+            self.paths.state_root / "snapshots/openclaw-config.preinstall"
+        ))
+        if source != expected_source:
+            raise RuntimeError("Rollback config identity is unsafe")
+        temporary_name = target.name + ".restore-tmp"
+        source_fd: int | None = None
+        target_fd: int | None = None
+        temporary_created = False
+        try:
+            with self._open_private_directory(source.parent) as source_parent_fd, \
+                    self._open_private_directory(target.parent) as target_parent_fd:
+                self._validate_restricted_directory(os.fstat(source_parent_fd))
+                source_fd = os.open(
+                    source.name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_NOFOLLOW,
+                    dir_fd=source_parent_fd,
+                )
+                self._validate_private_config(os.fstat(source_fd))
+                current_fd = os.open(
+                    target.name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_NOFOLLOW,
+                    dir_fd=target_parent_fd,
+                )
+                try:
+                    self._validate_private_config(os.fstat(current_fd))
+                finally:
+                    os.close(current_fd)
+                target_fd = os.open(
+                    temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600, dir_fd=target_parent_fd,
+                )
+                temporary_created = True
+                try:
+                    with os.fdopen(source_fd, "rb", closefd=True) as input_handle, \
+                            os.fdopen(target_fd, "wb", closefd=True) as output_handle:
+                        source_fd = None
+                        target_fd = None
+                        before = os.fstat(input_handle.fileno())
+                        shutil.copyfileobj(input_handle, output_handle)
+                        after = os.fstat(input_handle.fileno())
+                        self._assert_stable_file(before, after)
+                        output_handle.flush()
+                        os.fsync(output_handle.fileno())
+                    os.replace(
+                        temporary_name, target.name,
+                        src_dir_fd=target_parent_fd, dst_dir_fd=target_parent_fd,
+                    )
+                    temporary_created = False
+                    os.fsync(target_parent_fd)
+                except Exception:
+                    if temporary_created:
+                        try:
+                            os.unlink(temporary_name, dir_fd=target_parent_fd)
+                        except FileNotFoundError:
+                            pass
+                    raise
+        except OSError as error:
+            raise RuntimeError("Rollback config path is missing or unsafe") from error
+        finally:
+            if source_fd is not None:
+                os.close(source_fd)
+            if target_fd is not None:
+                os.close(target_fd)
+
     def rollback(self, *, require_exact_post_config: bool = True) -> dict[str, Any]:
         transaction = self.store.read()
         config = Path(transaction["configPath"])
@@ -718,7 +826,7 @@ class IntegrationManager:
             if self.paths.project_root.is_symlink():
                 raise RuntimeError("Created Qwen project became a symbolic link; refusing rollback")
             shutil.rmtree(self.paths.project_root)
-        self._restore_regular_file(Path(transaction["configBackupPath"]), config)
+        self._restore_config_file(Path(transaction["configBackupPath"]), config)
         self.cli.run(["config", "validate", "--json"])
         self.cli.run(["gateway", "restart", "--safe", "--json"], timeout=300, check=False)
         transaction["phase"] = "rolled_back"

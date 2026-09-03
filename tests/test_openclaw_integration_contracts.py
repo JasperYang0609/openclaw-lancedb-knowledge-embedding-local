@@ -6,6 +6,7 @@ import plistlib
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -214,6 +215,98 @@ def test_config_file_rejects_parent_symlink_and_open_race(
     monkeypatch.setattr(integration_core.os, "open", racing_open)
     with pytest.raises(RuntimeError, match="missing or unsafe"):
         manager._config_file()
+
+
+def test_config_hash_rejects_mid_read_metadata_change(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    real_fstat = os.fstat
+    regular_calls = 0
+
+    def changing_fstat(fd: int) -> object:
+        nonlocal regular_calls
+        metadata = real_fstat(fd)
+        if metadata.st_ino == config.lstat().st_ino:
+            regular_calls += 1
+            if regular_calls == 3:
+                fields = {name: getattr(metadata, name) for name in (
+                    "st_mode", "st_nlink", "st_uid", "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"
+                )}
+                fields["st_mtime_ns"] += 1
+                return SimpleNamespace(**fields)
+        return metadata
+
+    monkeypatch.setattr(integration_core.os, "fstat", changing_fstat)
+    with pytest.raises(RuntimeError, match="changed while"):
+        manager._sha256_config(config)
+
+
+def test_snapshot_rejects_symlink_destination(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    outside = tmp_path / "outside-snapshots"
+    outside.mkdir(mode=0o700)
+    snapshots = manager.paths.state_root / "snapshots"
+    snapshots.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="Managed directory"):
+        manager.snapshot()
+    assert not (outside / "openclaw-config.preinstall").exists()
+
+
+def test_snapshot_uses_secure_descriptor_and_matching_hash(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    config.write_text('{"safe":true}')
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+
+    result = manager.snapshot()
+
+    backup = Path(result["configBackupPath"])
+    assert backup.read_text() == config.read_text()
+    assert result["preConfigSha256"] == integration_core.sha256_file(backup)
+    assert backup.stat().st_mode & 0o077 == 0
+
+
+def test_restore_config_rejects_symlinked_target_parent(tmp_path: Path) -> None:
+    manager, _, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    snapshot_dir = manager.paths.state_root / "snapshots"
+    snapshot_dir.mkdir(mode=0o700)
+    source = snapshot_dir / "openclaw-config.preinstall"
+    source.write_text("original")
+    source.chmod(0o600)
+    outside = tmp_path / "outside-target"
+    outside.mkdir(mode=0o700)
+    outside_config = outside / "custom.json"
+    outside_config.write_text("outside")
+    outside_config.chmod(0o600)
+    linked_parent = manager.paths.home / "linked-config"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="Managed directory"):
+        manager._restore_config_file(source, linked_parent / "custom.json")
+    assert outside_config.read_text() == "outside"
+
+
+def test_restore_config_atomically_replaces_custom_config_name(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    snapshot_dir = manager.paths.state_root / "snapshots"
+    snapshot_dir.mkdir(mode=0o700)
+    source = snapshot_dir / "openclaw-config.preinstall"
+    source.write_text("original")
+    source.chmod(0o600)
+    custom = config.with_name("profile-config.json")
+    custom.write_text("changed")
+    custom.chmod(0o600)
+
+    manager._restore_config_file(source, custom)
+
+    assert custom.read_text() == "original"
+    assert custom.stat().st_mode & 0o077 == 0
+    assert not custom.with_name("profile-config.json.restore-tmp").exists()
 
 
 def test_paths_reject_wrong_project_identity_and_symlink(tmp_path: Path) -> None:
