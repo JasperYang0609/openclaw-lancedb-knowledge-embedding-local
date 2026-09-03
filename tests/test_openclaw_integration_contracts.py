@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import plistlib
+import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -63,6 +65,14 @@ def snapshot_run(manager: IntegrationManager) -> Path:
     return run_dir
 
 
+def restore_kwargs(source: Path) -> dict[str, object]:
+    metadata = source.parent.stat()
+    return {
+        "expected_sha256": integration_core.sha256_file(source),
+        "expected_run_identity": (metadata.st_dev, metadata.st_ino),
+    }
+
+
 def test_config_file_uses_official_validate_json_path(tmp_path: Path) -> None:
     manager, config, calls = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
 
@@ -85,6 +95,14 @@ def test_integration_lock_rejects_concurrent_transaction(tmp_path: Path) -> None
         with pytest.raises(RuntimeError, match="transaction is active"):
             with manager._integration_lock():
                 pass
+
+
+def test_integration_lock_preserves_consumer_oserror(tmp_path: Path) -> None:
+    manager, _, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+
+    with pytest.raises(OSError, match="consumer failure"):
+        with manager._integration_lock():
+            raise OSError("consumer failure")
 
 
 @pytest.mark.parametrize("payload", [
@@ -305,6 +323,9 @@ def test_snapshot_uses_secure_descriptor_and_matching_hash(tmp_path: Path) -> No
     backup = Path(result["configBackupPath"])
     assert backup.read_text() == config.read_text()
     assert result["preConfigSha256"] == integration_core.sha256_file(backup)
+    assert (result["snapshotRunDev"], result["snapshotRunIno"]) == (
+        backup.parent.stat().st_dev, backup.parent.stat().st_ino,
+    )
     assert backup.stat().st_mode & 0o077 == 0
 
 
@@ -431,10 +452,29 @@ def test_recorded_snapshot_cleanup_removes_only_manifest_run(tmp_path: Path) -> 
     foreign.mkdir(mode=0o700)
     marker = foreign / "foreign-data"
     marker.write_text("preserve")
+    recorded_metadata = recorded.stat()
 
-    manager._remove_recorded_snapshot_run(backup)
+    manager._remove_recorded_snapshot_run(backup, (recorded_metadata.st_dev, recorded_metadata.st_ino))
 
     assert not recorded.exists()
+    assert marker.read_text() == "preserve"
+
+
+def test_recorded_snapshot_cleanup_rejects_same_path_replacement(tmp_path: Path) -> None:
+    manager, _, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    recorded = snapshot_run(manager)
+    backup = recorded / "openclaw-config.preinstall"
+    backup.write_text("recorded")
+    backup.chmod(0o600)
+    original = recorded.stat()
+    shutil.rmtree(recorded)
+    recorded.mkdir(mode=0o700)
+    marker = recorded / "foreign-data"
+    marker.write_text("preserve")
+
+    with pytest.raises(RuntimeError, match="changed before cleanup"):
+        manager._remove_recorded_snapshot_run(backup, (original.st_dev, original.st_ino))
+
     assert marker.read_text() == "preserve"
 
 
@@ -453,7 +493,7 @@ def test_restore_config_rejects_symlinked_target_parent(tmp_path: Path) -> None:
     linked_parent.symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(RuntimeError, match="Managed directory"):
-        manager._restore_config_file(source, linked_parent / "custom.json")
+        manager._restore_config_file(source, linked_parent / "custom.json", **restore_kwargs(source))
     assert outside_config.read_text() == "outside"
 
 
@@ -469,7 +509,9 @@ def test_restore_config_rejects_symlinked_source_parent(tmp_path: Path) -> None:
     snapshot_dir = snapshot_root / "run-00000000-0000-4000-8000-000000000001"
 
     with pytest.raises(RuntimeError, match="Managed directory"):
-        manager._restore_config_file(snapshot_dir / "openclaw-config.preinstall", config)
+        manager._restore_config_file(
+            snapshot_dir / "openclaw-config.preinstall", config, **restore_kwargs(outside_source)
+        )
     assert config.read_text() == "{}"
 
 
@@ -483,28 +525,45 @@ def test_restore_config_atomically_replaces_custom_config_name(tmp_path: Path) -
     custom.write_text("changed")
     custom.chmod(0o600)
 
-    manager._restore_config_file(source, custom)
+    manager._restore_config_file(source, custom, **restore_kwargs(source))
 
     assert custom.read_text() == "original"
     assert custom.stat().st_mode & 0o077 == 0
     assert not custom.with_name("profile-config.json.restore-tmp").exists()
 
 
-def test_restore_config_copy_failure_preserves_target_and_cleans_temp(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_restore_config_integrity_failure_preserves_target_and_cleans_temp(tmp_path: Path) -> None:
     manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
     snapshot_dir = snapshot_run(manager)
     source = snapshot_dir / "openclaw-config.preinstall"
     source.write_text("original")
     source.chmod(0o600)
 
-    def fail_copy(source_handle: object, target_handle: object) -> None:
-        target_handle.write(b"partial")
-        raise OSError("simulated copy failure")
+    def fail_integrity(*_: object) -> None:
+        raise RuntimeError("simulated integrity failure")
 
-    monkeypatch.setattr(integration_core.shutil, "copyfileobj", fail_copy)
-    with pytest.raises(RuntimeError, match="Rollback config"):
-        manager._restore_config_file(source, config)
+    manager._assert_stable_file = fail_integrity
+    with pytest.raises(RuntimeError, match="simulated integrity failure"):
+        manager._restore_config_file(source, config, **restore_kwargs(source))
+    assert config.read_text() == "{}"
+    assert not config.with_name("openclaw.json.restore-tmp").exists()
+
+
+def test_restore_config_rejects_tampered_snapshot_hash(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    snapshot_dir = snapshot_run(manager)
+    source = snapshot_dir / "openclaw-config.preinstall"
+    source.write_text("tampered")
+    source.chmod(0o600)
+    identity = snapshot_dir.stat()
+
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        manager._restore_config_file(
+            source, config,
+            expected_sha256=hashlib.sha256(b"original").hexdigest(),
+            expected_run_identity=(identity.st_dev, identity.st_ino),
+        )
+
     assert config.read_text() == "{}"
     assert not config.with_name("openclaw.json.restore-tmp").exists()
 
