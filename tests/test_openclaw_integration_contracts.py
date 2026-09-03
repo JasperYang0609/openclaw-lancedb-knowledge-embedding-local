@@ -155,6 +155,27 @@ def test_config_file_rejects_unsafe_parent_and_special_file(tmp_path: Path) -> N
         manager._config_file()
 
 
+def test_unsafe_parent_validation_does_not_leak_directory_fds(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    config.parent.chmod(0o777)
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = len(list(fd_root.iterdir()))
+    for _ in range(20):
+        with pytest.raises(RuntimeError, match="parent permissions"):
+            manager._config_file()
+    assert len(list(fd_root.iterdir())) == before
+
+
+def test_config_reader_preserves_consumer_io_error(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    with pytest.raises(OSError, match="consumer read failure"):
+        with manager._open_config_file(config):
+            raise OSError("consumer read failure")
+
+
 def test_config_metadata_rejects_wrong_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
     metadata = config.lstat()
@@ -317,6 +338,26 @@ def test_snapshot_mid_read_failure_removes_partial_temp(tmp_path: Path) -> None:
     assert not (snapshot_dir / "openclaw-config.preinstall.tmp").exists()
 
     manager._assert_stable_file = original
+    assert Path(manager.snapshot()["configBackupPath"]).is_file()
+
+
+def test_snapshot_later_failure_removes_all_backups_and_can_retry(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    skill_target = manager.paths.workspace / "skills" / integration_core.SKILL_ID
+    skill_target.parent.mkdir(parents=True)
+    outside = tmp_path / "outside-skill"
+    outside.mkdir()
+    skill_target.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="skill is a symbolic link"):
+        manager.snapshot()
+    snapshot_dir = manager.paths.state_root / "snapshots"
+    assert list(snapshot_dir.iterdir()) == []
+
+    skill_target.unlink()
     assert Path(manager.snapshot()["configBackupPath"]).is_file()
 
 

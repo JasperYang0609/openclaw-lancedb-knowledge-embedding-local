@@ -281,33 +281,21 @@ class IntegrationManager:
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
         directory_fds: list[int] = []
         try:
-            current_fd = os.open(home, directory_flags)
-            directory_fds.append(current_fd)
-            self._validate_private_directory(os.fstat(current_fd))
-            for component in relative.parts[:-1]:
-                if create:
-                    try:
-                        os.mkdir(component, mode=0o700, dir_fd=current_fd)
-                    except FileExistsError:
-                        pass
-                current_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            try:
+                current_fd = os.open(home, directory_flags)
                 directory_fds.append(current_fd)
                 self._validate_private_directory(os.fstat(current_fd))
-            if relative.parts:
-                component = relative.parts[-1]
-                if create:
-                    try:
-                        os.mkdir(component, mode=0o700, dir_fd=current_fd)
-                    except FileExistsError:
-                        pass
-                current_fd = os.open(component, directory_flags, dir_fd=current_fd)
-                directory_fds.append(current_fd)
-                self._validate_private_directory(os.fstat(current_fd))
-        except OSError as error:
-            for descriptor in reversed(directory_fds):
-                os.close(descriptor)
-            raise RuntimeError("Managed directory path is missing or unsafe") from error
-        try:
+                for component in relative.parts:
+                    if create:
+                        try:
+                            os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                        except FileExistsError:
+                            pass
+                    current_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                    directory_fds.append(current_fd)
+                    self._validate_private_directory(os.fstat(current_fd))
+            except OSError as error:
+                raise RuntimeError("Managed directory path is missing or unsafe") from error
             yield current_fd
         finally:
             for descriptor in reversed(directory_fds):
@@ -320,19 +308,20 @@ class IntegrationManager:
         if absolute == home or home not in absolute.parents:
             raise ValueError("OpenClaw config must be a specific child of its managed root")
         file_fd: int | None = None
-        try:
-            with self._open_private_directory(absolute.parent) as parent_fd:
+        with self._open_private_directory(absolute.parent) as parent_fd:
+            try:
                 file_flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_NOFOLLOW
                 file_fd = os.open(absolute.name, file_flags, dir_fd=parent_fd)
                 self._validate_private_config(os.fstat(file_fd))
+            except OSError as error:
+                raise RuntimeError("OpenClaw config path is missing or unsafe") from error
+            try:
                 with os.fdopen(file_fd, "rb", closefd=True) as handle:
                     file_fd = None
                     yield handle
-        except OSError as error:
-            raise RuntimeError("OpenClaw config path is missing or unsafe") from error
-        finally:
-            if file_fd is not None:
-                os.close(file_fd)
+            finally:
+                if file_fd is not None:
+                    os.close(file_fd)
 
     @staticmethod
     def _assert_stable_file(before: os.stat_result, after: os.stat_result) -> None:
@@ -363,6 +352,71 @@ class IntegrationManager:
         with self._open_config_file(config_path):
             pass
         return Path(os.path.abspath(config_path))
+
+    def _remove_config_snapshot(self, backup: Path) -> None:
+        expected = Path(os.path.abspath(
+            self.paths.state_root / "snapshots/openclaw-config.preinstall"
+        ))
+        backup = Path(os.path.abspath(backup))
+        if backup != expected:
+            raise RuntimeError("Config snapshot cleanup identity is unsafe")
+        with self._open_private_directory(backup.parent) as snapshot_fd:
+            metadata = os.stat(backup.name, dir_fd=snapshot_fd, follow_symlinks=False)
+            self._validate_private_config(metadata)
+            os.unlink(backup.name, dir_fd=snapshot_fd)
+            os.fsync(snapshot_fd)
+
+    def _snapshot_other_assets(self, snapshot_dir: Path) -> dict[str, Any]:
+        skill_target = self.paths.workspace / "skills" / SKILL_ID
+        skill_backup = snapshot_dir / "skill.preinstall"
+        plist_backup = snapshot_dir / "launchd.preinstall.plist"
+        project_backup = snapshot_dir / "project-runtime.preinstall"
+        managed_backups = (skill_backup, plist_backup, project_backup)
+        if any(candidate.exists() or candidate.is_symlink() for candidate in managed_backups):
+            raise RuntimeError("A non-config preinstall snapshot already exists")
+        skill_existed = skill_target.exists()
+        plist_existed = self.paths.launchd_plist.exists()
+        project_existed = self.paths.project_root.exists()
+        try:
+            if skill_target.is_symlink():
+                raise RuntimeError("Existing local knowledge skill is a symbolic link")
+            if skill_existed:
+                shutil.copytree(skill_target, skill_backup)
+            if self.paths.launchd_plist.is_symlink():
+                raise RuntimeError("Existing launchd plist is a symbolic link")
+            if plist_existed:
+                shutil.copy2(self.paths.launchd_plist, plist_backup)
+                os.chmod(plist_backup, 0o600)
+            if project_existed:
+                if self.paths.project_root.is_symlink() or not self.paths.project_root.is_dir():
+                    raise RuntimeError("Existing Qwen project root is unsafe")
+                project_backup.mkdir(mode=0o700)
+                for relative in (Path("src"), Path("scripts"), Path("package.json"), Path("package-lock.json")):
+                    source = self.paths.project_root / relative
+                    if not source.exists():
+                        continue
+                    if source.is_symlink():
+                        raise RuntimeError("Existing Qwen project runtime contains a symbolic link")
+                    target = project_backup / relative
+                    if source.is_dir():
+                        shutil.copytree(source, target)
+                    else:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source, target)
+        except Exception:
+            for candidate in reversed(managed_backups):
+                if candidate.is_symlink():
+                    candidate.unlink()
+                elif candidate.is_dir():
+                    shutil.rmtree(candidate)
+                elif candidate.exists():
+                    candidate.unlink()
+            raise
+        return {
+            "skillTargetPath": str(skill_target), "skillBackupPath": str(skill_backup),
+            "skillExisted": skill_existed, "plistBackupPath": str(plist_backup), "plistExisted": plist_existed,
+            "projectExisted": project_existed, "projectBackupPath": str(project_backup),
+        }
 
     def snapshot(self) -> dict[str, Any]:
         config = self._config_file()
@@ -418,45 +472,14 @@ class IntegrationManager:
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
-        skill_target = self.paths.workspace / "skills" / SKILL_ID
-        skill_backup = snapshot_dir / "skill.preinstall"
-        skill_existed = skill_target.exists()
-        if skill_target.is_symlink():
-            raise RuntimeError("Existing local knowledge skill is a symbolic link")
-        if skill_existed:
-            if skill_backup.exists():
-                raise RuntimeError("Preinstall skill snapshot already exists")
-            shutil.copytree(skill_target, skill_backup)
-        plist_backup = snapshot_dir / "launchd.preinstall.plist"
-        plist_existed = self.paths.launchd_plist.exists()
-        if self.paths.launchd_plist.is_symlink():
-            raise RuntimeError("Existing launchd plist is a symbolic link")
-        if plist_existed:
-            shutil.copy2(self.paths.launchd_plist, plist_backup)
-            os.chmod(plist_backup, 0o600)
-        project_existed = self.paths.project_root.exists()
-        project_backup = snapshot_dir / "project-runtime.preinstall"
-        if project_existed:
-            if self.paths.project_root.is_symlink() or not self.paths.project_root.is_dir():
-                raise RuntimeError("Existing Qwen project root is unsafe")
-            project_backup.mkdir(mode=0o700)
-            for relative in (Path("src"), Path("scripts"), Path("package.json"), Path("package-lock.json")):
-                source = self.paths.project_root / relative
-                if not source.exists():
-                    continue
-                if source.is_symlink():
-                    raise RuntimeError("Existing Qwen project runtime contains a symbolic link")
-                target = project_backup / relative
-                if source.is_dir():
-                    shutil.copytree(source, target)
-                else:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, target)
+        try:
+            other_assets = self._snapshot_other_assets(snapshot_dir)
+        except Exception:
+            self._remove_config_snapshot(backup)
+            raise
         return {
             "configPath": str(config), "configBackupPath": str(backup), "preConfigSha256": digest.hexdigest(),
-            "skillTargetPath": str(skill_target), "skillBackupPath": str(skill_backup),
-            "skillExisted": skill_existed, "plistBackupPath": str(plist_backup), "plistExisted": plist_existed,
-            "projectExisted": project_existed, "projectBackupPath": str(project_backup),
+            **other_assets,
         }
 
     def install_launchd_plist(self, runtime_manifest: dict[str, Any]) -> None:
