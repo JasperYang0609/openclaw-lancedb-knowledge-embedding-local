@@ -394,13 +394,16 @@ class IntegrationManager:
         if str(parsed) != name[4:]:
             raise RuntimeError("Snapshot run identity is unsafe")
 
-    def _remove_tree_at(self, parent_fd: int, name: str, expected_identity: tuple[int, int]) -> None:
+    def _remove_tree_at(self, parent_fd: int, name: str, expected_identity: tuple[int, int],
+                        *, expected_root_marker_sha256: str | None = None) -> None:
         directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
         try:
             metadata = os.fstat(directory_fd)
             self._validate_private_directory(metadata)
             if (metadata.st_dev, metadata.st_ino) != expected_identity:
                 raise RuntimeError("Snapshot run changed before cleanup")
+            if expected_root_marker_sha256 is not None:
+                self._verify_snapshot_marker(directory_fd, expected_root_marker_sha256)
             for child_name in os.listdir(directory_fd):
                 child = os.stat(child_name, dir_fd=directory_fd, follow_symlinks=False)
                 if stat.S_ISDIR(child.st_mode):
@@ -448,15 +451,10 @@ class IntegrationManager:
             raise RuntimeError("Snapshot run cleanup identity is unsafe")
         self._validate_snapshot_run_name(run_dir.name)
         with self._open_private_directory(expected_parent) as snapshot_fd:
-            run_fd = os.open(run_dir.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=snapshot_fd)
-            try:
-                metadata = os.fstat(run_fd)
-                if (metadata.st_dev, metadata.st_ino) != expected_identity:
-                    raise RuntimeError("Snapshot run changed before cleanup")
-                self._verify_snapshot_marker(run_fd, expected_marker_sha256)
-            finally:
-                os.close(run_fd)
-            self._remove_tree_at(snapshot_fd, run_dir.name, expected_identity)
+            self._remove_tree_at(
+                snapshot_fd, run_dir.name, expected_identity,
+                expected_root_marker_sha256=expected_marker_sha256,
+            )
 
     def _snapshot_run_from_backup(self, backup: Path) -> Path:
         backup = Path(os.path.abspath(backup))
@@ -580,9 +578,13 @@ class IntegrationManager:
                         os.close(descriptor)
             other_assets = self._snapshot_other_assets(run_dir)
         except Exception:
-            if run_identity is not None and run_marker_sha256 is not None:
+            if run_identity is not None:
                 try:
-                    self._remove_snapshot_run(run_dir, run_identity, run_marker_sha256)
+                    if run_marker_sha256 is not None:
+                        self._remove_snapshot_run(run_dir, run_identity, run_marker_sha256)
+                    else:
+                        with self._open_private_directory(snapshot_root) as snapshot_fd:
+                            self._remove_tree_at(snapshot_fd, run_dir.name, run_identity)
                 except FileNotFoundError:
                     pass
             raise

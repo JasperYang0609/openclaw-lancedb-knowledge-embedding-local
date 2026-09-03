@@ -387,6 +387,28 @@ def test_snapshot_mid_read_failure_removes_partial_temp(tmp_path: Path) -> None:
     assert Path(manager.snapshot()["configBackupPath"]).is_file()
 
 
+def test_snapshot_marker_creation_failure_removes_orphan_run(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    real_open = integration_core.os.open
+
+    def fail_marker_open(path: object, *args: object, **kwargs: object) -> int:
+        if path == integration_core.SNAPSHOT_MARKER_NAME:
+            raise OSError("simulated marker failure")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(integration_core.os, "open", fail_marker_open)
+    with pytest.raises(OSError, match="simulated marker failure"):
+        manager.snapshot()
+
+    snapshot_root = manager.paths.state_root / "snapshots"
+    assert snapshot_root.is_dir()
+    assert list(snapshot_root.iterdir()) == []
+
+
 def test_snapshot_later_failure_removes_all_backups_and_can_retry(tmp_path: Path) -> None:
     manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
     manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
@@ -497,6 +519,27 @@ def test_recorded_snapshot_cleanup_rejects_same_path_replacement(tmp_path: Path)
         )
 
     assert marker.read_text() == "preserve"
+
+
+def test_recorded_snapshot_cleanup_rejects_changed_marker_on_same_directory(tmp_path: Path) -> None:
+    manager, _, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    recorded = snapshot_run(manager)
+    backup = recorded / "openclaw-config.preinstall"
+    backup.write_text("recorded")
+    backup.chmod(0o600)
+    identity = recorded.stat()
+    marker = recorded / integration_core.SNAPSHOT_MARKER_NAME
+    expected_marker_sha256 = integration_core.sha256_file(marker)
+    marker.write_text("replacement-marker")
+    marker.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="marker mismatch"):
+        manager._remove_recorded_snapshot_run(
+            backup, (identity.st_dev, identity.st_ino), expected_marker_sha256,
+        )
+
+    assert backup.read_text() == "recorded"
+    assert marker.read_text() == "replacement-marker"
 
 
 def test_restore_config_rejects_symlinked_target_parent(tmp_path: Path) -> None:
