@@ -62,6 +62,9 @@ def manager_with_config_result(tmp_path: Path, payload: object) -> tuple[Integra
 def snapshot_run(manager: IntegrationManager) -> Path:
     run_dir = manager.paths.state_root / "snapshots" / "run-00000000-0000-4000-8000-000000000001"
     run_dir.mkdir(parents=True, mode=0o700)
+    marker = run_dir / integration_core.SNAPSHOT_MARKER_NAME
+    marker.write_text("fixture-run-marker")
+    marker.chmod(0o600)
     return run_dir
 
 
@@ -70,6 +73,9 @@ def restore_kwargs(source: Path) -> dict[str, object]:
     return {
         "expected_sha256": integration_core.sha256_file(source),
         "expected_run_identity": (metadata.st_dev, metadata.st_ino),
+        "expected_marker_sha256": integration_core.sha256_file(
+            source.parent / integration_core.SNAPSHOT_MARKER_NAME
+        ),
     }
 
 
@@ -362,8 +368,14 @@ def test_snapshot_mid_read_failure_removes_partial_temp(tmp_path: Path) -> None:
     )
     original = manager._assert_stable_file
 
-    def changed(*_: object) -> None:
-        raise RuntimeError("changed while it was being read")
+    calls = 0
+
+    def changed(*args: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("changed while it was being read")
+        original(*args)
 
     manager._assert_stable_file = changed
     with pytest.raises(RuntimeError, match="changed while"):
@@ -453,11 +465,17 @@ def test_recorded_snapshot_cleanup_removes_only_manifest_run(tmp_path: Path) -> 
     marker = foreign / "foreign-data"
     marker.write_text("preserve")
     recorded_metadata = recorded.stat()
+    run_marker_sha256 = integration_core.sha256_file(recorded / integration_core.SNAPSHOT_MARKER_NAME)
 
-    manager._remove_recorded_snapshot_run(backup, (recorded_metadata.st_dev, recorded_metadata.st_ino))
+    assert manager._remove_recorded_snapshot_run(
+        backup, (recorded_metadata.st_dev, recorded_metadata.st_ino), run_marker_sha256,
+    ) is True
 
     assert not recorded.exists()
     assert marker.read_text() == "preserve"
+    assert manager._remove_recorded_snapshot_run(
+        backup, (recorded_metadata.st_dev, recorded_metadata.st_ino), run_marker_sha256,
+    ) is False
 
 
 def test_recorded_snapshot_cleanup_rejects_same_path_replacement(tmp_path: Path) -> None:
@@ -467,13 +485,16 @@ def test_recorded_snapshot_cleanup_rejects_same_path_replacement(tmp_path: Path)
     backup.write_text("recorded")
     backup.chmod(0o600)
     original = recorded.stat()
+    marker_sha256 = integration_core.sha256_file(recorded / integration_core.SNAPSHOT_MARKER_NAME)
     shutil.rmtree(recorded)
     recorded.mkdir(mode=0o700)
     marker = recorded / "foreign-data"
     marker.write_text("preserve")
 
-    with pytest.raises(RuntimeError, match="changed before cleanup"):
-        manager._remove_recorded_snapshot_run(backup, (original.st_dev, original.st_ino))
+    with pytest.raises(RuntimeError, match="changed before cleanup|marker"):
+        manager._remove_recorded_snapshot_run(
+            backup, (original.st_dev, original.st_ino), marker_sha256,
+        )
 
     assert marker.read_text() == "preserve"
 
@@ -504,6 +525,9 @@ def test_restore_config_rejects_symlinked_source_parent(tmp_path: Path) -> None:
     outside_source = outside / "openclaw-config.preinstall"
     outside_source.write_text("outside")
     outside_source.chmod(0o600)
+    outside_marker = outside / integration_core.SNAPSHOT_MARKER_NAME
+    outside_marker.write_text("outside-marker")
+    outside_marker.chmod(0o600)
     snapshot_root = manager.paths.state_root / "snapshots"
     snapshot_root.symlink_to(outside, target_is_directory=True)
     snapshot_dir = snapshot_root / "run-00000000-0000-4000-8000-000000000001"
@@ -562,10 +586,40 @@ def test_restore_config_rejects_tampered_snapshot_hash(tmp_path: Path) -> None:
             source, config,
             expected_sha256=hashlib.sha256(b"original").hexdigest(),
             expected_run_identity=(identity.st_dev, identity.st_ino),
+            expected_marker_sha256=integration_core.sha256_file(
+                snapshot_dir / integration_core.SNAPSHOT_MARKER_NAME
+            ),
         )
 
     assert config.read_text() == "{}"
     assert not config.with_name("openclaw.json.restore-tmp").exists()
+
+
+def test_rollback_preflights_snapshot_before_any_side_effect(tmp_path: Path) -> None:
+    manager, config, calls = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    snapshot = manager.snapshot()
+    manager.store.write({
+        "schemaVersion": 1,
+        "runId": "fixture-run",
+        "phase": "failed",
+        "ownedAssets": [],
+        "projectCreated": False,
+        **snapshot,
+    })
+    backup = Path(snapshot["configBackupPath"])
+    backup.write_text("tampered")
+    backup.chmod(0o600)
+    side_effects: list[str] = []
+    manager.deactivate_launchd = lambda: side_effects.append("deactivate")
+
+    with pytest.raises(RuntimeError, match="hash mismatch"):
+        manager._rollback_locked(require_exact_post_config=False)
+
+    assert side_effects == []
+    assert calls == []
 
 
 def test_paths_reject_wrong_project_identity_and_symlink(tmp_path: Path) -> None:

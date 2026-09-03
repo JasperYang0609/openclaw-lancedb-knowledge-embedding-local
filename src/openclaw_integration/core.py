@@ -20,6 +20,7 @@ from .launchd import LAUNCHD_LABEL, build_launchd_plist
 PLUGIN_ID = "openclaw-lancedb-knowledge-local"
 SKILL_ID = "openclaw-lancedb-knowledge-local"
 TOOL_NAME = "local_knowledge_search"
+SNAPSHOT_MARKER_NAME = ".snapshot-run-id"
 CRON_DECLARATION_KEY = "openclaw-lancedb-knowledge-local-incremental-v1"
 GEMINI_DECLARATION_KEY = "openclaw-lancedb-knowledge-gemini-incremental-v1"
 SCHEMA_VERSION = 1
@@ -414,13 +415,47 @@ class IntegrationManager:
         finally:
             os.close(directory_fd)
 
-    def _remove_snapshot_run(self, run_dir: Path, expected_identity: tuple[int, int]) -> None:
+    def _verify_snapshot_marker(self, run_fd: int, expected_sha256: str) -> None:
+        marker_fd: int | None = None
+        try:
+            marker_fd = os.open(
+                SNAPSHOT_MARKER_NAME,
+                os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_NOFOLLOW,
+                dir_fd=run_fd,
+            )
+            self._validate_private_config(os.fstat(marker_fd))
+            with os.fdopen(marker_fd, "rb", closefd=True) as handle:
+                marker_fd = None
+                before = os.fstat(handle.fileno())
+                value = handle.read(256)
+                if handle.read(1):
+                    raise RuntimeError("Snapshot run marker is oversized")
+                after = os.fstat(handle.fileno())
+                self._assert_stable_file(before, after)
+            if hashlib.sha256(value).hexdigest() != expected_sha256:
+                raise RuntimeError("Snapshot run marker mismatch")
+        except OSError as error:
+            raise RuntimeError("Snapshot run marker is missing or unsafe") from error
+        finally:
+            if marker_fd is not None:
+                os.close(marker_fd)
+
+    def _remove_snapshot_run(self, run_dir: Path, expected_identity: tuple[int, int],
+                             expected_marker_sha256: str) -> None:
         run_dir = Path(os.path.abspath(run_dir))
         expected_parent = Path(os.path.abspath(self.paths.state_root / "snapshots"))
         if run_dir.parent != expected_parent:
             raise RuntimeError("Snapshot run cleanup identity is unsafe")
         self._validate_snapshot_run_name(run_dir.name)
         with self._open_private_directory(expected_parent) as snapshot_fd:
+            run_fd = os.open(run_dir.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=snapshot_fd)
+            try:
+                metadata = os.fstat(run_fd)
+                if (metadata.st_dev, metadata.st_ino) != expected_identity:
+                    raise RuntimeError("Snapshot run changed before cleanup")
+                self._verify_snapshot_marker(run_fd, expected_marker_sha256)
+            finally:
+                os.close(run_fd)
             self._remove_tree_at(snapshot_fd, run_dir.name, expected_identity)
 
     def _snapshot_run_from_backup(self, backup: Path) -> Path:
@@ -431,9 +466,19 @@ class IntegrationManager:
         self._validate_snapshot_run_name(backup.parent.name)
         return backup.parent
 
-    def _remove_recorded_snapshot_run(self, backup: Path, expected_identity: tuple[int, int]) -> None:
+    def _remove_recorded_snapshot_run(self, backup: Path, expected_identity: tuple[int, int],
+                                      expected_marker_sha256: str) -> bool:
         run_dir = self._snapshot_run_from_backup(backup)
-        self._remove_snapshot_run(run_dir, expected_identity)
+        try:
+            self._remove_snapshot_run(run_dir, expected_identity, expected_marker_sha256)
+        except FileNotFoundError:
+            with self._open_private_directory(run_dir.parent) as snapshot_fd:
+                try:
+                    os.stat(run_dir.name, dir_fd=snapshot_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return False
+            raise
+        return True
 
     def _snapshot_other_assets(self, snapshot_dir: Path) -> dict[str, Any]:
         skill_target = self.paths.workspace / "skills" / SKILL_ID
@@ -486,6 +531,7 @@ class IntegrationManager:
         digest = hashlib.sha256()
         run_fd: int | None = None
         run_identity: tuple[int, int] | None = None
+        run_marker_sha256: str | None = None
         try:
             with self._open_private_directory(snapshot_root, create=True) as snapshot_fd:
                 os.fchmod(snapshot_fd, 0o700)
@@ -498,6 +544,16 @@ class IntegrationManager:
                 run_metadata = os.fstat(run_fd)
                 self._validate_restricted_directory(run_metadata)
                 run_identity = (run_metadata.st_dev, run_metadata.st_ino)
+                marker_value = uuid.uuid4().hex.encode("ascii")
+                marker_fd = os.open(
+                    SNAPSHOT_MARKER_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600, dir_fd=run_fd,
+                )
+                with os.fdopen(marker_fd, "wb", closefd=True) as marker_handle:
+                    marker_handle.write(marker_value)
+                    marker_handle.flush()
+                    os.fsync(marker_handle.fileno())
+                run_marker_sha256 = hashlib.sha256(marker_value).hexdigest()
                 descriptor: int | None = os.open(
                     temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                     0o600, dir_fd=run_fd,
@@ -524,9 +580,9 @@ class IntegrationManager:
                         os.close(descriptor)
             other_assets = self._snapshot_other_assets(run_dir)
         except Exception:
-            if run_identity is not None:
+            if run_identity is not None and run_marker_sha256 is not None:
                 try:
-                    self._remove_snapshot_run(run_dir, run_identity)
+                    self._remove_snapshot_run(run_dir, run_identity, run_marker_sha256)
                 except FileNotFoundError:
                     pass
             raise
@@ -536,6 +592,7 @@ class IntegrationManager:
         return {
             "configPath": str(config), "configBackupPath": str(backup), "preConfigSha256": digest.hexdigest(),
             "snapshotRunDev": run_identity[0], "snapshotRunIno": run_identity[1],
+            "snapshotRunMarkerSha256": run_marker_sha256,
             **other_assets,
         }
 
@@ -641,9 +698,13 @@ class IntegrationManager:
                     raise RuntimeError("Rolled-back transaction is missing its snapshot identity")
                 run_dev = prior.get("snapshotRunDev")
                 run_ino = prior.get("snapshotRunIno")
-                if type(run_dev) is not int or type(run_ino) is not int:
+                marker_sha256 = prior.get("snapshotRunMarkerSha256")
+                if type(run_dev) is not int or type(run_ino) is not int \
+                        or not isinstance(marker_sha256, str) or len(marker_sha256) != 64:
                     raise RuntimeError("Rolled-back transaction is missing its snapshot identity")
-                self._remove_recorded_snapshot_run(Path(backup_path), (run_dev, run_ino))
+                self._remove_recorded_snapshot_run(
+                    Path(backup_path), (run_dev, run_ino), marker_sha256,
+                )
         self.preflight()
         snapshot = self.snapshot()
         payload = {
@@ -828,7 +889,7 @@ class IntegrationManager:
         os.replace(temporary, target)
 
     def _restore_config_file(self, source: Path, target: Path, *, expected_sha256: str,
-                             expected_run_identity: tuple[int, int]) -> None:
+                             expected_run_identity: tuple[int, int], expected_marker_sha256: str) -> None:
         source = Path(os.path.abspath(source))
         target = Path(os.path.abspath(target))
         self._snapshot_run_from_backup(source)
@@ -843,6 +904,7 @@ class IntegrationManager:
                 source_parent = os.fstat(source_parent_fd)
                 if (source_parent.st_dev, source_parent.st_ino) != expected_run_identity:
                     raise RuntimeError("Rollback snapshot run identity changed")
+                self._verify_snapshot_marker(source_parent_fd, expected_marker_sha256)
                 source_fd = os.open(
                     source.name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_NOFOLLOW,
                     dir_fd=source_parent_fd,
@@ -898,6 +960,40 @@ class IntegrationManager:
             if target_fd is not None:
                 os.close(target_fd)
 
+    def _verify_config_snapshot(self, source: Path, *, expected_sha256: str,
+                                expected_run_identity: tuple[int, int],
+                                expected_marker_sha256: str) -> None:
+        source = Path(os.path.abspath(source))
+        self._snapshot_run_from_backup(source)
+        source_fd: int | None = None
+        try:
+            with self._open_private_directory(source.parent) as source_parent_fd:
+                self._validate_restricted_directory(os.fstat(source_parent_fd))
+                source_parent = os.fstat(source_parent_fd)
+                if (source_parent.st_dev, source_parent.st_ino) != expected_run_identity:
+                    raise RuntimeError("Rollback snapshot run identity changed")
+                self._verify_snapshot_marker(source_parent_fd, expected_marker_sha256)
+                source_fd = os.open(
+                    source.name, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_NOFOLLOW,
+                    dir_fd=source_parent_fd,
+                )
+                self._validate_private_config(os.fstat(source_fd))
+                with os.fdopen(source_fd, "rb", closefd=True) as handle:
+                    source_fd = None
+                    before = os.fstat(handle.fileno())
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                    after = os.fstat(handle.fileno())
+                    self._assert_stable_file(before, after)
+                if digest.hexdigest() != expected_sha256:
+                    raise RuntimeError("Rollback config snapshot hash mismatch")
+        except OSError as error:
+            raise RuntimeError("Rollback config snapshot is missing or unsafe") from error
+        finally:
+            if source_fd is not None:
+                os.close(source_fd)
+
     def rollback(self, *, require_exact_post_config: bool = True) -> dict[str, Any]:
         with self._integration_lock():
             return self._rollback_locked(require_exact_post_config=require_exact_post_config)
@@ -905,6 +1001,21 @@ class IntegrationManager:
     def _rollback_locked(self, *, require_exact_post_config: bool = True) -> dict[str, Any]:
         transaction = self.store.read()
         config = Path(transaction["configPath"])
+        run_dev = transaction.get("snapshotRunDev")
+        run_ino = transaction.get("snapshotRunIno")
+        pre_config_sha256 = transaction.get("preConfigSha256")
+        marker_sha256 = transaction.get("snapshotRunMarkerSha256")
+        if type(run_dev) is not int or type(run_ino) is not int \
+                or not isinstance(pre_config_sha256, str) or len(pre_config_sha256) != 64 \
+                or not isinstance(marker_sha256, str) or len(marker_sha256) != 64:
+            raise RuntimeError("Rollback snapshot integrity metadata is missing")
+        snapshot_path = Path(transaction["configBackupPath"])
+        self._verify_config_snapshot(
+            snapshot_path,
+            expected_sha256=pre_config_sha256,
+            expected_run_identity=(run_dev, run_ino),
+            expected_marker_sha256=marker_sha256,
+        )
         if require_exact_post_config and transaction.get("postConfigSha256") and \
                 self._sha256_config(config) != transaction["postConfigSha256"]:
             raise RuntimeError("OpenClaw config drifted after integration; refusing automatic rollback")
@@ -945,16 +1056,11 @@ class IntegrationManager:
             if self.paths.project_root.is_symlink():
                 raise RuntimeError("Created Qwen project became a symbolic link; refusing rollback")
             shutil.rmtree(self.paths.project_root)
-        run_dev = transaction.get("snapshotRunDev")
-        run_ino = transaction.get("snapshotRunIno")
-        pre_config_sha256 = transaction.get("preConfigSha256")
-        if type(run_dev) is not int or type(run_ino) is not int \
-                or not isinstance(pre_config_sha256, str) or len(pre_config_sha256) != 64:
-            raise RuntimeError("Rollback snapshot integrity metadata is missing")
         self._restore_config_file(
-            Path(transaction["configBackupPath"]), config,
+            snapshot_path, config,
             expected_sha256=pre_config_sha256,
             expected_run_identity=(run_dev, run_ino),
+            expected_marker_sha256=marker_sha256,
         )
         self.cli.run(["config", "validate", "--json"])
         self.cli.run(["gateway", "restart", "--safe", "--json"], timeout=300, check=False)
