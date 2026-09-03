@@ -730,6 +730,134 @@ def test_cron_contract_is_idempotent_fixed_argv_and_output_bounded(tmp_path: Pat
     assert "--command" not in args
 
 
+def test_job_argv_supports_current_and_legacy_cron_schemas() -> None:
+    current = {"payload": {"argv": ["/safe/current.sh"]}}
+    legacy = {"payload": {"command": {"argv": ["/safe/legacy.sh"]}}}
+
+    assert integration_core._job_argv(current) == ["/safe/current.sh"]
+    assert integration_core._job_argv(legacy) == ["/safe/legacy.sh"]
+
+
+class VerificationCli:
+    def __init__(self, jobs: list[dict[str, object]]) -> None:
+        self.jobs = jobs
+
+    def json(self, args: list[str], *, timeout: int = 120) -> object:
+        if args[:2] == ["plugins", "inspect"]:
+            return {"id": PLUGIN_ID, "tools": [integration_core.TOOL_NAME]}
+        if args[:2] == ["skills", "info"]:
+            return {"id": integration_core.SKILL_ID, "eligible": True}
+        if args[:3] == ["cron", "list", "--all"]:
+            return {"jobs": self.jobs}
+        if args[:2] == ["gateway", "status"]:
+            return {"ok": True}
+        raise AssertionError(f"unexpected verification command: {args}")
+
+
+def verification_manager(
+    tmp_path: Path, jobs: list[dict[str, object]]
+) -> tuple[IntegrationManager, Path]:
+    item = paths(tmp_path)
+    incremental = item.project_root / "scripts/knowledge_index_incremental.sh"
+    incremental.parent.mkdir(parents=True, exist_ok=True)
+    incremental.write_text("#!/bin/sh\n", encoding="utf-8")
+    manager = IntegrationManager(
+        paths=item,
+        repo_root=Path(__file__).resolve().parents[1],
+        cli=VerificationCli(jobs),
+        node_path=Path(sys.executable),
+    )
+    manager.store.write(
+        {"schemaVersion": 1, "runId": "verify", "phase": "committed", "ownedAssets": []}
+    )
+    return manager, incremental
+
+
+@pytest.mark.parametrize("legacy_schema", [False, True])
+def test_verify_accepts_one_managed_job_in_each_cron_schema(
+    tmp_path: Path, legacy_schema: bool
+) -> None:
+    item = paths(tmp_path)
+    script = item.project_root / "scripts/knowledge_index_incremental.sh"
+    argv = [str(script)]
+    payload = {"command": {"argv": argv}} if legacy_schema else {"argv": argv}
+    jobs: list[dict[str, object]] = [
+        {
+            "id": "canonical",
+            "enabled": True,
+            "declarationKey": CRON_DECLARATION_KEY,
+            "payload": payload,
+        }
+    ]
+    manager, _ = verification_manager(tmp_path, jobs)
+
+    assert manager.verify()["incrementalCronUnique"] is True
+
+
+def test_verify_rejects_duplicate_enabled_managed_incremental_jobs(tmp_path: Path) -> None:
+    item = paths(tmp_path)
+    script = item.project_root / "scripts/knowledge_index_incremental.sh"
+    jobs: list[dict[str, object]] = [
+        {
+            "id": "canonical",
+            "enabled": True,
+            "declarationKey": CRON_DECLARATION_KEY,
+            "payload": {"argv": [str(script)]},
+        },
+        {
+            "id": "legacy-duplicate",
+            "enabled": True,
+            "payload": {"command": {"argv": ["sh", "-lc", str(script)]}},
+        },
+    ]
+    manager, _ = verification_manager(tmp_path, jobs)
+
+    with pytest.raises(RuntimeError, match="command is missing or duplicated"):
+        manager.verify()
+
+
+def test_verify_ignores_disabled_managed_incremental_duplicate(tmp_path: Path) -> None:
+    item = paths(tmp_path)
+    script = item.project_root / "scripts/knowledge_index_incremental.sh"
+    jobs: list[dict[str, object]] = [
+        {
+            "id": "canonical",
+            "enabled": True,
+            "declarationKey": CRON_DECLARATION_KEY,
+            "payload": {"argv": [str(script)]},
+        },
+        {
+            "id": "disabled-duplicate",
+            "enabled": False,
+            "payload": {"command": {"argv": ["sh", "-lc", str(script)]}},
+        },
+    ]
+    manager, _ = verification_manager(tmp_path, jobs)
+
+    assert manager.verify()["incrementalCronUnique"] is True
+
+
+def test_verify_does_not_parse_arbitrary_shell_command_text(tmp_path: Path) -> None:
+    item = paths(tmp_path)
+    script = item.project_root / "scripts/knowledge_index_incremental.sh"
+    jobs: list[dict[str, object]] = [
+        {
+            "id": "canonical",
+            "enabled": True,
+            "declarationKey": CRON_DECLARATION_KEY,
+            "payload": {"argv": [str(script)]},
+        },
+        {
+            "id": "different-command",
+            "enabled": True,
+            "payload": {"argv": ["sh", "-lc", f"{script} --unexpected"]},
+        },
+    ]
+    manager, _ = verification_manager(tmp_path, jobs)
+
+    assert manager.verify()["incrementalCronUnique"] is True
+
+
 def test_allowlists_merge_without_removing_existing_entries() -> None:
     assert merge_allowlist(["message", "status_update_ui"], PLUGIN_ID) == [
         "message", "status_update_ui", PLUGIN_ID,
@@ -767,11 +895,13 @@ def test_only_exact_owned_gemini_jobs_are_selected() -> None:
     jobs = [
         {"id": "owned", "declarationKey": "openclaw-lancedb-knowledge-gemini-incremental-v1",
          "payload": {"command": {"argv": ["/safe/knowledge-lancedb/scripts/knowledge_index_incremental.sh"]}}},
+        {"id": "owned-current", "declarationKey": "openclaw-lancedb-knowledge-gemini-incremental-v1",
+         "payload": {"argv": ["/safe/knowledge-lancedb/scripts/knowledge_index_incremental.sh"]}},
         {"id": "name-only", "name": "Gemini knowledge incremental"},
         {"id": "wrong-command", "declarationKey": "openclaw-lancedb-knowledge-gemini-incremental-v1",
          "payload": {"command": {"argv": ["/tmp/attacker.sh"]}}},
     ]
-    assert [job["id"] for job in owned_gemini_jobs(jobs)] == ["owned"]
+    assert [job["id"] for job in owned_gemini_jobs(jobs)] == ["owned", "owned-current"]
 
 
 def test_runtime_sync_preserves_config_data_and_reports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

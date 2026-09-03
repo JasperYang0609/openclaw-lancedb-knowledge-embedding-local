@@ -14,15 +14,25 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 
-REQUIRED_PATHS = (
+SUPPORTED_DATABASE_PATHS = (
     "data/lancedb",
+    "data/qwen-local-lancedb",
+)
+
+REQUIRED_PATHS = (
     "config/source-map.json",
     "src/metadata.js",
     "package.json",
 )
 
+QWEN_REQUIRED_PATHS = (
+    "data/index-state.json",
+    "data/openclaw-ready.json",
+)
+
 OPTIONAL_PATHS = (
     "data/index-state.json",
+    "data/openclaw-ready.json",
     "data/embedding-cache",
     "data/enrichment/validated.jsonl",
     "config/source-map.example.json",
@@ -73,10 +83,67 @@ def copy_asset(project: Path, staging: Path, relative: str) -> None:
         shutil.copy2(source, target)
 
 
+def _validate_real_relative_path(root: Path, relative: str, *, directory: bool) -> Path:
+    """Resolve a fixed relative path without allowing a symlink escape."""
+    candidate = root
+    for part in Path(relative).parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            raise SystemExit(f"Snapshot asset must not use symbolic links: {relative}")
+    resolved_root = root.resolve()
+    resolved = candidate.resolve()
+    if resolved_root not in resolved.parents:
+        raise SystemExit(f"Snapshot asset escapes the project root: {relative}")
+    if directory:
+        if not candidate.is_dir():
+            raise SystemExit(f"Snapshot database must be a real directory: {relative}")
+    elif not candidate.is_file():
+        raise SystemExit(f"Required snapshot asset must be a real file: {relative}")
+    return candidate
+
+
+def resolve_project_database_path(project: Path) -> str:
+    """Return the one supported real database directory present in a project."""
+    if project.is_symlink() or not project.is_dir():
+        raise SystemExit(f"Project must be a real directory: {project}")
+    present: list[str] = []
+    for relative in SUPPORTED_DATABASE_PATHS:
+        candidate = project / relative
+        if candidate.exists() or candidate.is_symlink():
+            _validate_real_relative_path(project, relative, directory=True)
+            present.append(relative)
+    if len(present) != 1:
+        found = ", ".join(present) if present else "none"
+        raise SystemExit(
+            "Exactly one supported knowledge database directory is required; "
+            f"found: {found}"
+        )
+    return present[0]
+
+
+def manifest_database_path(manifest: dict) -> str:
+    """Read the allowlisted database path, preserving legacy manifest support."""
+    relative = manifest.get("databasePath", "data/lancedb")
+    if not isinstance(relative, str) or relative not in SUPPORTED_DATABASE_PATHS:
+        raise SystemExit(f"Unsupported snapshot databasePath: {relative!r}")
+    return relative
+
+
+def validate_snapshot_database_path(snapshot: Path, manifest: dict) -> str:
+    declared = manifest_database_path(manifest)
+    detected = resolve_project_database_path(snapshot)
+    if detected != declared:
+        raise SystemExit(
+            f"Snapshot databasePath mismatch: manifest={declared!r}, detected={detected!r}"
+        )
+    return declared
+
+
 def write_manifest(
     snapshot: Path,
     project: Path,
     missing_optional: list[str],
+    database_path: str,
     required_after: list[str] | None = None,
 ) -> dict:
     rows = []
@@ -88,9 +155,10 @@ def write_manifest(
         rows.append({"path": relative, "bytes": size, "sha256": sha256(file_path)})
 
     manifest = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "createdAt": datetime.now(timezone.utc).isoformat(),
         "projectName": project.name,
+        "databasePath": database_path,
         "files": len(rows),
         "bytes": total_bytes,
         "missingOptional": missing_optional,
@@ -111,6 +179,9 @@ def verify_snapshot(snapshot: Path) -> dict:
     if not manifest_path.is_file():
         raise SystemExit(f"Snapshot manifest not found: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise SystemExit("Snapshot manifest must be a JSON object")
+    database_path = validate_snapshot_database_path(snapshot, manifest)
     errors = []
     seen = set()
     total_bytes = 0
@@ -138,6 +209,11 @@ def verify_snapshot(snapshot: Path) -> dict:
         errors.append("file count mismatch")
     if total_bytes != int(manifest.get("bytes", -1)):
         errors.append("byte count mismatch")
+    if database_path == "data/qwen-local-lancedb":
+        for relative in QWEN_REQUIRED_PATHS:
+            required = snapshot / relative
+            if required.is_symlink() or not required.is_file() or relative not in seen:
+                errors.append(f"missing required Qwen state: {relative}")
 
     result = {
         "ok": not errors,
@@ -146,6 +222,7 @@ def verify_snapshot(snapshot: Path) -> dict:
         "bytes": total_bytes,
         "errors": errors,
         "createdAt": manifest.get("createdAt"),
+        "databasePath": database_path,
         "manifestSha256": sha256(manifest_path),
     }
     if errors:
@@ -212,8 +289,15 @@ def verify_database(project: Path, snapshot: Path, table_name: str, expected_row
         "const table=await db.openTable(process.argv[2]);"
         "console.log(await table.countRows());"
     )
+    manifest_path = snapshot / MANIFEST_NAME
+    if not manifest_path.is_file():
+        raise SystemExit(f"Snapshot manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise SystemExit("Snapshot manifest must be a JSON object")
+    database_path = validate_snapshot_database_path(snapshot, manifest)
     proc = subprocess.run(
-        [node, "--input-type=module", "-e", script, str(snapshot / "data/lancedb"), table_name],
+        [node, "--input-type=module", "-e", script, str(snapshot / database_path), table_name],
         cwd=project,
         text=True,
         capture_output=True,
@@ -223,7 +307,14 @@ def verify_database(project: Path, snapshot: Path, table_name: str, expected_row
         raise SystemExit(f"Snapshot database open failed: {(proc.stderr or proc.stdout).strip()}")
     rows = int(proc.stdout.strip())
     passed = expected_rows is None or rows == expected_rows
-    result = {"databaseOpenPass": True, "tableName": table_name, "rows": rows, "expectedRows": expected_rows, "rowCountPass": passed}
+    result = {
+        "databaseOpenPass": True,
+        "databasePath": database_path,
+        "tableName": table_name,
+        "rows": rows,
+        "expectedRows": expected_rows,
+        "rowCountPass": passed,
+    }
     if not passed:
         raise SystemExit(json.dumps(result, ensure_ascii=False, indent=2))
     return result
@@ -232,7 +323,10 @@ def verify_database(project: Path, snapshot: Path, table_name: str, expected_row
 def create_snapshot(
     project: Path, backup_root: Path, snapshot_name: str, required_after: list[str] | None = None
 ) -> dict:
-    missing_required = [relative for relative in REQUIRED_PATHS if not (project / relative).exists()]
+    database_path = resolve_project_database_path(project)
+    provider_required = QWEN_REQUIRED_PATHS if database_path == "data/qwen-local-lancedb" else ()
+    required_paths = (*REQUIRED_PATHS, database_path, *provider_required)
+    missing_required = [relative for relative in required_paths if not (project / relative).exists()]
     if missing_required:
         raise SystemExit(f"Required knowledge assets are missing: {', '.join(missing_required)}")
     target = backup_root / "snapshots" / snapshot_name
@@ -243,15 +337,19 @@ def create_snapshot(
     with tempfile.TemporaryDirectory(prefix=f".{snapshot_name}-", dir=target.parent) as tmp_dir:
         staging = Path(tmp_dir) / snapshot_name
         staging.mkdir()
-        for relative in REQUIRED_PATHS:
+        for relative in required_paths:
             copy_asset(project, staging, relative)
         missing_optional = []
         for relative in OPTIONAL_PATHS:
+            if relative in required_paths:
+                continue
             if (project / relative).exists():
                 copy_asset(project, staging, relative)
             else:
                 missing_optional.append(relative)
-        manifest = write_manifest(staging, project, missing_optional, required_after)
+        manifest = write_manifest(
+            staging, project, missing_optional, database_path, required_after
+        )
         verify_snapshot(staging)
         os.replace(staging, target)
 

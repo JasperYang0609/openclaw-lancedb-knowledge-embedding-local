@@ -176,9 +176,34 @@ def build_cron_add_args(*, project_root: Path, incremental_script: Path,
 
 def _job_argv(job: dict[str, Any]) -> list[str]:
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+    current_argv = payload.get("argv")
+    if isinstance(current_argv, list) and all(isinstance(item, str) for item in current_argv):
+        return current_argv
     command = payload.get("command") if isinstance(payload.get("command"), dict) else {}
-    argv = command.get("argv")
-    return argv if isinstance(argv, list) and all(isinstance(item, str) for item in argv) else []
+    legacy_argv = command.get("argv")
+    return legacy_argv if isinstance(legacy_argv, list) and all(isinstance(item, str) for item in legacy_argv) else []
+
+
+def _argv_targets_exact_script(argv: list[str], expected_script: Path) -> bool:
+    expected = expected_script.resolve(strict=False)
+
+    def same_script(raw: str) -> bool:
+        candidate = Path(raw).expanduser()
+        return candidate.is_absolute() and candidate.resolve(strict=False) == expected
+
+    if len(argv) == 1:
+        return same_script(argv[0])
+    safe_shells = {"sh", "/bin/sh", "bash", "/bin/bash", "zsh", "/bin/zsh"}
+    return (
+        len(argv) == 3
+        and argv[0] in safe_shells
+        and argv[1] == "-lc"
+        and same_script(argv[2])
+    )
+
+
+def _job_targets_exact_script(job: dict[str, Any], expected_script: Path) -> bool:
+    return _argv_targets_exact_script(_job_argv(job), expected_script)
 
 
 def owned_gemini_jobs(jobs: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -824,7 +849,14 @@ class IntegrationManager:
         jobs = jobs_payload.get("jobs", jobs_payload) if isinstance(jobs_payload, dict) else jobs_payload
         if not isinstance(jobs, list):
             raise RuntimeError("Cron verification returned an unexpected schema")
-        matching = [job for job in jobs if job.get("declarationKey") == CRON_DECLARATION_KEY]
+        enabled_jobs = [job for job in jobs if job.get("enabled", True) is not False]
+        matching = [
+            job for job in enabled_jobs if job.get("declarationKey") == CRON_DECLARATION_KEY
+        ]
+        incremental_script = self.paths.project_root / "scripts/knowledge_index_incremental.sh"
+        command_matches = [
+            job for job in enabled_jobs if _job_targets_exact_script(job, incremental_script)
+        ]
         plugin_text = json.dumps(plugin, sort_keys=True)
         skill_text = json.dumps(skill, sort_keys=True)
         if TOOL_NAME not in plugin_text or PLUGIN_ID not in plugin_text:
@@ -833,6 +865,8 @@ class IntegrationManager:
             raise RuntimeError("Local knowledge skill is not eligible")
         if len(matching) != 1:
             raise RuntimeError("Incremental cron declaration is missing or duplicated")
+        if len(command_matches) != 1 or command_matches[0] is not matching[0]:
+            raise RuntimeError("Managed incremental cron command is missing or duplicated")
         gateway = self.cli.json(["gateway", "status", "--require-rpc", "--json"])
         return {
             "ok": True, "phase": manifest.get("phase"), "pluginLoaded": True, "skillEligible": True,

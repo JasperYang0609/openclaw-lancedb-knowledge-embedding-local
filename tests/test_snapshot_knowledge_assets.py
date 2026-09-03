@@ -44,6 +44,7 @@ def main() -> None:
         snapshot = backup / "snapshots" / "fixture"
         manifest = json.loads((snapshot / "snapshot-manifest.json").read_text(encoding="utf-8"))
         paths = {row["path"] for row in manifest["assets"]}
+        assert manifest["databasePath"] == "data/lancedb"
         assert "data/lancedb/table.lance" in paths
         assert "data/embedding-cache/cache.jsonl" in paths
         assert "src/metadata.js" in paths
