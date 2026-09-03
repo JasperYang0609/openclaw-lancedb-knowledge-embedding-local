@@ -22,6 +22,7 @@ from src.openclaw_integration.core import (
     TransactionStore,
     build_cron_add_args,
     merge_allowlist,
+    resolve_tool_allowlist_update,
     owned_gemini_jobs,
     IntegrationManager,
 )
@@ -735,6 +736,31 @@ def test_allowlists_merge_without_removing_existing_entries() -> None:
     ]
     assert merge_allowlist(None, PLUGIN_ID) is None
     assert merge_allowlist(None, PLUGIN_ID, create_if_missing=True) == [PLUGIN_ID]
+
+
+def test_tool_allowlist_update_prefers_exact_allowlist() -> None:
+    path_name, values = resolve_tool_allowlist_update(
+        ["message"], ["status_update_ui"], "local_knowledge_search"
+    )
+    assert path_name == "tools.allow"
+    assert values == ["message", "local_knowledge_search"]
+
+
+def test_tool_allowlist_update_uses_also_allow_when_exact_allowlist_is_absent() -> None:
+    path_name, values = resolve_tool_allowlist_update(
+        None, ["message", "status_update_ui"], "local_knowledge_search"
+    )
+    assert path_name == "tools.alsoAllow"
+    assert values == ["message", "status_update_ui", "local_knowledge_search"]
+
+
+def test_tool_allowlist_update_preserves_unrestricted_configuration() -> None:
+    assert resolve_tool_allowlist_update(None, None, "local_knowledge_search") == (None, None)
+
+
+def test_tool_allowlist_update_rejects_unexpected_schema() -> None:
+    with pytest.raises(RuntimeError, match="unexpected schema"):
+        resolve_tool_allowlist_update(None, "message", "local_knowledge_search")
 
 
 def test_only_exact_owned_gemini_jobs_are_selected() -> None:
