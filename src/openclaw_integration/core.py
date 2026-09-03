@@ -149,6 +149,16 @@ def merge_allowlist(existing: Any, value: str, *, create_if_missing: bool = Fals
     return list(dict.fromkeys([*existing, value]))
 
 
+def resolve_tool_allowlist_update(tools_allow: Any, tools_also_allow: Any,
+                                  value: str) -> tuple[str | None, list[str] | None]:
+    """Select the active explicit tool allowlist without broadening policy semantics."""
+    if tools_allow is not None:
+        return "tools.allow", merge_allowlist(tools_allow, value)
+    if tools_also_allow is not None:
+        return "tools.alsoAllow", merge_allowlist(tools_also_allow, value)
+    return None, None
+
+
 def build_cron_add_args(*, project_root: Path, incremental_script: Path,
                         schedule: str = "17 3 * * *", timezone: str = "Asia/Taipei") -> list[str]:
     project = Path(project_root).resolve(strict=False)
@@ -635,9 +645,12 @@ class IntegrationManager:
         plugin_allow = merge_allowlist(self.cli.config_get("plugins.allow"), PLUGIN_ID, create_if_missing=True)
         if plugin_allow is not None:
             self.cli.run(["config", "set", "plugins.allow", json.dumps(plugin_allow), "--strict-json", "--replace"])
-        tool_allow = merge_allowlist(self.cli.config_get("tools.allow"), TOOL_NAME)
-        if tool_allow is not None:
-            self.cli.run(["config", "set", "tools.allow", json.dumps(tool_allow), "--strict-json", "--replace"])
+        tool_allow_path, tool_allow = resolve_tool_allowlist_update(
+            self.cli.config_get("tools.allow"), self.cli.config_get("tools.alsoAllow"), TOOL_NAME
+        )
+        if tool_allow_path is not None and tool_allow is not None:
+            self.cli.run(["config", "set", tool_allow_path, json.dumps(tool_allow),
+                          "--strict-json", "--replace"])
         self.cli.run(["skills", "install", str(self.skill_source), "--as", SKILL_ID, "--force", "--agent", self.agent], timeout=300)
         self.cli.run(["config", "validate", "--json"])
 
