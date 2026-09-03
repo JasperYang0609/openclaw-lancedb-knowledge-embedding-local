@@ -2,7 +2,7 @@
 
 Date: 2026-09-03
 
-Status: `IN_PROGRESS`
+Status: `COMPLETE`
 
 ## Objective
 
@@ -37,3 +37,11 @@ Allow the already-installed read-only `local_knowledge_search` tool in the curre
 - A08: config hash, Plugin ownership, index readiness, and repository integrity checks.
 - A09: redacted operational evidence only; no prompt or corpus bodies in committed logs.
 - A10: restart and verification failures trigger rollback; no partial success claim.
+
+## Closeout
+
+- The existing explicit `tools.allow` policy was preserved and extended with only `local_knowledge_search`.
+- OpenClaw configuration validation, Gateway RPC, Plugin ownership, Skill eligibility, Qwen health, READY index state, and the unique incremental schedule passed after restart.
+- Production conversation acceptance passed: five source-dependent fresh sessions called `local_knowledge_search`, answered the expected fact, and cited sources; two general-knowledge controls answered correctly without calling local search.
+- One candidate source question was excluded because the agent answered it through ordinary file access instead of the local search tool. A replacement historical-recall question passed the strict tool-call criterion; the acceptance threshold was not relaxed.
+- Full repository regression, package parity, dependency audits, dangerous-exec isolation, and Plugin validation passed. See `docs/reports/2026-09-03-production-local-search-acceptance.md`.
