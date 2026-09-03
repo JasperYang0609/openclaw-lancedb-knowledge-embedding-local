@@ -121,6 +121,101 @@ def test_config_file_rejects_hardlink_and_outside_home(tmp_path: Path) -> None:
         manager._config_file()
 
 
+def test_config_file_rejects_malformed_json_and_cli_failure(tmp_path: Path) -> None:
+    manager, _, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout="notice before json\n{\"valid\":true}", stderr=""
+    )
+    with pytest.raises(RuntimeError, match="invalid JSON"):
+        manager._config_file()
+
+    def failed_runner(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.CalledProcessError(2, argv, output="", stderr="validation failed")
+
+    manager.cli.runner = failed_runner
+    with pytest.raises(subprocess.CalledProcessError):
+        manager._config_file()
+
+
+def test_config_file_rejects_unsafe_parent_and_special_file(tmp_path: Path) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    config.parent.chmod(0o777)
+    with pytest.raises(RuntimeError, match="parent permissions"):
+        manager._config_file()
+
+    config.parent.chmod(0o700)
+    config.unlink()
+    os.mkfifo(config, mode=0o600)
+    with pytest.raises(RuntimeError, match="ownership"):
+        manager._config_file()
+
+
+def test_config_metadata_rejects_wrong_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager, config, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    metadata = config.lstat()
+    monkeypatch.setattr(integration_core.os, "getuid", lambda: metadata.st_uid + 1)
+    with pytest.raises(RuntimeError, match="file ownership"):
+        manager._validate_private_config(metadata)
+    with pytest.raises(RuntimeError, match="parent ownership"):
+        manager._validate_private_directory(config.parent.lstat())
+
+
+def test_config_file_rejects_parent_symlink_and_open_race(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    item = IntegrationPaths(
+        home=home,
+        workspace=home / ".openclaw/workspace",
+        project_root=home / ".openclaw/workspace/knowledge-lancedb-qwen-local",
+        runtime_root=home / "Library/Application Support/OpenClaw/qwen-local",
+        state_root=home / "Library/Application Support/OpenClaw/qwen-local-integration",
+        launchd_plist=home / "Library/LaunchAgents/ai.openclaw.qwen-local-embedding.plist",
+    )
+    outside_dir = tmp_path / "outside-config"
+    outside_dir.mkdir(mode=0o700)
+    outside_config = outside_dir / "openclaw.json"
+    outside_config.write_text("{}")
+    outside_config.chmod(0o600)
+    linked_parent = item.home / ".openclaw"
+    linked_parent.symlink_to(outside_dir, target_is_directory=True)
+    manager, _, _ = manager_with_config_result(tmp_path / "separate", {"valid": True, "path": "placeholder"})
+    manager.paths = item
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(linked_parent / "openclaw.json")}), stderr=""
+    )
+    with pytest.raises(ValueError, match="symbolic"):
+        manager._config_file()
+
+    linked_parent.unlink()
+    linked_parent.mkdir(mode=0o700)
+    config = linked_parent / "openclaw.json"
+    config.write_text("{}")
+    config.chmod(0o600)
+    manager.cli.runner = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout=json.dumps({"valid": True, "path": str(config)}), stderr=""
+    )
+    real_open = os.open
+    replaced = False
+
+    def racing_open(path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        nonlocal replaced
+        if path == "openclaw.json" and dir_fd is not None and not replaced:
+            replaced = True
+            config.unlink()
+            config.symlink_to(outside_config)
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(integration_core.os, "open", racing_open)
+    with pytest.raises(RuntimeError, match="missing or unsafe"):
+        manager._config_file()
+
+
 def test_paths_reject_wrong_project_identity_and_symlink(tmp_path: Path) -> None:
     item = paths(tmp_path)
     item.validate()

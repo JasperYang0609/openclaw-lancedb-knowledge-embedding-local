@@ -9,9 +9,10 @@ import stat
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
 from .launchd import LAUNCHD_LABEL, build_launchd_plist
 
@@ -247,6 +248,74 @@ class IntegrationManager:
         self.cli.run(["config", "validate", "--json"])
         return {"openclawCompatible": True, "pluginSource": True, "skillSource": True}
 
+    @staticmethod
+    def _validate_private_directory(metadata: os.stat_result) -> None:
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            raise RuntimeError("OpenClaw config parent ownership is unsafe")
+        if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RuntimeError("OpenClaw config parent permissions are too broad")
+
+    @staticmethod
+    def _validate_private_config(metadata: os.stat_result) -> None:
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != os.getuid():
+            raise RuntimeError("OpenClaw config file ownership is unsafe")
+        if metadata.st_mode & 0o077:
+            raise RuntimeError("OpenClaw config file permissions are too broad")
+
+    @contextmanager
+    def _open_config_file(self, config_path: Path) -> Iterator[BinaryIO]:
+        absolute = Path(os.path.abspath(config_path))
+        home = Path(os.path.abspath(self.paths.home))
+        if absolute == home or home not in absolute.parents:
+            raise ValueError("OpenClaw config must be a specific child of its managed root")
+        relative = absolute.relative_to(home)
+        if not relative.parts:
+            raise ValueError("OpenClaw config must be a specific child of its managed root")
+
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+            raise RuntimeError("Secure OpenClaw config traversal is unsupported on this platform")
+        nofollow = os.O_NOFOLLOW
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | nofollow
+        file_flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | nofollow
+        directory_fds: list[int] = []
+        file_fd: int | None = None
+        try:
+            current_fd = os.open(home, directory_flags)
+            directory_fds.append(current_fd)
+            self._validate_private_directory(os.fstat(current_fd))
+            for component in relative.parts[:-1]:
+                current_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                directory_fds.append(current_fd)
+                self._validate_private_directory(os.fstat(current_fd))
+            file_fd = os.open(relative.parts[-1], file_flags, dir_fd=current_fd)
+            self._validate_private_config(os.fstat(file_fd))
+            with os.fdopen(file_fd, "rb", closefd=True) as handle:
+                file_fd = None
+                yield handle
+        except OSError as error:
+            raise RuntimeError("OpenClaw config path is missing or unsafe") from error
+        finally:
+            if file_fd is not None:
+                os.close(file_fd)
+            for descriptor in reversed(directory_fds):
+                os.close(descriptor)
+
+    @staticmethod
+    def _assert_stable_file(before: os.stat_result, after: os.stat_result) -> None:
+        identity = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(before, field) != getattr(after, field) for field in identity):
+            raise RuntimeError("OpenClaw config changed while it was being read")
+
+    def _sha256_config(self, config_path: Path) -> str:
+        digest = hashlib.sha256()
+        with self._open_config_file(config_path) as handle:
+            before = os.fstat(handle.fileno())
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            after = os.fstat(handle.fileno())
+            self._assert_stable_file(before, after)
+        return digest.hexdigest()
+
     def _config_file(self) -> Path:
         payload = self.cli.json(["config", "validate", "--json"])
         if not isinstance(payload, dict) or payload.get("valid") is not True \
@@ -257,14 +326,9 @@ class IntegrationManager:
             raise RuntimeError("OpenClaw config validation JSON returned a relative path")
         _assert_no_symlink_components(config_path)
         _assert_specific_child(config_path, self.paths.home, "OpenClaw config")
-        if config_path.is_symlink() or not config_path.is_file():
-            raise RuntimeError("OpenClaw config file is missing or unsafe")
-        metadata = config_path.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != os.getuid():
-            raise RuntimeError("OpenClaw config file ownership is unsafe")
-        if metadata.st_mode & 0o077:
-            raise RuntimeError("OpenClaw config file permissions are too broad")
-        return config_path.resolve(strict=True)
+        with self._open_config_file(config_path):
+            pass
+        return Path(os.path.abspath(config_path))
 
     def snapshot(self) -> dict[str, Any]:
         config = self._config_file()
@@ -275,10 +339,20 @@ class IntegrationManager:
         if backup.exists() or backup.is_symlink():
             raise RuntimeError("Preinstall config snapshot already exists; rollback or remove the completed transaction first")
         descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with config.open("rb") as source, os.fdopen(descriptor, "wb") as target:
-            shutil.copyfileobj(source, target)
-            target.flush()
-            os.fsync(target.fileno())
+        digest = hashlib.sha256()
+        try:
+            with self._open_config_file(config) as source, os.fdopen(descriptor, "wb") as target:
+                before = os.fstat(source.fileno())
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    target.write(chunk)
+                after = os.fstat(source.fileno())
+                self._assert_stable_file(before, after)
+                target.flush()
+                os.fsync(target.fileno())
+        except Exception:
+            backup.unlink(missing_ok=True)
+            raise
         skill_target = self.paths.workspace / "skills" / SKILL_ID
         skill_backup = snapshot_dir / "skill.preinstall"
         skill_existed = skill_target.exists()
@@ -314,7 +388,7 @@ class IntegrationManager:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source, target)
         return {
-            "configPath": str(config), "configBackupPath": str(backup), "preConfigSha256": sha256_file(config),
+            "configPath": str(config), "configBackupPath": str(backup), "preConfigSha256": digest.hexdigest(),
             "skillTargetPath": str(skill_target), "skillBackupPath": str(skill_backup),
             "skillExisted": skill_existed, "plistBackupPath": str(plist_backup), "plistExisted": plist_existed,
             "projectExisted": project_existed, "projectBackupPath": str(project_backup),
@@ -569,7 +643,7 @@ class IntegrationManager:
             transaction["indexState"], transaction["initialIndexJobId"] = self.mark_ready_or_schedule_build()
             self.cli.run(["config", "validate", "--json"])
             config = Path(transaction["configPath"])
-            transaction["postConfigSha256"] = sha256_file(config)
+            transaction["postConfigSha256"] = self._sha256_config(config)
             transaction["phase"] = "restarting_gateway"
             self.store.write(transaction)
             self.cli.run(["gateway", "restart", "--safe", "--json"], timeout=300)
@@ -605,7 +679,7 @@ class IntegrationManager:
         transaction = self.store.read()
         config = Path(transaction["configPath"])
         if require_exact_post_config and transaction.get("postConfigSha256") and \
-                sha256_file(config) != transaction["postConfigSha256"]:
+                self._sha256_config(config) != transaction["postConfigSha256"]:
             raise RuntimeError("OpenClaw config drifted after integration; refusing automatic rollback")
         if transaction.get("cronId"):
             self.cli.run(["cron", "rm", str(transaction["cronId"])], check=False)
