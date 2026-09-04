@@ -46,6 +46,7 @@ def main() -> None:
             "src/installer/safe_archive.py", "src/installer/qwen_installer.py",
             "src/lifecycle/llama_server_manager.py",
             "src/openclaw_integration/core.py", "src/openclaw_integration/launchd.py",
+            "src/openclaw_integration/asset_recovery.py",
             "assets/knowledge-lancedb-template/scripts/backup_health_component.py",
             "assets/knowledge-lancedb-template/scripts/index_lock.py",
             "assets/knowledge-lancedb-template/scripts/run_verified_snapshot.py",

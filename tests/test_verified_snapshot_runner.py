@@ -81,6 +81,8 @@ def ownership_fixture(tmp_path: Path, *, phase: str = "committed") -> tuple[Path
 
 
 def test_health_receipt_has_consumer_identity_freshness_and_string_data_loss(tmp_path: Path) -> None:
+    assert runner.OWNERSHIP_SCHEMA == "qwen-local-openclaw.v3"
+    assert health.OWNERSHIP_SCHEMA == runner.OWNERSHIP_SCHEMA
     payload = health.build_receipt(event="snapshot", status="error", anomaly_code="SNAPSHOT_FAILED")
 
     assert payload["producer"] == "qwen-local"

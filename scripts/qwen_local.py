@@ -26,6 +26,11 @@ from src.openclaw_integration.core import (
 from src.openclaw_integration.launchd import LAUNCHD_LABEL
 
 
+CURRENT_OWNERSHIP_SCHEMA = "qwen-local-openclaw.v3"
+LEGACY_OWNERSHIP_SCHEMAS = frozenset({"qwen-local-openclaw.v2"})
+SUPPORTED_OWNERSHIP_SCHEMAS = frozenset({CURRENT_OWNERSHIP_SCHEMA}) | LEGACY_OWNERSHIP_SCHEMAS
+
+
 def emit(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
@@ -126,7 +131,7 @@ def load_stored_transaction(state_root: Path) -> dict | None:
         except (OSError, json.JSONDecodeError) as error:
             raise RuntimeError("Stored integration ownership receipt is malformed") from error
         ownership = payload.get("ownership") if isinstance(payload, dict) else None
-        if isinstance(ownership, dict) and ownership.get("schema") == "qwen-local-openclaw.v2":
+        if isinstance(ownership, dict) and ownership.get("schema") in SUPPORTED_OWNERSHIP_SCHEMAS:
             return payload
     return None
 

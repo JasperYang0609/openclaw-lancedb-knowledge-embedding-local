@@ -43,7 +43,7 @@ jobs:
       - run: npm run postrun:check
       - name: Validate bootstrap script
         working-directory: .
-        run: python3 -m py_compile openclaw-lancedb-knowledge-local/scripts/bootstrap_openclaw_lancedb.py openclaw-lancedb-knowledge-local/assets/knowledge-lancedb-template/scripts/snapshot_knowledge_assets.py tests/test_bootstrap_security.py tests/test_snapshot_knowledge_assets.py tests/test_skill_archive.py scripts/check_dangerous_exec.py scripts/build_skill_archive.py scripts/qwen_local.py src/openclaw_integration/core.py src/openclaw_integration/launchd.py
+        run: python3 -m py_compile openclaw-lancedb-knowledge-local/scripts/bootstrap_openclaw_lancedb.py openclaw-lancedb-knowledge-local/assets/knowledge-lancedb-template/scripts/snapshot_knowledge_assets.py tests/test_bootstrap_security.py tests/test_snapshot_knowledge_assets.py tests/test_skill_archive.py tests/test_asset_receipt_contract_v3.py tests/test_asset_rollback_security.py tests/test_plugin_skill_parent_identity.py tests/test_project_runtime_forward_sync.py tests/test_rollback_v3_resume.py tests/test_v2_to_v3_upgrade.py scripts/check_dangerous_exec.py scripts/build_skill_archive.py scripts/qwen_local.py src/openclaw_integration/core.py src/openclaw_integration/launchd.py src/openclaw_integration/asset_recovery.py
       - name: Test bootstrap execution boundary
         working-directory: .
         run: python3 tests/test_bootstrap_security.py

@@ -22,6 +22,14 @@ from typing import Any, BinaryIO, Callable, Iterable, Iterator
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+from .asset_recovery import (
+    AssetIdentity,
+    inspect_asset_at,
+    publish_noreplace_at,
+    purge_exact_at,
+    quarantine_exact_at,
+    stage_copy_at,
+)
 from .launchd import LAUNCHD_LABEL, build_launchd_plist
 
 PLUGIN_ID = "openclaw-lancedb-knowledge-local"
@@ -34,8 +42,9 @@ INITIAL_CRON_DECLARATION_KEY = "openclaw-lancedb-knowledge-local-initial-v1"
 LEGACY_SNAPSHOT_DECLARATION_KEY = "lancedb-daily-desktop-backup-permanent"
 GEMINI_DECLARATION_KEY = "openclaw-lancedb-knowledge-gemini-incremental-v1"
 SCHEMA_VERSION = 1
-INTEGRATION_CONTRACT_VERSION = 2
-OWNERSHIP_SCHEMA = "qwen-local-openclaw.v2"
+INTEGRATION_CONTRACT_VERSION = 3
+OWNERSHIP_SCHEMA = "qwen-local-openclaw.v3"
+ASSET_ROLLBACK_RECEIPT_SCHEMA = "qwen-local.rollback-assets.v1"
 SNAPSHOT_CONTRACT = "qwen-local-verified-snapshot.v1"
 HEALTH_RECEIPT_SCHEMA = "backup-health-component.v1"
 HEALTH_RECEIPT_MAX_AGE_SECONDS = 36 * 60 * 60
@@ -82,6 +91,17 @@ SNAPSHOT_ROOT_STAGE_RE = re.compile(r"^\.qwen-snapshot-root\.install-[0-9a-f]{32
 QUARANTINE_RE = re.compile(r"^\.qwen-recovery-quarantine-[0-9a-f]{32}$")
 CAPABILITY_PROBE_STAGE_RE = re.compile(r"^\.qwen-capability-probe-[0-9a-f]{32}$")
 CAPABILITY_PROBE_FINAL_RE = re.compile(r"^\.qwen-capability-probe-published-[0-9a-f]{32}$")
+ASSET_RESTORE_STAGE_RE = re.compile(r"^\.qwen-asset-restore-[0-9a-f]{32}$")
+ASSET_INSTALL_STAGE_RE = re.compile(r"^\.qwen-asset-install-[0-9a-f]{32}$")
+ASSET_PARENT_STAGE_RE = re.compile(r"^\.qwen-asset-parent-install-[0-9a-f]{32}$")
+ROLLBACK_ASSET_IDS = (
+    "plugin",
+    "skill",
+    "project.src",
+    "project.scripts",
+    "project.package_json",
+    "project.package_lock",
+)
 
 
 def _rename_noreplace_at(source_fd: int, source: str, target_fd: int, target: str) -> None:
@@ -404,6 +424,23 @@ class ApprovedDisabledCronCollision:
             "contractSha256": self.contract_sha256,
             "role": self.role,
         }
+
+
+@dataclass(frozen=True)
+class RollbackAssetSpec:
+    asset_id: str
+    target: Path
+    backup_relative: Path
+    kind: str
+    mutation_field: str
+
+    def __post_init__(self) -> None:
+        if self.asset_id not in ROLLBACK_ASSET_IDS:
+            raise ValueError("Rollback asset identity is unsupported")
+        if self.kind not in {"directory", "file"}:
+            raise ValueError("Rollback asset kind is unsupported")
+        if self.backup_relative.is_absolute() or ".." in self.backup_relative.parts:
+            raise ValueError("Rollback asset backup identity is unsafe")
 
 
 def _job_argv(job: dict[str, Any]) -> list[str]:
@@ -1020,50 +1057,37 @@ class IntegrationManager:
         return target
 
     @staticmethod
-    def _safe_tree_sha256(root: Path, *, label: str) -> str:
-        if root.is_symlink() or not root.is_dir():
-            raise RuntimeError(f"{label} is missing or unsafe")
-        digest = hashlib.sha256()
-        root_meta = root.stat()
-        if root_meta.st_uid != os.getuid() or root_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            raise RuntimeError(f"{label} ownership or permissions are unsafe")
-        for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
-            relative = path.relative_to(root).as_posix()
-            metadata = path.lstat()
-            if path.is_symlink():
-                if metadata.st_uid != os.getuid():
-                    raise RuntimeError(f"{label} contains an unsafe symbolic link")
-                target = IntegrationManager._safe_plugin_symlink(root, path, label=label)
-                digest.update(b"L\0")
-                digest.update(relative.encode("utf-8"))
-                digest.update(b"\0")
-                digest.update(target.encode("utf-8"))
-                digest.update(b"\0")
-                continue
-            if metadata.st_uid != os.getuid() or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                raise RuntimeError(f"{label} contains an unsafe entry")
-            if stat.S_ISDIR(metadata.st_mode):
-                digest.update(b"D\0")
-                digest.update(relative.encode("utf-8"))
-                digest.update(b"\0")
-                digest.update(str(stat.S_IMODE(metadata.st_mode)).encode("ascii"))
-                digest.update(b"\0")
-                continue
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise RuntimeError(f"{label} contains a non-regular or multiply linked file")
-            digest.update(b"F\0")
-            digest.update(relative.encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(str(stat.S_IMODE(metadata.st_mode)).encode("ascii"))
-            digest.update(b"\0")
-            with path.open("rb") as handle:
-                before = os.fstat(handle.fileno())
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-                after = os.fstat(handle.fileno())
-            IntegrationManager._assert_stable_file(before, after)
-            digest.update(b"\0")
-        return digest.hexdigest()
+    def _asset_symlink_policy(relative: str, target: str) -> None:
+        if relative != "node_modules/openclaw":
+            raise RuntimeError("Rollback asset contains an unsupported symbolic link")
+        if not target or len(target) > 4096 or "\x00" in target:
+            raise RuntimeError("Rollback asset contains an unsafe symbolic link target")
+        target_path = Path(target)
+        if not target_path.is_absolute() or ".." in target_path.parts \
+                or target_path.parts[-3:] != ("lib", "node_modules", "openclaw"):
+            raise RuntimeError("Rollback asset contains an unsafe symbolic link target")
+        try:
+            target_meta = target_path.lstat()
+        except OSError as error:
+            raise RuntimeError("Rollback asset symbolic link destination is missing") from error
+        if target_path.is_symlink() or not stat.S_ISDIR(target_meta.st_mode) \
+                or target_meta.st_uid != os.getuid() \
+                or target_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RuntimeError("Rollback asset symbolic link destination is unsafe")
+
+    def _safe_tree_sha256(self, root: Path, *, label: str) -> str:
+        try:
+            with self._open_private_directory(root.parent) as parent_fd:
+                return inspect_asset_at(
+                    parent_fd,
+                    root.name,
+                    kind="directory",
+                    symlink_policy=self._asset_symlink_policy,
+                ).sha256
+        except RuntimeError:
+            raise
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"{label} is missing or unsafe") from error
 
     def _copy_safe_tree(self, source: Path, target: Path, *, label: str) -> str:
         expected = self._safe_tree_sha256(source, label=label)
@@ -1073,6 +1097,115 @@ class IntegrationManager:
         if self._safe_tree_sha256(target, label=f"{label} backup") != expected:
             raise RuntimeError(f"{label} backup verification failed")
         return expected
+
+    def _rollback_asset_specs(self) -> tuple[RollbackAssetSpec, ...]:
+        project_backup = Path("project-runtime.preinstall")
+        return (
+            RollbackAssetSpec(
+                "plugin", self.plugin_target, Path("plugin.preinstall"),
+                "directory", "pluginMutationStarted",
+            ),
+            RollbackAssetSpec(
+                "skill", self.paths.workspace / "skills" / SKILL_ID,
+                Path("skill.preinstall"), "directory", "skillMutationStarted",
+            ),
+            RollbackAssetSpec(
+                "project.src", self.paths.project_root / "src",
+                project_backup / "src", "directory", "projectRuntimeMutationStarted",
+            ),
+            RollbackAssetSpec(
+                "project.scripts", self.paths.project_root / "scripts",
+                project_backup / "scripts", "directory", "projectRuntimeMutationStarted",
+            ),
+            RollbackAssetSpec(
+                "project.package_json", self.paths.project_root / "package.json",
+                project_backup / "package.json", "file", "projectRuntimeMutationStarted",
+            ),
+            RollbackAssetSpec(
+                "project.package_lock", self.paths.project_root / "package-lock.json",
+                project_backup / "package-lock.json", "file", "projectRuntimeMutationStarted",
+            ),
+        )
+
+    def _safe_file_identity(self, path: Path, *, label: str) -> dict[str, Any]:
+        try:
+            with self._open_private_directory(path.parent) as parent_fd:
+                return inspect_asset_at(parent_fd, path.name, kind="file").as_dict()
+        except RuntimeError:
+            raise
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"{label} is missing or unsafe") from error
+
+    def _safe_directory_identity(self, path: Path, *, label: str) -> dict[str, Any]:
+        try:
+            with self._open_private_directory(path.parent) as parent_fd:
+                return inspect_asset_at(
+                    parent_fd,
+                    path.name,
+                    kind="directory",
+                    symlink_policy=self._asset_symlink_policy,
+                ).as_dict()
+        except RuntimeError:
+            raise
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"{label} is missing or unsafe") from error
+
+    def _safe_asset_identity(
+        self, path: Path, *, kind: str, label: str,
+    ) -> dict[str, Any]:
+        if kind == "directory":
+            return self._safe_directory_identity(path, label=label)
+        if kind == "file":
+            return self._safe_file_identity(path, label=label)
+        raise RuntimeError("Rollback asset kind is unsupported")
+
+    def _copy_safe_file(self, source: Path, target: Path, *, label: str) -> str:
+        source_identity = self._safe_file_identity(source, label=label)
+        if target.exists() or target.is_symlink():
+            raise RuntimeError(f"{label} backup target already exists")
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        source_fd: int | None = None
+        target_fd: int | None = None
+        try:
+            with self._open_private_directory(source.parent) as source_parent_fd, \
+                    self._open_private_directory(target.parent) as target_parent_fd:
+                source_fd = os.open(
+                    source.name,
+                    os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_NOFOLLOW,
+                    dir_fd=source_parent_fd,
+                )
+                target_fd = os.open(
+                    target.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    int(source_identity["mode"]),
+                    dir_fd=target_parent_fd,
+                )
+                with os.fdopen(source_fd, "rb", closefd=True) as input_handle, \
+                        os.fdopen(target_fd, "wb", closefd=True) as output_handle:
+                    source_fd = None
+                    target_fd = None
+                    before = os.fstat(input_handle.fileno())
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: input_handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        output_handle.write(chunk)
+                    after = os.fstat(input_handle.fileno())
+                    self._assert_stable_file(before, after)
+                    os.fchmod(output_handle.fileno(), int(source_identity["mode"]))
+                    output_handle.flush()
+                    os.fsync(output_handle.fileno())
+                os.fsync(target_parent_fd)
+        except OSError as error:
+            raise RuntimeError(f"{label} backup copy failed safely") from error
+        finally:
+            if source_fd is not None:
+                os.close(source_fd)
+            if target_fd is not None:
+                os.close(target_fd)
+        copied = self._safe_file_identity(target, label=f"{label} backup")
+        if copied["sha256"] != source_identity["sha256"]:
+            raise RuntimeError(f"{label} backup verification failed")
+        return str(source_identity["sha256"])
 
     def _snapshot_other_assets(self, snapshot_dir: Path) -> dict[str, Any]:
         plugin_target = self.plugin_target
@@ -1093,38 +1226,99 @@ class IntegrationManager:
         plist_existed = self.paths.launchd_plist.exists()
         project_existed = self.paths.project_root.exists()
         health_receipt_existed = health_receipt.exists()
-        plugin_sha256 = None
-        if plugin_target.is_symlink():
-            raise RuntimeError("Existing OpenClaw plugin is a symbolic link")
-        if plugin_existed:
-            plugin_sha256 = self._copy_safe_tree(
-                plugin_target, plugin_backup, label="Existing OpenClaw plugin",
-            )
-        if skill_target.is_symlink():
-            raise RuntimeError("Existing local knowledge skill is a symbolic link")
-        if skill_existed:
-            shutil.copytree(skill_target, skill_backup)
+        asset_receipts: dict[str, dict[str, Any]] = {}
+        if project_existed:
+            if self.paths.project_root.is_symlink() or not self.paths.project_root.is_dir():
+                raise RuntimeError("Existing Qwen project root is unsafe")
+            project_backup.mkdir(mode=0o700)
+        for spec in self._rollback_asset_specs():
+            target = spec.target
+            backup = snapshot_dir / spec.backup_relative
+            if target.is_symlink():
+                raise RuntimeError(f"Existing rollback asset {spec.asset_id} is a symbolic link")
+            existed = target.exists()
+            parent_existed = target.parent.exists()
+            parent_fields: dict[str, Any]
+            if parent_existed:
+                parent_meta = target.parent.lstat()
+                self._validate_private_directory(parent_meta)
+                parent_fields = {
+                    "canonicalParent": str(Path(os.path.abspath(target.parent))),
+                    "canonicalName": target.name,
+                    "parentDev": parent_meta.st_dev,
+                    "parentIno": parent_meta.st_ino,
+                }
+            elif not existed:
+                parent_fields = {
+                    "canonicalParent": str(Path(os.path.abspath(target.parent))),
+                    "canonicalName": target.name,
+                    "parentDev": None,
+                    "parentIno": None,
+                }
+            else:
+                raise RuntimeError(f"Rollback asset parent for {spec.asset_id} is missing")
+            receipt: dict[str, Any] = {
+                **parent_fields,
+                "parentPreExisted": parent_existed,
+                "parentCreatePlanned": not parent_existed,
+                "parentCreated": False,
+                "parentPublished": False,
+                "preExisted": existed,
+                "preKind": spec.kind if existed else None,
+                "preDev": None,
+                "preIno": None,
+                "preMode": None,
+                "preSha256": None,
+                "backupRelativeName": spec.backup_relative.as_posix(),
+                "backupKind": spec.kind if existed else None,
+                "backupDev": None,
+                "backupIno": None,
+                "backupMode": None,
+                "backupSha256": None,
+                "mutationField": spec.mutation_field,
+                "mutationStarted": False,
+            }
+            if existed:
+                before = self._safe_asset_identity(
+                    target, kind=spec.kind, label=f"Existing rollback asset {spec.asset_id}",
+                )
+                backup.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                if spec.kind == "directory":
+                    copied_sha256 = self._copy_safe_tree(
+                        target, backup, label=f"Existing rollback asset {spec.asset_id}",
+                    )
+                else:
+                    copied_sha256 = self._copy_safe_file(
+                        target, backup, label=f"Existing rollback asset {spec.asset_id}",
+                    )
+                after = self._safe_asset_identity(
+                    target, kind=spec.kind, label=f"Existing rollback asset {spec.asset_id}",
+                )
+                if before != after or copied_sha256 != before["sha256"]:
+                    raise RuntimeError(f"Rollback asset {spec.asset_id} changed during snapshot")
+                backup_identity = self._safe_asset_identity(
+                    backup, kind=spec.kind, label=f"Rollback backup {spec.asset_id}",
+                )
+                if backup_identity["sha256"] != before["sha256"]:
+                    raise RuntimeError(f"Rollback backup {spec.asset_id} failed verification")
+                receipt.update({
+                    "preKind": before["kind"],
+                    "preDev": before["dev"],
+                    "preIno": before["ino"],
+                    "preMode": before["mode"],
+                    "preSha256": before["sha256"],
+                    "backupKind": backup_identity["kind"],
+                    "backupDev": backup_identity["dev"],
+                    "backupIno": backup_identity["ino"],
+                    "backupMode": backup_identity["mode"],
+                    "backupSha256": backup_identity["sha256"],
+                })
+            asset_receipts[spec.asset_id] = receipt
         if self.paths.launchd_plist.is_symlink():
             raise RuntimeError("Existing launchd plist is a symbolic link")
         if plist_existed:
             shutil.copy2(self.paths.launchd_plist, plist_backup)
             os.chmod(plist_backup, 0o600)
-        if project_existed:
-            if self.paths.project_root.is_symlink() or not self.paths.project_root.is_dir():
-                raise RuntimeError("Existing Qwen project root is unsafe")
-            project_backup.mkdir(mode=0o700)
-            for relative in (Path("src"), Path("scripts"), Path("package.json"), Path("package-lock.json")):
-                source = self.paths.project_root / relative
-                if not source.exists():
-                    continue
-                if source.is_symlink():
-                    raise RuntimeError("Existing Qwen project runtime contains a symbolic link")
-                target = project_backup / relative
-                if source.is_dir():
-                    shutil.copytree(source, target)
-                else:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, target)
         if health_receipt.is_symlink():
             raise RuntimeError("Existing Qwen health receipt is a symbolic link")
         if health_receipt_existed:
@@ -1134,14 +1328,1134 @@ class IntegrationManager:
             os.chmod(health_receipt_backup, 0o600)
         return {
             "pluginTargetPath": str(plugin_target), "pluginBackupPath": str(plugin_backup),
-            "pluginExisted": plugin_existed, "pluginBackupSha256": plugin_sha256,
+            "pluginExisted": plugin_existed,
+            "pluginBackupSha256": asset_receipts["plugin"]["backupSha256"],
             "skillTargetPath": str(skill_target), "skillBackupPath": str(skill_backup),
-            "skillExisted": skill_existed, "plistBackupPath": str(plist_backup), "plistExisted": plist_existed,
+            "skillExisted": skill_existed,
+            "skillBackupSha256": asset_receipts["skill"]["backupSha256"],
+            "plistBackupPath": str(plist_backup), "plistExisted": plist_existed,
             "projectExisted": project_existed, "projectBackupPath": str(project_backup),
             "healthReceiptPath": str(health_receipt),
             "healthReceiptBackupPath": str(health_receipt_backup),
             "healthReceiptExisted": health_receipt_existed,
+            "assetRecoverySchema": ASSET_ROLLBACK_RECEIPT_SCHEMA,
+            "assetReceipts": asset_receipts,
         }
+
+    @staticmethod
+    def _receipt_identity(
+        receipt: dict[str, Any], prefix: str, *, required: bool = False,
+    ) -> AssetIdentity | None:
+        values = {
+            "kind": receipt.get(f"{prefix}Kind"),
+            "dev": receipt.get(f"{prefix}Dev"),
+            "ino": receipt.get(f"{prefix}Ino"),
+            "mode": receipt.get(f"{prefix}Mode"),
+            "sha256": receipt.get(f"{prefix}Sha256"),
+        }
+        if all(value is None for value in values.values()):
+            if required:
+                raise RuntimeError(f"Rollback asset {prefix} identity is missing")
+            return None
+        if values["kind"] not in {"directory", "file"} \
+                or type(values["dev"]) is not int or type(values["ino"]) is not int \
+                or type(values["mode"]) is not int or not 0 <= values["mode"] <= 0o7777 \
+                or not isinstance(values["sha256"], str) \
+                or re.fullmatch(r"[0-9a-f]{64}", values["sha256"]) is None:
+            raise RuntimeError(f"Rollback asset {prefix} identity is malformed")
+        return AssetIdentity(
+            kind=str(values["kind"]),
+            dev=int(values["dev"]),
+            ino=int(values["ino"]),
+            mode=int(values["mode"]),
+            sha256=str(values["sha256"]),
+        )
+
+    @staticmethod
+    def _identity_fields(prefix: str, identity: AssetIdentity) -> dict[str, Any]:
+        return {
+            f"{prefix}Kind": identity.kind,
+            f"{prefix}Dev": identity.dev,
+            f"{prefix}Ino": identity.ino,
+            f"{prefix}Mode": identity.mode,
+            f"{prefix}Sha256": identity.sha256,
+        }
+
+    def _asset_symlink_policy_for(
+        self, spec: RollbackAssetSpec,
+    ) -> Callable[[str, str], None] | None:
+        return self._asset_symlink_policy if spec.asset_id == "plugin" else None
+
+    def _inspect_optional_asset(
+        self, spec: RollbackAssetSpec, *, name: str | None = None,
+    ) -> AssetIdentity | None:
+        if not os.path.lexists(spec.target.parent):
+            return None
+        with self._open_private_directory(spec.target.parent) as parent_fd:
+            try:
+                return inspect_asset_at(
+                    parent_fd,
+                    name or spec.target.name,
+                    kind=spec.kind,
+                    symlink_policy=self._asset_symlink_policy_for(spec),
+                )
+            except FileNotFoundError:
+                return None
+
+    def _checkpoint_asset_receipt(
+        self, transaction: dict[str, Any], asset_id: str, updates: dict[str, Any],
+    ) -> None:
+        receipts = transaction.get("assetReceipts")
+        if not isinstance(receipts, dict) or not isinstance(receipts.get(asset_id), dict):
+            raise RuntimeError("Rollback asset receipt is missing")
+        receipt = receipts[asset_id]
+        validated: dict[str, Any] = {}
+        for key, value in updates.items():
+            current = receipt.get(key)
+            if current == value:
+                continue
+            if isinstance(value, bool):
+                if current not in {None, False} or value is not True:
+                    raise RuntimeError("Rollback asset state is not monotonic")
+            elif current is not None:
+                raise RuntimeError("Rollback asset identity attempted to change")
+            validated[key] = value
+        receipt.update(validated)
+        self.store.write(transaction)
+
+    @staticmethod
+    def _asset_parent_identity(
+        spec: RollbackAssetSpec, receipt: dict[str, Any], *, require_owned: bool,
+    ) -> tuple[int, int] | None:
+        parent_dev = receipt.get("parentDev")
+        parent_ino = receipt.get("parentIno")
+        if (parent_dev is None) != (parent_ino is None) or parent_dev is not None and (
+            type(parent_dev) is not int or type(parent_ino) is not int
+        ):
+            raise RuntimeError(f"Rollback asset parent receipt for {spec.asset_id} is malformed")
+        pre_existed = receipt.get("parentPreExisted", parent_dev is not None)
+        create_planned = receipt.get("parentCreatePlanned", False)
+        created = receipt.get("parentCreated", False)
+        published = receipt.get("parentPublished", False)
+        if any(type(value) is not bool for value in (
+            pre_existed, create_planned, created, published,
+        )):
+            raise RuntimeError(f"Rollback asset parent receipt for {spec.asset_id} is malformed")
+        if pre_existed:
+            if parent_dev is None or create_planned or created or published:
+                raise RuntimeError(f"Rollback asset parent receipt for {spec.asset_id} is malformed")
+            return parent_dev, parent_ino
+        if not create_planned or created is not published:
+            raise RuntimeError(f"Rollback asset parent receipt for {spec.asset_id} is malformed")
+        if created:
+            if parent_dev is None:
+                raise RuntimeError(f"Rollback asset parent receipt for {spec.asset_id} is malformed")
+            return parent_dev, parent_ino
+        if parent_dev is not None or require_owned:
+            raise RuntimeError(f"Rollback asset parent transition for {spec.asset_id} is not checkpointed")
+        return None
+
+    def _assert_asset_parent_identity(
+        self,
+        parent_fd: int,
+        spec: RollbackAssetSpec,
+        receipt: dict[str, Any],
+    ) -> None:
+        expected = self._asset_parent_identity(spec, receipt, require_owned=True)
+        assert expected is not None
+        opened = os.fstat(parent_fd)
+        if (opened.st_dev, opened.st_ino) != expected:
+            raise RuntimeError(f"Rollback asset parent for {spec.asset_id} changed")
+        try:
+            public = os.stat(spec.target.parent, follow_symlinks=False)
+        except OSError as error:
+            raise RuntimeError(f"Rollback asset parent for {spec.asset_id} changed") from error
+        if not stat.S_ISDIR(public.st_mode) or (public.st_dev, public.st_ino) != expected:
+            raise RuntimeError(f"Rollback asset parent for {spec.asset_id} changed")
+
+    @contextmanager
+    def _open_checked_asset_parent(
+        self, spec: RollbackAssetSpec, receipt: dict[str, Any],
+    ) -> Iterator[int]:
+        with self._open_private_directory(spec.target.parent) as parent_fd:
+            self._assert_asset_parent_identity(parent_fd, spec, receipt)
+            try:
+                yield parent_fd
+            except BaseException:
+                raise
+            else:
+                self._assert_asset_parent_identity(parent_fd, spec, receipt)
+
+    def _checkpoint_fresh_asset_parent(
+        self, transaction: dict[str, Any], spec: RollbackAssetSpec,
+        receipt: dict[str, Any], *, create_if_missing: bool = True,
+    ) -> None:
+        if self._asset_parent_identity(spec, receipt, require_owned=False) is not None:
+            return
+        if spec.asset_id.startswith("project."):
+            project_identity = (
+                transaction.get("projectRootDev"), transaction.get("projectRootIno"),
+            )
+            if transaction.get("projectCreated") is not True:
+                if not create_if_missing and not os.path.lexists(spec.target.parent):
+                    return
+                raise RuntimeError("Project runtime parent transition is not checkpointed")
+            if any(type(value) is not int for value in project_identity) \
+                    or spec.target.parent != self.paths.project_root:
+                raise RuntimeError("Project runtime parent transition is not checkpointed")
+            with self._open_private_directory(spec.target.parent) as parent_fd:
+                current = os.fstat(parent_fd)
+                if (current.st_dev, current.st_ino) != project_identity:
+                    raise RuntimeError(f"Rollback asset parent for {spec.asset_id} changed")
+            self._checkpoint_asset_receipt(transaction, spec.asset_id, {
+                "parentCreated": True,
+                "parentPublished": True,
+                "parentDev": project_identity[0],
+                "parentIno": project_identity[1],
+            })
+            return
+        if spec.asset_id not in {"plugin", "skill"}:
+            raise RuntimeError("Rollback asset parent transition is unsupported")
+
+        stage_name = receipt.get("parentStageName")
+        stage_dev = receipt.get("parentStageDev")
+        stage_ino = receipt.get("parentStageIno")
+        if stage_name is None and stage_dev is None and stage_ino is None:
+            if not create_if_missing:
+                if os.path.lexists(spec.target.parent):
+                    raise RuntimeError(
+                        f"Rollback asset parent for {spec.asset_id} appeared without ownership"
+                    )
+                return
+            stage_name = f".qwen-asset-parent-install-{uuid.uuid4().hex}"
+            with self._open_private_directory(spec.target.parent.parent) as ancestor_fd:
+                try:
+                    os.stat(spec.target.parent.name, dir_fd=ancestor_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise RuntimeError(
+                        f"Rollback asset parent for {spec.asset_id} appeared before creation"
+                    )
+                os.mkdir(stage_name, mode=0o700, dir_fd=ancestor_fd)
+                stage_fd = os.open(
+                    stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=ancestor_fd,
+                )
+                try:
+                    metadata = os.fstat(stage_fd)
+                    self._validate_restricted_directory(metadata)
+                    os.fsync(stage_fd)
+                    os.fsync(ancestor_fd)
+                finally:
+                    os.close(stage_fd)
+            stage_dev, stage_ino = metadata.st_dev, metadata.st_ino
+            self._checkpoint_asset_receipt(transaction, spec.asset_id, {
+                "parentStageName": stage_name,
+                "parentStageDev": stage_dev,
+                "parentStageIno": stage_ino,
+            })
+        elif not isinstance(stage_name, str) \
+                or ASSET_PARENT_STAGE_RE.fullmatch(stage_name) is None \
+                or type(stage_dev) is not int or type(stage_ino) is not int:
+            raise RuntimeError(f"Rollback asset parent transition for {spec.asset_id} is malformed")
+
+        expected = (stage_dev, stage_ino)
+        with self._open_private_directory(spec.target.parent.parent) as ancestor_fd:
+            def identity(name: str) -> tuple[int, int] | None:
+                try:
+                    metadata = os.stat(name, dir_fd=ancestor_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return None
+                self._validate_restricted_directory(metadata)
+                return metadata.st_dev, metadata.st_ino
+
+            stage_current = identity(stage_name)
+            final_current = identity(spec.target.parent.name)
+            if stage_current is not None and final_current is not None:
+                raise RuntimeError(f"Rollback asset parent transition for {spec.asset_id} is ambiguous")
+            if final_current is not None:
+                if final_current != expected:
+                    raise RuntimeError(f"Rollback asset parent for {spec.asset_id} changed")
+            else:
+                if stage_current != expected:
+                    raise RuntimeError(f"Rollback asset parent stage for {spec.asset_id} changed")
+                _rename_noreplace_at(
+                    ancestor_fd, stage_name, ancestor_fd, spec.target.parent.name,
+                )
+                os.fsync(ancestor_fd)
+                final_current = identity(spec.target.parent.name)
+                if final_current != expected:
+                    raise RuntimeError(f"Rollback asset parent for {spec.asset_id} changed")
+        self._checkpoint_asset_receipt(transaction, spec.asset_id, {
+            "parentCreated": True,
+            "parentPublished": True,
+            "parentDev": expected[0],
+            "parentIno": expected[1],
+        })
+
+    def _checkpoint_asset_mutation(
+        self, transaction: dict[str, Any] | None, asset_ids: Iterable[str],
+    ) -> None:
+        if transaction is None:
+            return
+        specs = {spec.asset_id: spec for spec in self._rollback_asset_specs()}
+        receipts = transaction.get("assetReceipts")
+        if transaction.get("assetRecoverySchema") != ASSET_ROLLBACK_RECEIPT_SCHEMA \
+                or not isinstance(receipts, dict):
+            raise RuntimeError("Rollback asset receipt set is missing")
+        changed = False
+        for asset_id in asset_ids:
+            spec = specs.get(asset_id)
+            receipt = receipts.get(asset_id)
+            if spec is None or not isinstance(receipt, dict):
+                raise RuntimeError("Rollback asset receipt is missing")
+            self._checkpoint_fresh_asset_parent(transaction, spec, receipt)
+            with self._open_private_directory(spec.target.parent) as parent_fd:
+                self._assert_asset_parent_identity(parent_fd, spec, receipt)
+            if receipt.get("mutationStarted") is not True:
+                if receipt.get("mutationStarted") is not False:
+                    raise RuntimeError("Rollback asset mutation receipt is malformed")
+                receipt["mutationStarted"] = True
+                changed = True
+            if transaction.get(spec.mutation_field) is not True:
+                if transaction.get(spec.mutation_field) not in {None, False}:
+                    raise RuntimeError("Rollback asset mutation state is malformed")
+                transaction[spec.mutation_field] = True
+                changed = True
+        if changed:
+            self.store.write(transaction)
+
+    def _capture_asset_post_identity(
+        self, transaction: dict[str, Any] | None, asset_id: str,
+    ) -> None:
+        if transaction is None:
+            return
+        specs = {spec.asset_id: spec for spec in self._rollback_asset_specs()}
+        spec = specs.get(asset_id)
+        if spec is None:
+            raise RuntimeError("Rollback asset identity is unsupported")
+        if not os.path.lexists(spec.target.parent):
+            raise RuntimeError("Installed rollback asset parent is missing")
+        receipts = transaction.get("assetReceipts")
+        if not isinstance(receipts, dict) or not isinstance(receipts.get(asset_id), dict):
+            raise RuntimeError("Rollback asset receipt is missing")
+        receipt = receipts[asset_id]
+        with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+            parent = os.fstat(parent_fd)
+            post = inspect_asset_at(
+                parent_fd,
+                spec.target.name,
+                kind=spec.kind,
+                symlink_policy=self._asset_symlink_policy_for(spec),
+            )
+        updates = {
+            "postParentDev": parent.st_dev,
+            "postParentIno": parent.st_ino,
+            **self._identity_fields("post", post),
+        }
+        self._checkpoint_asset_receipt(transaction, asset_id, updates)
+
+    @staticmethod
+    def _inspect_optional_asset_at(
+        parent_fd: int,
+        name: str,
+        *,
+        kind: str,
+        symlink_policy: Callable[[str, str], None] | None,
+    ) -> AssetIdentity | None:
+        try:
+            return inspect_asset_at(
+                parent_fd,
+                name,
+                kind=kind,
+                symlink_policy=symlink_policy,
+            )
+        except FileNotFoundError:
+            return None
+
+    def _project_runtime_source_identity(
+        self,
+        source: Path,
+        spec: RollbackAssetSpec,
+    ) -> AssetIdentity:
+        if source.is_symlink() or not source.exists():
+            raise RuntimeError("Qwen project runtime source is missing or unsafe")
+        try:
+            with self._open_private_directory(source.parent) as source_parent_fd:
+                return inspect_asset_at(
+                    source_parent_fd,
+                    source.name,
+                    kind=spec.kind,
+                    symlink_policy=None,
+                )
+        except RuntimeError:
+            raise
+        except (OSError, ValueError) as error:
+            raise RuntimeError("Qwen project runtime source is missing or unsafe") from error
+
+    def _synchronize_one_project_asset(
+        self,
+        transaction: dict[str, Any],
+        spec: RollbackAssetSpec,
+        source: Path,
+    ) -> None:
+        receipts = transaction.get("assetReceipts")
+        if transaction.get("assetRecoverySchema") != ASSET_ROLLBACK_RECEIPT_SCHEMA \
+                or not isinstance(receipts, dict) \
+                or not isinstance(receipts.get(spec.asset_id), dict):
+            raise RuntimeError("Project runtime synchronization receipt is missing")
+        receipt = receipts[spec.asset_id]
+        if receipt.get("mutationStarted") is not True:
+            raise RuntimeError("Project runtime synchronization was not checkpointed")
+        policy = self._asset_symlink_policy_for(spec)
+        if policy is not None:
+            raise RuntimeError("Project runtime synchronization policy is unsafe")
+
+        source_current = self._project_runtime_source_identity(source, spec)
+        source_expected = self._receipt_identity(receipt, "installSource", required=False)
+        if source_expected is None:
+            self._checkpoint_asset_receipt(
+                transaction,
+                spec.asset_id,
+                self._identity_fields("installSource", source_current),
+            )
+            source_expected = source_current
+        elif source_current != source_expected:
+            raise RuntimeError("Qwen project runtime source changed")
+
+        pre = self._receipt_identity(
+            receipt, "pre", required=receipt.get("preExisted") is True,
+        )
+        if receipt.get("preExisted") is False and pre is not None:
+            raise RuntimeError("Project runtime absence receipt is inconsistent")
+        if pre is not None and pre.kind != spec.kind:
+            raise RuntimeError("Project runtime preinstall identity is inconsistent")
+
+        stage_name = receipt.get("installStageName")
+        stage = self._receipt_identity(receipt, "installStage", required=False)
+        quarantine_name = receipt.get("installQuarantineName")
+        if stage_name is not None and (
+            not isinstance(stage_name, str)
+            or ASSET_INSTALL_STAGE_RE.fullmatch(stage_name) is None
+            or stage is None
+        ):
+            raise RuntimeError("Project runtime install stage receipt is malformed")
+        if stage is not None and (
+            not isinstance(stage_name, str) or stage.kind != spec.kind
+        ):
+            raise RuntimeError("Project runtime install stage receipt is malformed")
+        if quarantine_name is not None and (
+            not isinstance(quarantine_name, str)
+            or QUARANTINE_RE.fullmatch(quarantine_name) is None
+        ):
+            raise RuntimeError("Project runtime quarantine receipt is malformed")
+
+        with self._open_private_directory(spec.target.parent) as target_parent_fd:
+            self._assert_asset_parent_identity(target_parent_fd, spec, receipt)
+            if receipt.get("installComplete") is True:
+                if stage is None:
+                    raise RuntimeError("Completed project runtime receipt is missing its identity")
+                current = self._inspect_optional_asset_at(
+                    target_parent_fd,
+                    spec.target.name,
+                    kind=spec.kind,
+                    symlink_policy=policy,
+                )
+                post = self._receipt_identity(receipt, "post", required=True)
+                if current != post or post != stage or source_current.sha256 != stage.sha256:
+                    raise RuntimeError("Completed project runtime asset changed")
+                if isinstance(quarantine_name, str) and self._inspect_optional_asset_at(
+                    target_parent_fd,
+                    quarantine_name,
+                    kind=spec.kind,
+                    symlink_policy=policy,
+                ) is not None:
+                    raise RuntimeError("Completed project runtime quarantine still exists")
+                return
+
+            if stage is None:
+                stage_name = f".qwen-asset-install-{uuid.uuid4().hex}"
+                try:
+                    with self._open_private_directory(source.parent) as source_parent_fd:
+                        stage = stage_copy_at(
+                            source_parent_fd,
+                            source.name,
+                            target_parent_fd,
+                            stage_name,
+                            expected_backup=source_expected,
+                            symlink_policy=policy,
+                        )
+                except FileExistsError as error:
+                    raise RuntimeError(
+                        "Project runtime install stage collided with an existing path"
+                    ) from error
+                self._checkpoint_asset_receipt(
+                    transaction,
+                    spec.asset_id,
+                    {
+                        "installStageName": stage_name,
+                        **self._identity_fields("installStage", stage),
+                    },
+                )
+            else:
+                stage_current = self._inspect_optional_asset_at(
+                    target_parent_fd,
+                    str(stage_name),
+                    kind=spec.kind,
+                    symlink_policy=policy,
+                )
+                current = self._inspect_optional_asset_at(
+                    target_parent_fd,
+                    spec.target.name,
+                    kind=spec.kind,
+                    symlink_policy=policy,
+                )
+                if stage_current is None and current != stage:
+                    raise RuntimeError("Project runtime install stage is missing")
+                if stage_current is not None and stage_current != stage:
+                    raise RuntimeError("Project runtime install stage changed")
+
+            assert stage is not None and isinstance(stage_name, str)
+            if source_expected != self._project_runtime_source_identity(source, spec):
+                raise RuntimeError("Qwen project runtime source changed before publication")
+            self._assert_asset_parent_identity(target_parent_fd, spec, receipt)
+
+            current = self._inspect_optional_asset_at(
+                target_parent_fd,
+                spec.target.name,
+                kind=spec.kind,
+                symlink_policy=policy,
+            )
+            if receipt.get("preExisted") is True:
+                assert pre is not None
+                if quarantine_name is None:
+                    quarantine_name = f".qwen-recovery-quarantine-{uuid.uuid4().hex}"
+                    self._checkpoint_asset_receipt(
+                        transaction,
+                        spec.asset_id,
+                        {"installQuarantineName": quarantine_name},
+                    )
+                quarantine = self._inspect_optional_asset_at(
+                    target_parent_fd,
+                    quarantine_name,
+                    kind=spec.kind,
+                    symlink_policy=policy,
+                )
+                if quarantine is not None and quarantine != pre:
+                    raise RuntimeError("Project runtime quarantine changed")
+                if current is not None and current not in {pre, stage}:
+                    raise RuntimeError("Project runtime target changed before quarantine")
+                if current == pre:
+                    quarantine_exact_at(
+                        target_parent_fd,
+                        spec.target.name,
+                        quarantine_name,
+                        expected=pre,
+                        rename_noreplace=_rename_noreplace_at,
+                        symlink_policy=policy,
+                    )
+                elif current is None:
+                    if quarantine != pre:
+                        raise RuntimeError("Project runtime preinstall asset is missing")
+                self._checkpoint_asset_receipt(
+                    transaction,
+                    spec.asset_id,
+                    {"installQuarantined": True},
+                )
+            elif current is not None and current != stage:
+                raise RuntimeError("Project runtime target collision was preserved")
+
+            if source_expected != self._project_runtime_source_identity(source, spec):
+                raise RuntimeError("Qwen project runtime source changed before publication")
+            self._assert_asset_parent_identity(target_parent_fd, spec, receipt)
+            published = publish_noreplace_at(
+                target_parent_fd,
+                stage_name,
+                spec.target.name,
+                expected_stage=stage,
+                rename_noreplace=_rename_noreplace_at,
+                symlink_policy=policy,
+            )
+            if published != stage:
+                raise RuntimeError("Project runtime publication identity changed")
+            self._checkpoint_asset_receipt(
+                transaction,
+                spec.asset_id,
+                {"installPublished": True},
+            )
+            self._assert_asset_parent_identity(target_parent_fd, spec, receipt)
+            post = self._inspect_optional_asset_at(
+                target_parent_fd,
+                spec.target.name,
+                kind=spec.kind,
+                symlink_policy=policy,
+            )
+            if post != stage:
+                raise RuntimeError("Project runtime post-publication identity changed")
+            self._checkpoint_asset_receipt(
+                transaction,
+                spec.asset_id,
+                {
+                    "postParentDev": os.fstat(target_parent_fd).st_dev,
+                    "postParentIno": os.fstat(target_parent_fd).st_ino,
+                    **self._identity_fields("post", post),
+                },
+            )
+
+            if receipt.get("preExisted") is True:
+                assert pre is not None and isinstance(quarantine_name, str)
+                quarantine = self._inspect_optional_asset_at(
+                    target_parent_fd,
+                    quarantine_name,
+                    kind=spec.kind,
+                    symlink_policy=policy,
+                )
+                if quarantine is not None:
+                    if quarantine != pre:
+                        raise RuntimeError("Project runtime quarantine changed before purge")
+                    purge_exact_at(
+                        target_parent_fd,
+                        quarantine_name,
+                        expected=pre,
+                        symlink_policy=policy,
+                    )
+                self._checkpoint_asset_receipt(
+                    transaction,
+                    spec.asset_id,
+                    {"installQuarantinePurged": True},
+                )
+            self._checkpoint_asset_receipt(
+                transaction,
+                spec.asset_id,
+                {"installComplete": True},
+            )
+
+    def _validate_asset_receipt_structure(
+        self, transaction: dict[str, Any], spec: RollbackAssetSpec,
+        receipt: dict[str, Any], snapshot_dir: Path,
+    ) -> tuple[AssetIdentity | None, AssetIdentity | None, AssetIdentity | None]:
+        if receipt.get("canonicalParent") != str(Path(os.path.abspath(spec.target.parent))) \
+                or receipt.get("canonicalName") != spec.target.name \
+                or receipt.get("backupRelativeName") != spec.backup_relative.as_posix() \
+                or receipt.get("mutationField") != spec.mutation_field \
+                or type(receipt.get("preExisted")) is not bool \
+                or type(receipt.get("mutationStarted")) is not bool:
+            raise RuntimeError(f"Rollback asset receipt for {spec.asset_id} is malformed")
+        expected_parent = self._asset_parent_identity(
+            spec, receipt, require_owned=receipt["mutationStarted"],
+        )
+        stage_name = receipt.get("parentStageName")
+        stage_dev = receipt.get("parentStageDev")
+        stage_ino = receipt.get("parentStageIno")
+        if any(value is not None for value in (stage_name, stage_dev, stage_ino)) and (
+            not isinstance(stage_name, str)
+            or ASSET_PARENT_STAGE_RE.fullmatch(stage_name) is None
+            or type(stage_dev) is not int
+            or type(stage_ino) is not int
+        ):
+            raise RuntimeError(f"Rollback asset parent transition for {spec.asset_id} is malformed")
+        if receipt.get("parentPreExisted", receipt.get("parentDev") is not None) is True \
+                and any(value is not None for value in (stage_name, stage_dev, stage_ino)):
+            raise RuntimeError(f"Rollback asset parent transition for {spec.asset_id} is malformed")
+        if receipt.get("parentCreated", False) is True and spec.asset_id in {"plugin", "skill"} \
+                and (stage_dev, stage_ino) != expected_parent:
+            raise RuntimeError(f"Rollback asset parent transition for {spec.asset_id} is malformed")
+        post_parent_dev = receipt.get("postParentDev")
+        post_parent_ino = receipt.get("postParentIno")
+        if (post_parent_dev is None) != (post_parent_ino is None) \
+                or post_parent_dev is not None and (
+                    type(post_parent_dev) is not int or type(post_parent_ino) is not int
+                    or (post_parent_dev, post_parent_ino) != expected_parent
+                ):
+            raise RuntimeError(f"Rollback asset post parent for {spec.asset_id} is malformed")
+        if os.path.lexists(spec.target.parent):
+            with self._open_private_directory(spec.target.parent) as parent_fd:
+                self._assert_asset_parent_identity(parent_fd, spec, receipt)
+        elif os.path.lexists(spec.target):
+            raise RuntimeError(f"Rollback asset parent for {spec.asset_id} is unsafe")
+        elif expected_parent is not None:
+            raise RuntimeError(f"Rollback asset parent for {spec.asset_id} is missing")
+
+        pre_existed = receipt["preExisted"]
+        pre = self._receipt_identity(receipt, "pre", required=pre_existed)
+        backup = self._receipt_identity(receipt, "backup", required=pre_existed)
+        post = self._receipt_identity(receipt, "post", required=False)
+        if pre_existed:
+            assert pre is not None and backup is not None
+            if pre.kind != spec.kind or backup.kind != spec.kind \
+                    or pre.mode != backup.mode or pre.sha256 != backup.sha256:
+                raise RuntimeError(f"Rollback asset backup for {spec.asset_id} is inconsistent")
+            backup_path = snapshot_dir / spec.backup_relative
+            if Path(os.path.abspath(backup_path)) != Path(os.path.abspath(
+                snapshot_dir / Path(str(receipt["backupRelativeName"]))
+            )):
+                raise RuntimeError(f"Rollback asset backup for {spec.asset_id} escaped its snapshot")
+            try:
+                with self._open_private_directory(backup_path.parent) as backup_parent_fd:
+                    actual_backup = inspect_asset_at(
+                        backup_parent_fd,
+                        backup_path.name,
+                        kind=spec.kind,
+                        symlink_policy=self._asset_symlink_policy_for(spec),
+                    )
+            except (OSError, RuntimeError, ValueError) as error:
+                raise RuntimeError(f"Rollback asset backup for {spec.asset_id} is unsafe") from error
+            if actual_backup != backup:
+                raise RuntimeError(f"Rollback asset backup for {spec.asset_id} changed")
+        elif pre is not None or backup is not None:
+            raise RuntimeError(f"Rollback asset absence receipt for {spec.asset_id} is inconsistent")
+        if post is not None and post.kind != spec.kind:
+            raise RuntimeError(f"Rollback asset post identity for {spec.asset_id} is malformed")
+        install_source = self._receipt_identity(
+            receipt, "installSource", required=False,
+        )
+        install_stage = self._receipt_identity(
+            receipt, "installStage", required=False,
+        )
+        install_stage_name = receipt.get("installStageName")
+        install_quarantine_name = receipt.get("installQuarantineName")
+        if install_source is not None and install_source.kind != spec.kind:
+            raise RuntimeError(
+                f"Project runtime source receipt for {spec.asset_id} is malformed"
+            )
+        if install_stage_name is not None and (
+            not isinstance(install_stage_name, str)
+            or ASSET_INSTALL_STAGE_RE.fullmatch(install_stage_name) is None
+            or install_stage is None
+        ):
+            raise RuntimeError(
+                f"Project runtime install stage for {spec.asset_id} is malformed"
+            )
+        if install_stage is not None and (
+            not isinstance(install_stage_name, str) or install_stage.kind != spec.kind
+        ):
+            raise RuntimeError(
+                f"Project runtime install stage for {spec.asset_id} is malformed"
+            )
+        if install_quarantine_name is not None and (
+            not isinstance(install_quarantine_name, str)
+            or QUARANTINE_RE.fullmatch(install_quarantine_name) is None
+        ):
+            raise RuntimeError(
+                f"Project runtime quarantine for {spec.asset_id} is malformed"
+            )
+        for key in (
+            "installQuarantined",
+            "installPublished",
+            "installQuarantinePurged",
+            "installComplete",
+        ):
+            if key in receipt and type(receipt[key]) is not bool:
+                raise RuntimeError(
+                    f"Project runtime state for {spec.asset_id} is malformed"
+                )
+        return pre, backup, post
+
+    def _preflight_rollback_assets(
+        self, transaction: dict[str, Any], snapshot_dir: Path,
+    ) -> dict[str, tuple[RollbackAssetSpec, dict[str, Any]]]:
+        receipts = transaction.get("assetReceipts")
+        if transaction.get("assetRecoverySchema") != ASSET_ROLLBACK_RECEIPT_SCHEMA \
+                or not isinstance(receipts, dict):
+            if any(transaction.get(spec.mutation_field) is True for spec in self._rollback_asset_specs()):
+                raise RuntimeError("Current rollback asset receipts are missing")
+            return {}
+        prepared: dict[str, tuple[RollbackAssetSpec, dict[str, Any]]] = {}
+        for spec in self._rollback_asset_specs():
+            raw = receipts.get(spec.asset_id)
+            global_started = transaction.get(spec.mutation_field) is True
+            nested_started = isinstance(raw, dict) and raw.get("mutationStarted") is True
+            transition_started = isinstance(raw, dict) and (
+                raw.get("parentCreated") is True
+                or raw.get("parentStageName") is not None
+                or raw.get("parentStageDev") is not None
+                or raw.get("parentStageIno") is not None
+            )
+            if isinstance(raw, dict) and (global_started or nested_started or transition_started):
+                self._checkpoint_fresh_asset_parent(
+                    transaction, spec, raw, create_if_missing=False,
+                )
+            if not global_started and not nested_started:
+                continue
+            if not isinstance(raw, dict) or raw.get("mutationStarted") is not True:
+                raise RuntimeError(f"Rollback asset receipt for {spec.asset_id} is missing")
+            pre, backup, post = self._validate_asset_receipt_structure(
+                transaction, spec, raw, snapshot_dir,
+            )
+            current = self._inspect_optional_asset(spec)
+            stage = self._receipt_identity(raw, "restoreStage", required=False)
+            stage_name = raw.get("restoreStageName")
+            if stage_name is not None and (
+                not isinstance(stage_name, str)
+                or ASSET_RESTORE_STAGE_RE.fullmatch(stage_name) is None
+            ):
+                raise RuntimeError(f"Rollback restore stage for {spec.asset_id} is malformed")
+            if stage is not None and stage.kind != spec.kind:
+                raise RuntimeError(f"Rollback restore stage for {spec.asset_id} is malformed")
+            stage_current = self._inspect_optional_asset(spec, name=stage_name) \
+                if isinstance(stage_name, str) else None
+            if stage is not None and stage_current is not None and stage_current != stage:
+                raise RuntimeError(f"Rollback restore stage for {spec.asset_id} changed")
+            quarantine_name = raw.get("quarantineName")
+            if quarantine_name is not None and (
+                not isinstance(quarantine_name, str)
+                or QUARANTINE_RE.fullmatch(quarantine_name) is None
+            ):
+                raise RuntimeError(f"Rollback quarantine for {spec.asset_id} is malformed")
+            quarantine = self._inspect_optional_asset(spec, name=quarantine_name) \
+                if isinstance(quarantine_name, str) else None
+            if quarantine is not None and (post is None or quarantine != post):
+                raise RuntimeError(f"Rollback quarantine for {spec.asset_id} changed")
+            install_stage = self._receipt_identity(
+                raw, "installStage", required=False,
+            )
+            install_stage_name = raw.get("installStageName")
+            install_stage_current = self._inspect_optional_asset(
+                spec, name=install_stage_name,
+            ) if isinstance(install_stage_name, str) else None
+            if install_stage_current is not None and install_stage_current != install_stage:
+                raise RuntimeError(
+                    f"Project runtime install stage for {spec.asset_id} changed"
+                )
+            install_quarantine_name = raw.get("installQuarantineName")
+            install_quarantine = self._inspect_optional_asset(
+                spec, name=install_quarantine_name,
+            ) if isinstance(install_quarantine_name, str) else None
+            if install_quarantine is not None and (
+                pre is None or install_quarantine != pre
+            ):
+                raise RuntimeError(
+                    f"Project runtime quarantine for {spec.asset_id} changed"
+                )
+            accepted = [
+                candidate for candidate in (pre, post, stage, install_stage)
+                if candidate is not None
+            ]
+            if current is not None and current not in accepted:
+                raise RuntimeError(f"Rollback target for {spec.asset_id} changed")
+            if current is not None and post is None \
+                    and current != pre and current != stage and current != install_stage:
+                raise RuntimeError(f"Rollback post identity for {spec.asset_id} is missing")
+            if current is not None and not raw["preExisted"] \
+                    and post is None and current != install_stage:
+                raise RuntimeError(f"Rollback post identity for {spec.asset_id} is missing")
+            if stage_name is not None and stage is None and stage_current is not None:
+                if backup is None or stage_current.kind != backup.kind \
+                        or stage_current.mode != backup.mode \
+                        or stage_current.sha256 != backup.sha256:
+                    raise RuntimeError(f"Rollback restore stage for {spec.asset_id} is unverified")
+            prepared[spec.asset_id] = (spec, raw)
+        return prepared
+
+    def _rollback_one_asset(
+        self,
+        transaction: dict[str, Any],
+        spec: RollbackAssetSpec,
+        receipt: dict[str, Any],
+        snapshot_dir: Path,
+    ) -> None:
+        pre, backup, post = self._validate_asset_receipt_structure(
+            transaction, spec, receipt, snapshot_dir,
+        )
+        policy = self._asset_symlink_policy_for(spec)
+        current = self._inspect_optional_asset(spec)
+        quarantine_name = receipt.get("quarantineName")
+        quarantine = self._inspect_optional_asset(spec, name=quarantine_name) \
+            if isinstance(quarantine_name, str) else None
+        install_stage_name = receipt.get("installStageName")
+        install_stage = self._receipt_identity(
+            receipt, "installStage", required=False,
+        )
+        install_stage_current = self._inspect_optional_asset(
+            spec, name=install_stage_name,
+        ) if isinstance(install_stage_name, str) else None
+        install_quarantine_name = receipt.get("installQuarantineName")
+        install_quarantine = self._inspect_optional_asset(
+            spec, name=install_quarantine_name,
+        ) if isinstance(install_quarantine_name, str) else None
+        if install_stage_current is not None and install_stage_current != install_stage:
+            raise RuntimeError(
+                f"Project runtime install stage for {spec.asset_id} changed"
+            )
+        if install_quarantine is not None and (
+            pre is None or install_quarantine != pre
+        ):
+            raise RuntimeError(
+                f"Project runtime quarantine for {spec.asset_id} changed"
+            )
+        if current is not None and post is None and current == install_stage:
+            assert install_stage is not None
+            with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+                parent = os.fstat(parent_fd)
+            self._checkpoint_asset_receipt(
+                transaction,
+                spec.asset_id,
+                {
+                    "postParentDev": parent.st_dev,
+                    "postParentIno": parent.st_ino,
+                    **self._identity_fields("post", install_stage),
+                },
+            )
+            post = install_stage
+
+        if not receipt["preExisted"]:
+            if current is not None:
+                if post is None or current != post:
+                    raise RuntimeError(f"Rollback target for {spec.asset_id} changed")
+                if quarantine_name is None:
+                    quarantine_name = f".qwen-recovery-quarantine-{uuid.uuid4().hex}"
+                    self._checkpoint_asset_receipt(
+                        transaction, spec.asset_id, {"quarantineName": quarantine_name},
+                    )
+                with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+                    quarantine_exact_at(
+                        parent_fd,
+                        spec.target.name,
+                        quarantine_name,
+                        expected=post,
+                        rename_noreplace=_rename_noreplace_at,
+                        symlink_policy=policy,
+                    )
+                self._checkpoint_asset_receipt(
+                    transaction, spec.asset_id, {"quarantined": True},
+                )
+                quarantine = post
+            if quarantine is not None:
+                if post is None or quarantine != post or not isinstance(quarantine_name, str):
+                    raise RuntimeError(f"Rollback quarantine for {spec.asset_id} changed")
+                with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+                    purge_exact_at(
+                        parent_fd,
+                        quarantine_name,
+                        expected=post,
+                        symlink_policy=policy,
+                    )
+                self._checkpoint_asset_receipt(
+                    transaction, spec.asset_id, {"quarantinePurged": True},
+                )
+            with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+                if self._inspect_optional_asset_at(
+                    parent_fd,
+                    spec.target.name,
+                    kind=spec.kind,
+                    symlink_policy=policy,
+                ) is not None:
+                    raise RuntimeError(f"Rollback target for {spec.asset_id} was not removed")
+            install_stage_current = self._inspect_optional_asset(
+                spec, name=install_stage_name,
+            ) if isinstance(install_stage_name, str) else None
+            if install_stage_current is not None:
+                if install_stage is None or install_stage_current != install_stage:
+                    raise RuntimeError(
+                        f"Project runtime install stage for {spec.asset_id} changed"
+                    )
+                with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+                    purge_exact_at(
+                        parent_fd,
+                        install_stage_name,
+                        expected=install_stage,
+                        symlink_policy=policy,
+                    )
+                self._checkpoint_asset_receipt(
+                    transaction,
+                    spec.asset_id,
+                    {"rollbackInstallStagePurged": True},
+                )
+            self._checkpoint_asset_receipt(
+                transaction, spec.asset_id, {"rollbackComplete": True},
+            )
+            return
+
+        assert pre is not None and backup is not None
+        backup_path = snapshot_dir / spec.backup_relative
+        stage_name = receipt.get("restoreStageName")
+        if stage_name is None:
+            stage_name = f".qwen-asset-restore-{uuid.uuid4().hex}"
+            self._checkpoint_asset_receipt(
+                transaction, spec.asset_id, {"restoreStageName": stage_name},
+            )
+        if not isinstance(stage_name, str) \
+                or ASSET_RESTORE_STAGE_RE.fullmatch(stage_name) is None:
+            raise RuntimeError(f"Rollback restore stage for {spec.asset_id} is malformed")
+        stage = self._receipt_identity(receipt, "restoreStage", required=False)
+        stage_current = self._inspect_optional_asset(spec, name=stage_name)
+        if stage is None:
+            if stage_current is None:
+                with self._open_private_directory(backup_path.parent) as backup_parent_fd, \
+                        self._open_checked_asset_parent(spec, receipt) as target_parent_fd:
+                    stage_current = stage_copy_at(
+                        backup_parent_fd,
+                        backup_path.name,
+                        target_parent_fd,
+                        stage_name,
+                        expected_backup=backup,
+                        symlink_policy=policy,
+                    )
+            elif stage_current.kind != backup.kind or stage_current.mode != backup.mode \
+                    or stage_current.sha256 != backup.sha256:
+                raise RuntimeError(f"Rollback restore stage for {spec.asset_id} is unverified")
+            stage = stage_current
+            self._checkpoint_asset_receipt(
+                transaction,
+                spec.asset_id,
+                self._identity_fields("restoreStage", stage),
+            )
+        elif stage_current is not None and stage_current != stage:
+            raise RuntimeError(f"Rollback restore stage for {spec.asset_id} changed")
+
+        current = self._inspect_optional_asset(spec)
+        restored_already = current == pre or current == stage
+        if current is not None and not restored_already:
+            if post is None or current != post:
+                raise RuntimeError(f"Rollback target for {spec.asset_id} changed")
+            if quarantine_name is None:
+                quarantine_name = f".qwen-recovery-quarantine-{uuid.uuid4().hex}"
+                self._checkpoint_asset_receipt(
+                    transaction, spec.asset_id, {"quarantineName": quarantine_name},
+                )
+            with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+                quarantine_exact_at(
+                    parent_fd,
+                    spec.target.name,
+                    quarantine_name,
+                    expected=post,
+                    rename_noreplace=_rename_noreplace_at,
+                    symlink_policy=policy,
+                )
+            self._checkpoint_asset_receipt(
+                transaction, spec.asset_id, {"quarantined": True},
+            )
+            quarantine = post
+            current = None
+
+        if current is None:
+            install_quarantine = self._inspect_optional_asset(
+                spec, name=install_quarantine_name,
+            ) if isinstance(install_quarantine_name, str) else None
+            if install_quarantine is not None:
+                if install_quarantine != pre:
+                    raise RuntimeError(
+                        f"Project runtime quarantine for {spec.asset_id} changed"
+                    )
+                with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+                    restored = publish_noreplace_at(
+                        parent_fd,
+                        install_quarantine_name,
+                        spec.target.name,
+                        expected_stage=pre,
+                        rename_noreplace=_rename_noreplace_at,
+                        symlink_policy=policy,
+                    )
+                if restored != pre:
+                    raise RuntimeError(
+                        f"Project runtime quarantine restoration for {spec.asset_id} changed"
+                    )
+                self._checkpoint_asset_receipt(
+                    transaction,
+                    spec.asset_id,
+                    {"rollbackInstallQuarantineRestored": True},
+                )
+                current = restored
+            else:
+                with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+                    restored = publish_noreplace_at(
+                        parent_fd,
+                        stage_name,
+                        spec.target.name,
+                        expected_stage=stage,
+                        rename_noreplace=_rename_noreplace_at,
+                        symlink_policy=policy,
+                    )
+                if restored != stage:
+                    raise RuntimeError(f"Rollback restoration for {spec.asset_id} changed")
+                current = restored
+        if current != pre and current != stage:
+            raise RuntimeError(f"Rollback restoration for {spec.asset_id} is incomplete")
+        self._checkpoint_asset_receipt(
+            transaction, spec.asset_id, {"rollbackPublished": True},
+        )
+
+        if current == pre and stage_current is not None:
+            with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+                purge_exact_at(
+                    parent_fd,
+                    stage_name,
+                    expected=stage,
+                    symlink_policy=policy,
+                )
+            self._checkpoint_asset_receipt(
+                transaction, spec.asset_id, {"restoreStagePurged": True},
+            )
+
+        quarantine_name = receipt.get("quarantineName")
+        quarantine = self._inspect_optional_asset(spec, name=quarantine_name) \
+            if isinstance(quarantine_name, str) else None
+        if quarantine is not None:
+            if post is None or quarantine != post or not isinstance(quarantine_name, str):
+                raise RuntimeError(f"Rollback quarantine for {spec.asset_id} changed")
+            with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+                purge_exact_at(
+                    parent_fd,
+                    quarantine_name,
+                    expected=post,
+                    symlink_policy=policy,
+                )
+            self._checkpoint_asset_receipt(
+                transaction, spec.asset_id, {"quarantinePurged": True},
+            )
+        install_stage_current = self._inspect_optional_asset(
+            spec, name=install_stage_name,
+        ) if isinstance(install_stage_name, str) else None
+        if install_stage_current is not None:
+            if install_stage is None or install_stage_current != install_stage:
+                raise RuntimeError(
+                    f"Project runtime install stage for {spec.asset_id} changed"
+                )
+            with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+                purge_exact_at(
+                    parent_fd,
+                    install_stage_name,
+                    expected=install_stage,
+                    symlink_policy=policy,
+                )
+            self._checkpoint_asset_receipt(
+                transaction,
+                spec.asset_id,
+                {"rollbackInstallStagePurged": True},
+            )
+        install_quarantine = self._inspect_optional_asset(
+            spec, name=install_quarantine_name,
+        ) if isinstance(install_quarantine_name, str) else None
+        if install_quarantine is not None:
+            if install_quarantine != pre:
+                raise RuntimeError(
+                    f"Project runtime quarantine for {spec.asset_id} changed"
+                )
+            with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+                purge_exact_at(
+                    parent_fd,
+                    install_quarantine_name,
+                    expected=pre,
+                    symlink_policy=policy,
+                )
+            self._checkpoint_asset_receipt(
+                transaction,
+                spec.asset_id,
+                {"rollbackInstallQuarantinePurged": True},
+            )
+        with self._open_checked_asset_parent(spec, receipt) as parent_fd:
+            final = self._inspect_optional_asset_at(
+                parent_fd,
+                spec.target.name,
+                kind=spec.kind,
+                symlink_policy=policy,
+            )
+        if final != pre and final != stage:
+            raise RuntimeError(f"Rollback restoration for {spec.asset_id} did not verify")
+        self._checkpoint_asset_receipt(
+            transaction, spec.asset_id, {"rollbackComplete": True},
+        )
 
     def snapshot(self) -> dict[str, Any]:
         config = self._config_file()
@@ -1251,9 +2565,10 @@ class IntegrationManager:
     ) -> None:
         plugin_archive = self.package_plugin_archive()
         try:
-            self._checkpoint_mutation(transaction, "pluginMutationStarted")
+            self._checkpoint_asset_mutation(transaction, ["plugin"])
             self._checkpoint_mutation(transaction, "configMutationStarted")
             self.cli.run(["plugins", "install", "--force", str(plugin_archive)], timeout=600)
+            self._capture_asset_post_identity(transaction, "plugin")
         finally:
             staging = plugin_archive.parent
             if staging.exists() and not staging.is_symlink():
@@ -1274,8 +2589,9 @@ class IntegrationManager:
         if tool_allow_path is not None and tool_allow is not None:
             self.cli.run(["config", "set", tool_allow_path, json.dumps(tool_allow),
                           "--strict-json", "--replace"])
-        self._checkpoint_mutation(transaction, "skillMutationStarted")
+        self._checkpoint_asset_mutation(transaction, ["skill"])
         self.cli.run(["skills", "install", str(self.skill_source), "--as", SKILL_ID, "--force", "--agent", self.agent], timeout=300)
+        self._capture_asset_post_identity(transaction, "skill")
         self.cli.run(["config", "validate", "--json"])
 
     def package_plugin_archive(self) -> Path:
@@ -2613,24 +3929,30 @@ class IntegrationManager:
         ], shell=False, check=True, text=True, capture_output=True, timeout=1800)
         return True
 
-    def synchronize_project_runtime(self) -> None:
+    def synchronize_project_runtime(
+        self, transaction: dict[str, Any] | None = None,
+    ) -> None:
+        if transaction is None:
+            raise RuntimeError(
+                "Project runtime synchronization requires a durable transaction receipt"
+            )
         template = self.skill_source / "assets/knowledge-lancedb-template"
         if template.is_symlink() or not template.is_dir():
             raise RuntimeError("Bundled Qwen project template is missing or unsafe")
-        for relative in (Path("src"), Path("scripts"), Path("package.json"), Path("package-lock.json")):
+        project_assets = {
+            Path("src"): "project.src",
+            Path("scripts"): "project.scripts",
+            Path("package.json"): "project.package_json",
+            Path("package-lock.json"): "project.package_lock",
+        }
+        self._checkpoint_asset_mutation(transaction, project_assets.values())
+        specs = {spec.asset_id: spec for spec in self._rollback_asset_specs()}
+        for relative, asset_id in project_assets.items():
             source = template / relative
-            target = self.paths.project_root / relative
-            if source.is_symlink() or not source.exists() or target.is_symlink():
-                raise RuntimeError("Qwen project runtime synchronization boundary is unsafe")
-            if target.exists():
-                if target.is_dir():
-                    shutil.rmtree(target)
-                else:
-                    target.unlink()
-            if source.is_dir():
-                shutil.copytree(source, target)
-            else:
-                shutil.copy2(source, target)
+            spec = specs.get(asset_id)
+            if spec is None:
+                raise RuntimeError("Qwen project runtime asset contract is incomplete")
+            self._synchronize_one_project_asset(transaction, spec, source)
         npm = shutil.which("npm")
         if not npm:
             raise RuntimeError("npm executable is required to synchronize the Qwen project runtime")
@@ -3132,6 +4454,7 @@ class IntegrationManager:
             transaction["pluginMutationStarted"] = False
             transaction["configMutationStarted"] = False
             transaction["skillMutationStarted"] = False
+            transaction["projectRuntimeMutationStarted"] = False
             transaction["plistMutationStarted"] = False
             transaction["launchdMutationStarted"] = False
             transaction["disabledGeminiJobs"] = planned_gemini_disables
@@ -3224,7 +4547,7 @@ class IntegrationManager:
                             ):
                         raise RuntimeError("Fresh Qwen project identity changed during bootstrap")
                 if not actual_project_created:
-                    self.synchronize_project_runtime()
+                    self.synchronize_project_runtime(transaction)
                 self.store.write(transaction)
 
                 self.configure_openclaw(self._allowed_projects(), transaction=transaction)
@@ -3797,39 +5120,6 @@ class IntegrationManager:
                     directory=True,
                 )
 
-    def _restore_plugin_from_snapshot(
-        self, transaction: dict[str, Any], *, snapshot_path: Path,
-    ) -> None:
-        target_value = transaction.get("pluginTargetPath")
-        backup_value = transaction.get("pluginBackupPath")
-        if not isinstance(target_value, str) or Path(target_value) != self.plugin_target:
-            raise RuntimeError("Rollback plugin target identity is missing or unsafe")
-        expected_backup = snapshot_path.parent / "plugin.preinstall"
-        if not isinstance(backup_value, str) or Path(backup_value) != expected_backup:
-            raise RuntimeError("Rollback plugin backup identity is missing or unsafe")
-        plugin_existed = transaction.get("pluginExisted") is True
-        expected_sha256 = transaction.get("pluginBackupSha256")
-        if plugin_existed:
-            if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
-                raise RuntimeError("Rollback plugin backup checksum is missing")
-            if self._safe_tree_sha256(expected_backup, label="Rollback plugin backup") != expected_sha256:
-                raise RuntimeError("Rollback plugin backup checksum mismatch")
-        elif expected_sha256 is not None:
-            raise RuntimeError("Rollback plugin backup receipt is inconsistent")
-        if self.plugin_target.is_symlink() or (
-            self.plugin_target.exists() and not self.plugin_target.is_dir()
-        ):
-            raise RuntimeError("Installed plugin became unsafe before rollback")
-        self.cli.run(["plugins", "uninstall", PLUGIN_ID, "--force"], check=False)
-        if self.plugin_target.exists():
-            shutil.rmtree(self.plugin_target)
-        if plugin_existed:
-            restored_sha256 = self._copy_safe_tree(
-                expected_backup, self.plugin_target, label="Rollback OpenClaw plugin",
-            )
-            if restored_sha256 != expected_sha256:
-                raise RuntimeError("Rollback plugin restoration did not match its snapshot")
-
     def _rollback_locked(self, *, require_exact_post_config: bool = True) -> dict[str, Any]:
         transaction = self.store.read()
         self._snapshot_root_from_transaction(transaction)
@@ -3849,6 +5139,9 @@ class IntegrationManager:
             expected_sha256=pre_config_sha256,
             expected_run_identity=(run_dev, run_ino),
             expected_marker_sha256=marker_sha256,
+        )
+        prepared_assets = self._preflight_rollback_assets(
+            transaction, snapshot_path.parent,
         )
         if require_exact_post_config and transaction.get("postConfigSha256") and \
                 self._sha256_config(config) != transaction["postConfigSha256"]:
@@ -3872,7 +5165,8 @@ class IntegrationManager:
             precise_markers = any(
                 field in transaction for field in (
                     "pluginMutationStarted", "configMutationStarted", "skillMutationStarted",
-                    "plistMutationStarted", "launchdMutationStarted",
+                    "projectRuntimeMutationStarted", "plistMutationStarted",
+                    "launchdMutationStarted",
                 )
             )
             legacy_runtime_receipt = not precise_markers
@@ -3893,26 +5187,27 @@ class IntegrationManager:
                 else:
                     self.paths.launchd_plist.unlink(missing_ok=True)
             if plugin_mutation_started:
-                self._restore_plugin_from_snapshot(transaction, snapshot_path=snapshot_path)
+                spec, receipt = prepared_assets["plugin"]
+                self._rollback_one_asset(
+                    transaction, spec, receipt, snapshot_path.parent,
+                )
             if skill_mutation_started:
-                skill_target = Path(transaction["skillTargetPath"])
-                if skill_target.exists():
-                    if skill_target.is_symlink():
-                        raise RuntimeError("Installed skill became a symbolic link; refusing rollback deletion")
-                    shutil.rmtree(skill_target)
-                if transaction.get("skillExisted"):
-                    shutil.copytree(Path(transaction["skillBackupPath"]), skill_target)
-            project_backup = Path(transaction["projectBackupPath"])
+                spec, receipt = prepared_assets["skill"]
+                self._rollback_one_asset(
+                    transaction, spec, receipt, snapshot_path.parent,
+                )
+            project_asset_ids = (
+                "project.src", "project.scripts",
+                "project.package_json", "project.package_lock",
+            )
             if transaction.get("projectExisted"):
-                for relative in (Path("src"), Path("scripts"), Path("package.json"), Path("package-lock.json")):
-                    target = project_root / relative
-                    if target.is_symlink():
-                        raise RuntimeError("Qwen project runtime became a symbolic link; refusing rollback")
-                    if target.exists():
-                        shutil.rmtree(target) if target.is_dir() else target.unlink()
-                    source = project_backup / relative
-                    if source.exists():
-                        shutil.copytree(source, target) if source.is_dir() else shutil.copy2(source, target)
+                for asset_id in project_asset_ids:
+                    if asset_id not in prepared_assets:
+                        continue
+                    spec, receipt = prepared_assets[asset_id]
+                    self._rollback_one_asset(
+                        transaction, spec, receipt, snapshot_path.parent,
+                    )
             elif transaction.get("projectCreated"):
                 if not os.path.lexists(project_root):
                     pass

@@ -237,13 +237,16 @@ def write_receipt(path: Path, payload: dict[str, Any]) -> None:
             raise
 
 
+OWNERSHIP_SCHEMA = "qwen-local-openclaw.v3"
+
+
 def ownership_paths(manifest_path: Path) -> tuple[Path, Path]:
     if not manifest_path.is_absolute():
         raise RuntimeError("Qwen ownership manifest path is unsafe")
     manifest = load_json(manifest_path, private=True, private_parent=True)
     ownership = manifest.get("ownership")
     if manifest.get("schemaVersion") != 1 or manifest.get("phase") not in {"activation_pending", "committed"} \
-            or not isinstance(ownership, dict) or ownership.get("schema") != "qwen-local-openclaw.v2" \
+            or not isinstance(ownership, dict) or ownership.get("schema") != OWNERSHIP_SCHEMA \
             or ownership.get("provider") != COMPONENT or ownership.get("localOnly") is not True \
             or ownership.get("healthReceiptSchema") != SCHEMA \
             or ownership.get("incrementalDeclarationKey") != DECLARATION_KEYS["incremental"] \

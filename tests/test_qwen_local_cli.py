@@ -33,12 +33,13 @@ def write_stored_ownership(
     schema_version: object = 1,
     phase: object = "committed",
     snapshot_root: object | None = None,
+    ownership_schema: str = "qwen-local-openclaw.v3",
 ) -> None:
     state.mkdir(parents=True, mode=0o700)
     state.chmod(0o700)
     manifest = state / "transaction.json"
     ownership = {
-        "schema": "qwen-local-openclaw.v2",
+        "schema": ownership_schema,
         "reportChannel": "discord",
         "reportTo": "channel:stored",
         "reportAccountId": "default",

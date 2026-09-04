@@ -400,7 +400,7 @@ def test_integration_includes_exact_gemini_job_in_quiescence_targets(
     config.chmod(0o600)
     base = {
         "schemaVersion": 1,
-        "contractVersion": 2,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
         "runId": "gemini-target",
         "phase": "prepared",
         "ownedAssets": [],
@@ -1267,7 +1267,7 @@ def prepare_collision_integration_runtime(
     monkeypatch.setattr(item, "_prepare_snapshot_root", lambda _transaction: create_snapshot_root(item))
     monkeypatch.setattr(item, "_runtime_quiescence_guard", guard)
     monkeypatch.setattr(item, "bootstrap_project", lambda _: False)
-    monkeypatch.setattr(item, "synchronize_project_runtime", lambda: None)
+    monkeypatch.setattr(item, "synchronize_project_runtime", lambda *_: None)
     monkeypatch.setattr(item, "_allowed_projects", lambda: [])
     monkeypatch.setattr(item, "configure_openclaw", lambda _allowed, **_: None)
     monkeypatch.setattr(item, "install_launchd_plist", lambda _: None)
@@ -1471,7 +1471,8 @@ def test_activation_failure_invokes_rollback_before_commit(
     config.chmod(0o600)
     events: list[str] = []
     base = {
-        "schemaVersion": 1, "contractVersion": 2, "runId": "fault", "phase": "prepared",
+        "schemaVersion": 1, "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "runId": "fault", "phase": "prepared",
         "ownedAssets": [], "configPath": str(config), "healthReceiptExisted": False,
         "projectExisted": True,
     }
@@ -1485,7 +1486,7 @@ def test_activation_failure_invokes_rollback_before_commit(
     monkeypatch.setattr(item, "_prepare_snapshot_root", lambda _transaction: create_snapshot_root(item))
     monkeypatch.setattr(item, "_runtime_quiescence_guard", guard)
     monkeypatch.setattr(item, "bootstrap_project", lambda _: False)
-    monkeypatch.setattr(item, "synchronize_project_runtime", lambda: events.append("sync"))
+    monkeypatch.setattr(item, "synchronize_project_runtime", lambda *_: events.append("sync"))
     monkeypatch.setattr(item, "_allowed_projects", lambda: [])
     monkeypatch.setattr(item, "configure_openclaw", lambda _allowed, **_: events.append("configure"))
     monkeypatch.setattr(item, "install_launchd_plist", lambda _: events.append("plist"))
@@ -1517,7 +1518,7 @@ def test_failed_phase_write_failure_cannot_suppress_rollback(
     config.chmod(0o600)
     base = {
         "schemaVersion": 1,
-        "contractVersion": 2,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
         "runId": "failed-write",
         "phase": "prepared",
         "ownedAssets": [],
@@ -1561,7 +1562,7 @@ def test_incomplete_automatic_rollback_raises_typed_recovery_state_and_preserves
     rollback = OSError("rollback verification fault")
     base = {
         "schemaVersion": 1,
-        "contractVersion": 2,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
         "runId": "rollback-incomplete",
         "phase": "prepared",
         "ownedAssets": [],
@@ -1622,7 +1623,7 @@ def write_rollback_transaction(
     config.chmod(0o600)
     item.store.write({
         "schemaVersion": 1,
-        "contractVersion": 2,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
         "ownership": item._ownership_payload(),
         "runId": "rollback-fixture",
         "phase": "failed",
@@ -2960,10 +2961,25 @@ def test_plugin_snapshot_restores_exact_tree_after_forced_upgrade(
     assert os.readlink(backup_link) == str(openclaw_package)
     (item.plugin_target / "index.js").write_text("new", encoding="utf-8")
     (item.plugin_target / "added.js").write_text("new-file", encoding="utf-8")
-
-    item._restore_plugin_from_snapshot(
-        receipt, snapshot_path=snapshot_dir / "openclaw-config.preinstall",
+    asset = receipt["assetReceipts"]["plugin"]
+    asset["mutationStarted"] = True
+    receipt["pluginMutationStarted"] = True
+    post = item._safe_asset_identity(
+        item.plugin_target, kind="directory", label="installed plugin",
     )
+    asset.update({
+        "postParentDev": item.plugin_target.parent.stat().st_dev,
+        "postParentIno": item.plugin_target.parent.stat().st_ino,
+        "postKind": post["kind"],
+        "postDev": post["dev"],
+        "postIno": post["ino"],
+        "postMode": post["mode"],
+        "postSha256": post["sha256"],
+    })
+    item.store.write(receipt)
+    prepared = item._preflight_rollback_assets(receipt, snapshot_dir)
+    spec, asset = prepared["plugin"]
+    item._rollback_one_asset(receipt, spec, asset, snapshot_dir)
 
     assert (item.plugin_target / "index.js").read_text(encoding="utf-8") == "old"
     assert (item.plugin_target / "dist/runtime.js").read_text(encoding="utf-8") == "old-runtime"
@@ -2974,7 +2990,7 @@ def test_plugin_snapshot_restores_exact_tree_after_forced_upgrade(
     assert item._safe_tree_sha256(item.plugin_target, label="restored plugin") == receipt[
         "pluginBackupSha256"
     ]
-    assert ["plugins", "uninstall", core.PLUGIN_ID, "--force"] in cli.calls
+    assert not any(call[:2] == ["plugins", "uninstall"] for call in cli.calls)
 
 
 def test_plugin_snapshot_tamper_fails_before_uninstall(
@@ -2995,12 +3011,25 @@ def test_plugin_snapshot_tamper_fails_before_uninstall(
     snapshot_dir = item.paths.state_root / "snapshots/run-00000000-0000-0000-0000-000000000101"
     snapshot_dir.mkdir(parents=True)
     receipt = item._snapshot_other_assets(snapshot_dir)
+    asset = receipt["assetReceipts"]["plugin"]
+    asset["mutationStarted"] = True
+    receipt["pluginMutationStarted"] = True
+    post = item._safe_asset_identity(
+        item.plugin_target, kind="directory", label="installed plugin",
+    )
+    asset.update({
+        "postParentDev": item.plugin_target.parent.stat().st_dev,
+        "postParentIno": item.plugin_target.parent.stat().st_ino,
+        "postKind": post["kind"],
+        "postDev": post["dev"],
+        "postIno": post["ino"],
+        "postMode": post["mode"],
+        "postSha256": post["sha256"],
+    })
     (snapshot_dir / "plugin.preinstall/index.js").write_text("tampered", encoding="utf-8")
 
-    with pytest.raises(RuntimeError, match="checksum mismatch"):
-        item._restore_plugin_from_snapshot(
-            receipt, snapshot_path=snapshot_dir / "openclaw-config.preinstall",
-        )
+    with pytest.raises(RuntimeError, match="changed|unsafe"):
+        item._preflight_rollback_assets(receipt, snapshot_dir)
 
     assert installed.read_text(encoding="utf-8") == "existing"
     assert not any(call[:2] == ["plugins", "uninstall"] for call in cli.calls)
@@ -3122,7 +3151,8 @@ def test_successful_integration_commits_after_activation_verification_and_reinst
     config.write_text("{}", encoding="utf-8")
     config.chmod(0o600)
     base = {
-        "schemaVersion": 1, "contractVersion": 2, "runId": "success", "phase": "prepared",
+        "schemaVersion": 1, "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "runId": "success", "phase": "prepared",
         "ownedAssets": [], "configPath": str(config), "healthReceiptExisted": False,
         "projectExisted": True,
     }
@@ -3144,7 +3174,7 @@ def test_successful_integration_commits_after_activation_verification_and_reinst
 
     monkeypatch.setattr(item, "_runtime_quiescence_guard", guard)
     monkeypatch.setattr(item, "bootstrap_project", lambda _: False)
-    monkeypatch.setattr(item, "synchronize_project_runtime", lambda: events.append("sync"))
+    monkeypatch.setattr(item, "synchronize_project_runtime", lambda *_: events.append("sync"))
     monkeypatch.setattr(item, "_allowed_projects", lambda: [])
     monkeypatch.setattr(item, "configure_openclaw", lambda _allowed, **_: events.append("configure"))
     monkeypatch.setattr(item, "install_launchd_plist", lambda _: events.append("plist"))

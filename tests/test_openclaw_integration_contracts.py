@@ -931,8 +931,29 @@ def test_runtime_sync_preserves_config_data_and_reports(tmp_path: Path, monkeypa
     monkeypatch.setattr(integration_core.subprocess, "run", lambda argv, **kwargs: calls.append((argv, kwargs)))
     manager = IntegrationManager(paths=item, repo_root=Path(__file__).resolve().parents[1], cli=None,
                                  node_path=Path(sys.executable))
+    bundled_skill = item.home / "bundled-skill"
+    bundled_template = bundled_skill / "assets/knowledge-lancedb-template"
+    bundled_template.parent.mkdir(parents=True)
+    shutil.copytree(
+        manager.skill_source / "assets/knowledge-lancedb-template",
+        bundled_template,
+    )
+    manager.skill_source = bundled_skill
+    snapshot_dir = item.state_root / "snapshots/runtime-sync-preserves"
+    snapshot_dir.mkdir(parents=True, mode=0o700)
+    transaction = {
+        "schemaVersion": integration_core.SCHEMA_VERSION,
+        "contractVersion": integration_core.INTEGRATION_CONTRACT_VERSION,
+        "runId": "runtime-sync-preserves",
+        "phase": "staging",
+        "ownership": manager._ownership_payload(),
+        "ownedAssets": [],
+        "projectRuntimeMutationStarted": False,
+        **manager._snapshot_other_assets(snapshot_dir),
+    }
+    manager.store.write(transaction)
 
-    manager.synchronize_project_runtime()
+    manager.synchronize_project_runtime(transaction)
 
     assert (item.project_root / "config/source-map.json").read_text() == "{\"keep\":true}"
     assert (item.project_root / "data/existing.index").read_text() == "keep-index"

@@ -28,7 +28,7 @@ from snapshot_knowledge_assets import (
 )
 
 
-OWNERSHIP_SCHEMA = "qwen-local-openclaw.v2"
+OWNERSHIP_SCHEMA = "qwen-local-openclaw.v3"
 SNAPSHOT_CONTRACT = "qwen-local-verified-snapshot.v1"
 DEFAULT_LOCK_WAIT_SECONDS = 30 * 60
 DEFAULT_LOCK_POLL_SECONDS = 15

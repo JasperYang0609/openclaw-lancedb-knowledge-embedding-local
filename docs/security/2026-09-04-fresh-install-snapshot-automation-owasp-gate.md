@@ -1,7 +1,7 @@
 # Qwen local fresh-install snapshot automation security gate
 
 Date: 2026-09-04
-Status: `REVIEW_PENDING`
+Status: `PASS`
 Scope: local CLI, OpenClaw cron reconciliation, installer-owned runtime files,
 immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
 
@@ -29,7 +29,7 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
   provider/channel/account routing; recurring jobs require exact description,
   isolated session, fixed schedule/argv/cwd/limits, delivery `none`, first-failure
   announce alert, and no tools. Qwen endpoint remains loopback HTTP with no fallback.
-- A03 Software Supply Chain Failures — `PASS`. The deterministic 55-file Skill
+- A03 Software Supply Chain Failures — `PASS`. The deterministic 56-file Skill
   archive matches source, package lockfiles are retained, Plugin validation passes,
   existing same-ID Plugin upgrades use the explicit supported `--force` path and
   retain an exact verified pre-install tree for rollback. The bounded
@@ -68,6 +68,14 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
   existing safe ancestor, including fresh custom roots whose parent is not yet present.
   Root publication and lock recovery use staged identities, directory fsync, exact
   inode checks, and fail-closed quarantine receipts.
+  Existing-project forward sync uses verified same-parent staging, exact pre-state
+  quarantine, no-replace publication, durable post-state receipts, and fd-relative
+  rollback. A forced interruption can preserve a private random stage artifact, but
+  cannot replace a public target or prevent a safe retry.
+  Plugin and Skill parent directories are authenticated before mutation and again
+  before post-state capture; a missing parent is installed through an atomically
+  published, durably checkpointed identity. Rollback accepts no unreceipted parent
+  transition and fails closed on namespace replacement.
   Launchd activation and rollback apply bounded retry followed by service
   readback, and cron restoration begins only after runtime restoration.
 - A07 Authentication Failures — `NOT_APPLICABLE_WITH_EVIDENCE`. This change adds no
@@ -99,19 +107,21 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
   stored custom snapshot-root binding, missing custom-root parents, staged root
   publication interruption, stale transaction staging files, legacy receipt policy,
   native Darwin/Linux no-replace ABI and errno mapping, and Linux home-boundary
-  fixtures.
+  fixtures, v2-to-v3 upgrade success/idempotence/failure rollback, existing-project
+  forward-sync interruption, restrictive-umask restoration, Plugin/Skill parent
+  replacement, and bounded Plugin symlink handling on macOS and non-root Linux.
 
 ## Verification evidence
 
-- Python suite: `327 passed` on macOS and `327 passed` in a non-root Python 3.12
+- Python suite: `371 passed` on macOS and `371 passed` in a non-root Python 3.12
   Linux container.
-- Focused reconciliation and integration-contract suites: `167 passed`.
+- Final safety-focused release suite: `42 passed`.
 - Qwen template Node suite: `28 passed`.
 - OpenClaw Plugin Node suite: `5 passed`; syntax check and official Plugin validation
   passed.
 - Production dependency audit: `0 vulnerabilities` for both shipped packages in
   offline mode.
-- Skill archive: deterministic parity passed with 55 source files and packaged CLI
+- Skill archive: deterministic parity passed with 56 source files and packaged CLI
   smoke passed.
 - Installed Plugin safe-tree readback passed against the real package-link layout;
   this was read-only and performed no runtime or cron mutation.
@@ -131,7 +141,7 @@ The current implementation and cross-platform suites have no known P0/P1. One P2
 explicitly retained: a crash or rollback may leave an exact, randomly named private
 quarantine artifact instead of risking deletion after namespace replacement; the
 transaction reports it as a preserved artifact and never claims exact restoration.
-Final independent review of the frozen commit remains a mandatory release gate.
+Final independent review of the frozen release tree passed with `P0=0` and `P1=0`.
 
 `ASVS_LEVEL_TARGET`: `NOT_APPLICABLE_WITH_EVIDENCE`. There is no Web application or
 public product API in this change. Equivalent local CLI/filesystem/process controls

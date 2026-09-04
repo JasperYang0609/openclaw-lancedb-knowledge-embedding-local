@@ -43,7 +43,7 @@ def runtime_fixture(tmp_path: Path) -> tuple[Path, Path]:
     ):
         shutil.copy2(SCRIPTS / name, scripts / name)
     ownership = {
-        "schema": "qwen-local-openclaw.v2",
+        "schema": "qwen-local-openclaw.v3",
         "snapshotContract": "qwen-local-verified-snapshot.v1",
         "provider": "qwen-local",
         "localOnly": True,
