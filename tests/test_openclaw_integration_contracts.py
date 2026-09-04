@@ -647,10 +647,14 @@ def test_rollback_preflights_snapshot_before_any_side_effect(tmp_path: Path) -> 
     snapshot = manager.snapshot()
     manager.store.write({
         "schemaVersion": 1,
+        "contractVersion": integration_core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": manager._ownership_payload(),
         "runId": "fixture-run",
         "phase": "failed",
         "ownedAssets": [],
         "projectCreated": False,
+        "snapshotRootCreated": False,
+        "snapshotLockCreated": False,
         **snapshot,
     })
     backup = Path(snapshot["configBackupPath"])

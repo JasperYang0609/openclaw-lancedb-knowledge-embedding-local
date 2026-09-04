@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -13,6 +14,12 @@ from typing import Any, Iterator
 import pytest
 
 import src.openclaw_integration.core as core
+
+
+def read_pipe_with_timeout(descriptor: int, size: int = 5, timeout: float = 5.0) -> bytes:
+    readable, _, _ = select.select([descriptor], [], [], timeout)
+    assert readable, "child process did not reach the expected checkpoint before timeout"
+    return os.read(descriptor, size)
 
 
 def integration_paths(tmp_path: Path) -> core.IntegrationPaths:
@@ -197,6 +204,11 @@ def manager(tmp_path: Path, cli: Any | None = None, **kwargs: Any) -> core.Integ
         report_account_id=report_account_id,
         **kwargs,
     )
+
+
+def create_snapshot_root(item: core.IntegrationManager) -> bool:
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    return True
 
 
 def legacy_snapshot_job(
@@ -415,6 +427,98 @@ def test_integration_includes_exact_gemini_job_in_quiescence_targets(
     assert captured == {"gemini"}
 
 
+def test_integration_persists_creation_intent_without_claiming_uncreated_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = manager(tmp_path)
+    item.paths.project_root.rmdir()
+    config = item.paths.home / ".openclaw/openclaw.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("{}", encoding="utf-8")
+    config.chmod(0o600)
+    base = {
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "runId": "planned-not-created",
+        "phase": "prepared",
+        "ownedAssets": [],
+        "configPath": str(config),
+        "projectExisted": False,
+        "healthReceiptExisted": False,
+    }
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(item, "_preflight_cron_inventory", lambda: ([], []))
+    monkeypatch.setattr(item, "begin", lambda: dict(base))
+
+    def stop_before_creation(*_args: Any) -> list[str]:
+        captured.update(item.store.read())
+        raise RuntimeError("fixture stop before root creation")
+
+    monkeypatch.setattr(item, "_quiesce_prior_jobs", stop_before_creation)
+    monkeypatch.setattr(item, "_rollback_locked", lambda **_: {"ok": True})
+
+    with pytest.raises(RuntimeError, match="fixture stop"):
+        item._integrate_locked({"runtimePort": 18888})
+
+    assert captured["snapshotRootCreatePlanned"] is True
+    assert captured["snapshotRootCreated"] is False
+    assert captured["projectCreatePlanned"] is True
+    assert captured["projectCreated"] is False
+    assert not item.snapshot_root.exists()
+    assert not item.paths.project_root.exists()
+
+
+def test_atomic_capability_failure_happens_before_cron_or_runtime_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = manager(tmp_path)
+    config = item.paths.home / ".openclaw/openclaw.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("{}", encoding="utf-8")
+    config.chmod(0o600)
+    base = {
+        "schemaVersion": core.SCHEMA_VERSION,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "runId": "capability-failure",
+        "phase": "prepared",
+        "ownedAssets": [],
+        "configPath": str(config),
+        "projectExisted": True,
+        "healthReceiptExisted": False,
+    }
+    quiesce_called = False
+    rollback_called = False
+    monkeypatch.setattr(item, "_preflight_cron_inventory", lambda: ([], []))
+    monkeypatch.setattr(item, "begin", lambda: dict(base))
+
+    def fail_probe(*_args: Any, **_kwargs: Any) -> None:
+        receipt = item.store.read()
+        assert receipt["cronMutationStarted"] is False
+        assert receipt["runtimeMutationStarted"] is False
+        raise RuntimeError("fixture unsupported filesystem")
+
+    def quiesce(*_args: Any, **_kwargs: Any) -> list[str]:
+        nonlocal quiesce_called
+        quiesce_called = True
+        return []
+
+    def rollback(**_kwargs: Any) -> dict[str, Any]:
+        nonlocal rollback_called
+        rollback_called = True
+        return {"ok": True}
+
+    monkeypatch.setattr(item, "_probe_atomic_publication_capability", fail_probe)
+    monkeypatch.setattr(item, "_quiesce_prior_jobs", quiesce)
+    monkeypatch.setattr(item, "_rollback_locked", rollback)
+
+    with pytest.raises(RuntimeError, match="unsupported filesystem"):
+        item._integrate_locked({"runtimePort": 18888})
+
+    assert quiesce_called is False
+    assert rollback_called is True
+    assert item.store.read()["cronMutationStarted"] is False
+
+
 def test_runtime_quiescence_guard_refuses_held_index_lock_without_mutation(tmp_path: Path) -> None:
     item = manager(tmp_path)
     data = item.paths.project_root / "data"
@@ -423,7 +527,9 @@ def test_runtime_quiescence_guard_refuses_held_index_lock_without_mutation(tmp_p
     index_lock.mkdir(mode=0o700)
 
     with pytest.raises(RuntimeError, match="index run did not quiesce"):
-        with item._runtime_quiescence_guard(timeout_seconds=0, poll_seconds=0.01):
+        with item._runtime_quiescence_guard(
+            timeout_seconds=0, poll_seconds=0.01, checkpoint=lambda _receipt: None,
+        ):
             pytest.fail("guard must not yield while the index lock is held")
 
     assert index_lock.is_dir()
@@ -440,7 +546,9 @@ def test_runtime_quiescence_guard_refuses_held_snapshot_lock_and_releases_index_
     try:
         core.fcntl.flock(descriptor, core.fcntl.LOCK_EX | core.fcntl.LOCK_NB)
         with pytest.raises(RuntimeError, match="snapshot run did not quiesce"):
-            with item._runtime_quiescence_guard(timeout_seconds=0, poll_seconds=0.01):
+            with item._runtime_quiescence_guard(
+                timeout_seconds=0, poll_seconds=0.01, checkpoint=lambda _receipt: None,
+            ):
                 pytest.fail("guard must not yield while the snapshot lock is held")
     finally:
         core.fcntl.flock(descriptor, core.fcntl.LOCK_UN)
@@ -456,14 +564,327 @@ def test_runtime_quiescence_guard_receipts_created_index_lock_identity(tmp_path:
     data.mkdir(mode=0o700)
     item.snapshot_root.mkdir(parents=True, mode=0o700)
 
-    with item._runtime_quiescence_guard() as receipt:
+    with item._runtime_quiescence_guard(checkpoint=lambda _receipt: None) as receipt:
         index_lock = data / "index.lock"
         metadata = index_lock.stat()
         assert receipt["indexLockCreated"] is True
+        assert receipt["indexLockPublished"] is True
+        assert core.INDEX_LOCK_STAGE_RE.fullmatch(receipt["indexLockStageName"])
+        assert receipt["indexLockStageDev"] == metadata.st_dev
+        assert receipt["indexLockStageIno"] == metadata.st_ino
         assert receipt["indexLockDev"] == metadata.st_dev
         assert receipt["indexLockIno"] == metadata.st_ino
 
     assert not (data / "index.lock").exists()
+
+
+def test_atomic_noreplace_publication_preserves_existing_target(tmp_path: Path) -> None:
+    parent = tmp_path / "locks"
+    parent.mkdir(mode=0o700)
+    stage = parent / ".index.lock.install-00000000000000000000000000000000"
+    final = parent / "index.lock"
+    stage.mkdir(mode=0o700)
+    final.mkdir(mode=0o700)
+    stage_identity = stage.stat()
+    final_identity = final.stat()
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        with pytest.raises(FileExistsError):
+            core._rename_noreplace_at(parent_fd, stage.name, parent_fd, final.name)
+    finally:
+        os.close(parent_fd)
+
+    assert (stage.stat().st_dev, stage.stat().st_ino) == (
+        stage_identity.st_dev, stage_identity.st_ino,
+    )
+    assert (final.stat().st_dev, final.stat().st_ino) == (
+        final_identity.st_dev, final_identity.st_ino,
+    )
+
+
+@pytest.mark.parametrize(
+    ("platform", "symbol", "expected_flag"),
+    [("darwin", "renameatx_np", 0x00000004), ("linux", "renameat2", 0x00000001)],
+)
+def test_atomic_noreplace_uses_platform_abi_and_expected_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    symbol: str,
+    expected_flag: int,
+) -> None:
+    class Operation:
+        argtypes: list[Any] | None = None
+        restype: Any = None
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, ...]] = []
+
+        def __call__(self, *args: Any) -> int:
+            self.calls.append(args)
+            return 0
+
+    operation = Operation()
+    library = type("FakeLibc", (), {})()
+    setattr(library, symbol, operation)
+    monkeypatch.setattr(core.sys, "platform", platform)
+    monkeypatch.setattr(core.ctypes, "CDLL", lambda *_args, **_kwargs: library)
+
+    core._rename_noreplace_at(11, "stage", 12, "target")
+
+    assert operation.calls == [(11, b"stage", 12, b"target", expected_flag)]
+    assert operation.restype is core.ctypes.c_int
+    assert operation.argtypes == [
+        core.ctypes.c_int,
+        core.ctypes.c_char_p,
+        core.ctypes.c_int,
+        core.ctypes.c_char_p,
+        core.ctypes.c_uint,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("error_number", "exception", "message"),
+    [
+        (core.errno.EEXIST, FileExistsError, None),
+        (core.errno.ENOTEMPTY, FileExistsError, None),
+        (core.errno.ENOSYS, RuntimeError, "unavailable on this filesystem"),
+        (core.errno.EOPNOTSUPP, RuntimeError, "unavailable on this filesystem"),
+        (core.errno.EINVAL, RuntimeError, "unavailable on this filesystem"),
+        (core.errno.EIO, OSError, None),
+    ],
+)
+def test_atomic_noreplace_maps_native_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    error_number: int,
+    exception: type[BaseException],
+    message: str | None,
+) -> None:
+    class Operation:
+        argtypes: list[Any] | None = None
+        restype: Any = None
+
+        def __call__(self, *_args: Any) -> int:
+            return -1
+
+    library = type("FakeLibc", (), {"renameat2": Operation()})()
+    monkeypatch.setattr(core.sys, "platform", "linux")
+    monkeypatch.setattr(core.ctypes, "CDLL", lambda *_args, **_kwargs: library)
+    monkeypatch.setattr(core.ctypes, "get_errno", lambda: error_number)
+
+    context = pytest.raises(exception, match=message) if message else pytest.raises(exception)
+    with context:
+        core._rename_noreplace_at(11, "stage", 12, "target")
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux", "win32"])
+def test_atomic_noreplace_fails_closed_when_native_symbol_or_platform_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, platform: str,
+) -> None:
+    monkeypatch.setattr(core.sys, "platform", platform)
+    monkeypatch.setattr(core.ctypes, "CDLL", lambda *_args, **_kwargs: object())
+
+    with pytest.raises(RuntimeError, match="unavailable on this platform"):
+        core._rename_noreplace_at(11, "stage", 12, "target")
+
+
+def test_fresh_custom_snapshot_parent_uses_nearest_existing_safe_ancestor(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    custom_parent = item.paths.home / "OpenClawBackups/customer"
+    assert not custom_parent.exists()
+
+    selected = item._nearest_existing_capability_parent(custom_parent)
+
+    assert selected == item.paths.home
+    transaction: dict[str, Any] = {"phase": "preflight_complete"}
+    item.store.write(transaction)
+    item._probe_atomic_publication_capability(
+        transaction,
+        parent=selected,
+        receipt_prefix="snapshotParentCapabilityProbe",
+    )
+    assert transaction["snapshotParentCapabilityProbeParent"] == str(item.paths.home)
+    assert transaction["snapshotParentCapabilityProbePublished"] is True
+    assert transaction["snapshotParentCapabilityProbeQuarantined"] is True
+    assert transaction["snapshotParentCapabilityProbeQuarantinePurged"] is True
+    assert not (
+        item.paths.home / transaction["snapshotParentCapabilityProbeQuarantineName"]
+    ).exists()
+
+    custom_parent.mkdir(parents=True, mode=0o700)
+    recovered = item._capability_parent_from_transaction(
+        transaction,
+        receipt_prefix="snapshotParentCapabilityProbe",
+        target_parent=custom_parent,
+    )
+    assert recovered == item.paths.home
+
+
+def test_capability_parent_receipt_must_be_an_ancestor_of_the_owned_target(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    unrelated = item.paths.home / "unrelated"
+    unrelated.mkdir(mode=0o700)
+    transaction = {"probeParent": str(unrelated)}
+
+    with pytest.raises(RuntimeError, match="not an ancestor"):
+        item._capability_parent_from_transaction(
+            transaction,
+            receipt_prefix="probe",
+            target_parent=item.paths.workspace / "snapshots",
+        )
+
+
+def test_capability_recovery_purges_exact_interrupted_stage(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    stage_name = ".qwen-capability-probe-11111111111111111111111111111111"
+    final_name = ".qwen-capability-probe-published-22222222222222222222222222222222"
+    stage = item.paths.home / stage_name
+    stage.mkdir(mode=0o700)
+    metadata = stage.stat()
+    transaction = {
+        "schemaVersion": core.SCHEMA_VERSION,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "probeParent": str(item.paths.home),
+        "probeStageName": stage_name,
+        "probeStageDev": metadata.st_dev,
+        "probeStageIno": metadata.st_ino,
+        "probeFinalName": final_name,
+        "probePublished": False,
+    }
+    item.store.write(transaction)
+
+    item._recover_capability_probe(
+        transaction,
+        receipt_prefix="probe",
+        expected_parent=item.paths.home,
+    )
+
+    assert not stage.exists()
+    assert transaction["probeQuarantined"] is True
+    assert transaction["probeQuarantinePurged"] is True
+    assert transaction["probePreserved"] is False
+    assert not (item.paths.home / transaction["probeQuarantineName"]).exists()
+
+
+def test_capability_recovery_rejects_replacement_and_malformed_quarantine(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    stage_name = ".qwen-capability-probe-33333333333333333333333333333333"
+    final_name = ".qwen-capability-probe-published-44444444444444444444444444444444"
+    stage = item.paths.home / stage_name
+    stage.mkdir(mode=0o700)
+    metadata = stage.stat()
+    base = {
+        "schemaVersion": core.SCHEMA_VERSION,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "probeParent": str(item.paths.home),
+        "probeStageName": stage_name,
+        "probeStageDev": metadata.st_dev,
+        "probeStageIno": metadata.st_ino + 1,
+        "probeFinalName": final_name,
+        "probePublished": False,
+    }
+    item.store.write(base)
+
+    with pytest.raises(RuntimeError, match="artifact changed"):
+        item._recover_capability_probe(
+            base,
+            receipt_prefix="probe",
+            expected_parent=item.paths.home,
+        )
+    assert stage.is_dir()
+
+    malformed = dict(base)
+    malformed["probeStageDev"] = metadata.st_dev
+    malformed["probeStageIno"] = metadata.st_ino
+    malformed["probeQuarantineName"] = "../unsafe"
+    item.store.write(malformed)
+    with pytest.raises(RuntimeError, match="quarantine receipt is malformed"):
+        item._recover_capability_probe(
+            malformed,
+            receipt_prefix="probe",
+            expected_parent=item.paths.home,
+        )
+    assert stage.is_dir()
+
+
+def test_runtime_quiescence_guard_requires_durable_checkpoint_before_lock_creation(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+
+    with pytest.raises(RuntimeError, match="requires a durable transaction checkpoint"):
+        with item._runtime_quiescence_guard():
+            pytest.fail("guard must not yield without a durable checkpoint")
+
+    assert not (item.paths.project_root / "data/index.lock").exists()
+
+
+def test_runtime_quiescence_checkpoints_lock_identity_before_any_lock_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = manager(tmp_path)
+    (item.paths.project_root / "data").mkdir(mode=0o700)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    events: list[str] = []
+    real_fsync = core.os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        events.append("fsync")
+        real_fsync(descriptor)
+
+    def checkpoint(receipt: dict[str, Any]) -> None:
+        if "indexLockStageDev" in receipt:
+            events.append("checkpoint:index-stage")
+        if receipt.get("indexLockPublished") is True:
+            events.append("checkpoint:index-published")
+        if "snapshotLockStageDev" in receipt:
+            events.append("checkpoint:snapshot-stage")
+        if "snapshotLockDev" in receipt:
+            events.append("checkpoint:snapshot-final")
+
+    monkeypatch.setattr(core.os, "fsync", record_fsync)
+    with item._runtime_quiescence_guard(checkpoint=checkpoint) as receipt:
+        receipt["persisted"] = True
+
+    assert events.index("checkpoint:index-stage") < events.index("fsync")
+    assert events.index("fsync") < events.index("checkpoint:index-published")
+    assert events.index("checkpoint:index-published") < events.index("checkpoint:snapshot-stage")
+    assert events.index("checkpoint:snapshot-stage") < events.index("checkpoint:snapshot-final")
+    assert not (item.paths.project_root / "data/index.lock").exists()
+
+
+def test_prepare_project_root_checkpoints_exact_identity_before_bootstrap(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    item.paths.project_root.rmdir()
+    transaction = {
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "runId": "fresh-project",
+        "phase": "staging",
+        "ownedAssets": [],
+        "projectExisted": False,
+        "projectCreatePlanned": True,
+        "projectCreated": False,
+    }
+    item.store.write(transaction)
+
+    item._prepare_project_root(transaction)
+
+    metadata = item.paths.project_root.stat()
+    persisted = item.store.read()
+    assert transaction["projectCreated"] is True
+    assert persisted["projectCreated"] is True
+    assert (persisted["projectRootDev"], persisted["projectRootIno"]) == (
+        metadata.st_dev, metadata.st_ino,
+    )
+    assert not any(item.paths.project_root.iterdir())
 
 
 def test_managed_contract_requires_exact_alert_delivery_env_and_tools(tmp_path: Path) -> None:
@@ -843,7 +1264,7 @@ def prepare_collision_integration_runtime(
         yield {"snapshotLockCreated": False, "persisted": False}
 
     monkeypatch.setattr(item, "begin", lambda: dict(base))
-    monkeypatch.setattr(item, "_prepare_snapshot_root", lambda: True)
+    monkeypatch.setattr(item, "_prepare_snapshot_root", lambda _transaction: create_snapshot_root(item))
     monkeypatch.setattr(item, "_runtime_quiescence_guard", guard)
     monkeypatch.setattr(item, "bootstrap_project", lambda _: False)
     monkeypatch.setattr(item, "synchronize_project_runtime", lambda: None)
@@ -1061,7 +1482,7 @@ def test_activation_failure_invokes_rollback_before_commit(
 
     monkeypatch.setattr(item, "_preflight_cron_inventory", lambda: ([], []))
     monkeypatch.setattr(item, "begin", lambda: dict(base))
-    monkeypatch.setattr(item, "_prepare_snapshot_root", lambda: True)
+    monkeypatch.setattr(item, "_prepare_snapshot_root", lambda _transaction: create_snapshot_root(item))
     monkeypatch.setattr(item, "_runtime_quiescence_guard", guard)
     monkeypatch.setattr(item, "bootstrap_project", lambda _: False)
     monkeypatch.setattr(item, "synchronize_project_runtime", lambda: events.append("sync"))
@@ -1252,7 +1673,11 @@ def test_rollback_restores_owned_and_gemini_definitions_and_preserves_unknown_ex
 
     result = item._rollback_locked(require_exact_post_config=False)
 
-    assert result == {"ok": True, "status": "ROLLED_BACK"}
+    assert result == {
+        "ok": True,
+        "status": "ROLLED_BACK",
+        "outcome": "restored_exactly",
+    }
     assert item.store.read()["phase"] == "rolled_back"
     after_unknown = next(job for job in cli.jobs if job["id"] == "customer")
     assert core._job_contract_hash(after_unknown, include_id=True) == core._job_contract_hash(
@@ -1312,6 +1737,7 @@ def test_failed_fresh_install_removes_only_recorded_empty_snapshot_root_and_lock
     lock.touch(mode=0o600)
     lock.chmod(0o600)
     metadata = lock.stat()
+    root_metadata = item.snapshot_root.stat()
 
     item._remove_created_snapshot_artifacts({
         "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
@@ -1323,10 +1749,95 @@ def test_failed_fresh_install_removes_only_recorded_empty_snapshot_root_and_lock
         "snapshotLockDev": metadata.st_dev,
         "snapshotLockIno": metadata.st_ino,
         "snapshotRootCreated": True,
+        "snapshotRootDev": root_metadata.st_dev,
+        "snapshotRootIno": root_metadata.st_ino,
     })
 
     assert not index_lock.exists()
     assert not item.snapshot_root.exists()
+
+
+def test_unreceipted_planned_snapshot_root_is_preserved(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+
+    item._remove_created_snapshot_artifacts({
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "indexLockCreated": False,
+        "snapshotLockCreated": False,
+        "snapshotRootCreatePlanned": True,
+        "snapshotRootCreated": False,
+    })
+
+    assert item.snapshot_root.is_dir()
+
+
+def test_created_snapshot_root_replacement_is_refused_and_preserved(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    original = item.snapshot_root.stat()
+    replacement_path = item.snapshot_root.with_name("snapshot-root-replacement")
+    replacement_path.mkdir(mode=0o700)
+    replacement = replacement_path.stat()
+    item.snapshot_root.rmdir()
+    replacement_path.rename(item.snapshot_root)
+    assert (replacement.st_dev, replacement.st_ino) != (original.st_dev, original.st_ino)
+
+    with pytest.raises(RuntimeError, match="Created snapshot root is unsafe"):
+        item._remove_created_snapshot_artifacts({
+            "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+            "ownership": item._ownership_payload(),
+            "indexLockCreated": False,
+            "snapshotLockCreated": False,
+            "snapshotRootCreated": True,
+            "snapshotRootDev": original.st_dev,
+            "snapshotRootIno": original.st_ino,
+        })
+
+    assert item.snapshot_root.is_dir()
+
+
+def test_legacy_v2_created_snapshot_root_without_identity_is_preserved_and_receipted(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    transaction = {
+        "schemaVersion": core.SCHEMA_VERSION,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "indexLockCreated": False,
+        "snapshotLockCreated": False,
+        "snapshotRootCreated": True,
+    }
+    item.store.write(transaction)
+
+    item._remove_created_snapshot_artifacts(transaction)
+
+    assert item.snapshot_root.is_dir()
+    assert item.store.read()["legacyUnverifiedSnapshotRootPreserved"] is True
+
+
+def test_current_created_snapshot_root_missing_identity_fails_closed(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    transaction = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "indexLockCreated": False,
+        "snapshotLockCreated": False,
+        "snapshotRootCreatePlanned": True,
+        "snapshotRootCreated": True,
+    }
+    item.store.write(transaction)
+
+    with pytest.raises(RuntimeError, match="identity is missing"):
+        item._remove_created_snapshot_artifacts(transaction)
+
+    assert item.snapshot_root.is_dir()
 
 
 def test_created_lock_cleanup_is_idempotent_when_locks_are_already_absent(tmp_path: Path) -> None:
@@ -1370,6 +1881,20 @@ def test_created_snapshot_cleanup_is_bound_to_transaction_ownership(tmp_path: Pa
     assert unrelated.is_dir()
 
 
+def test_project_recovery_is_bound_to_transaction_ownership(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    ownership = item._ownership_payload()
+    ownership["projectRoot"] = str(
+        item.paths.workspace / "different" / "knowledge-lancedb-qwen-local"
+    )
+
+    with pytest.raises(RuntimeError, match="does not match transaction ownership"):
+        item._project_root_from_transaction({
+            "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+            "ownership": ownership,
+        })
+
+
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX crash semantics")
 def test_quiescence_lock_identities_survive_sigkill_before_guard_yields(tmp_path: Path) -> None:
     item = manager(tmp_path)
@@ -1408,7 +1933,7 @@ def test_quiescence_lock_identities_survive_sigkill_before_guard_yields(tmp_path
 
     os.close(write_fd)
     try:
-        assert os.read(read_fd, 5) == b"ready"
+        assert read_pipe_with_timeout(read_fd) == b"ready"
         os.kill(pid, signal.SIGKILL)
         _, status = os.waitpid(pid, 0)
         assert os.WIFSIGNALED(status)
@@ -1427,6 +1952,205 @@ def test_quiescence_lock_identities_survive_sigkill_before_guard_yields(tmp_path
         assert not (data / "index.lock").exists()
         assert not (item.snapshot_root / ".snapshot-run.lock").exists()
         assert item.snapshot_root.is_dir()
+    finally:
+        os.close(read_fd)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX crash semantics")
+def test_index_lock_receipt_survives_sigkill_during_parent_fsync(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    data = item.paths.project_root / "data"
+    data.mkdir(mode=0o700)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    item.store.write({
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "phase": "quiescing",
+        "ownership": item._ownership_payload(),
+    })
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        transaction = item.store.read()
+
+        def checkpoint(receipt: dict[str, Any]) -> None:
+            transaction.update(receipt)
+            item.store.write(transaction)
+            if "indexLockDev" in receipt:
+                def block_fsync(_descriptor: int) -> None:
+                    os.write(write_fd, b"ready")
+                    signal.pause()
+
+                core.os.fsync = block_fsync
+
+        try:
+            with item._runtime_quiescence_guard(checkpoint=checkpoint):
+                os._exit(2)
+        finally:
+            os._exit(3)
+
+    os.close(write_fd)
+    try:
+        assert read_pipe_with_timeout(read_fd) == b"ready"
+        os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFSIGNALED(status)
+        transaction = item.store.read()
+        assert transaction["indexLockCreated"] is True
+        assert isinstance(transaction["indexLockDev"], int)
+        assert isinstance(transaction["indexLockIno"], int)
+        assert (data / "index.lock").is_dir()
+
+        item._remove_created_snapshot_artifacts(transaction)
+
+        assert not (data / "index.lock").exists()
+    finally:
+        os.close(read_fd)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX crash semantics")
+def test_staged_index_lock_recovers_sigkill_after_publish_before_final_checkpoint(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    data = item.paths.project_root / "data"
+    data.mkdir(mode=0o700)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    item.store.write({
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "phase": "quiescing",
+        "ownership": item._ownership_payload(),
+    })
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        transaction = item.store.read()
+        real_publish = core._rename_noreplace_at
+
+        def checkpoint(receipt: dict[str, Any]) -> None:
+            transaction.update(receipt)
+            item.store.write(transaction)
+
+        def publish_then_block(
+            source_fd: int, source: str, target_fd: int, target: str,
+        ) -> None:
+            real_publish(source_fd, source, target_fd, target)
+            if target == "index.lock":
+                os.write(write_fd, b"ready")
+                signal.pause()
+
+        core._rename_noreplace_at = publish_then_block
+        try:
+            with item._runtime_quiescence_guard(checkpoint=checkpoint):
+                os._exit(2)
+        finally:
+            os._exit(3)
+
+    os.close(write_fd)
+    try:
+        assert read_pipe_with_timeout(read_fd) == b"ready"
+        os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFSIGNALED(status)
+        transaction = item.store.read()
+        assert transaction["indexLockPublished"] is False
+        assert transaction.get("indexLockCreated") is not True
+        assert isinstance(transaction["indexLockStageDev"], int)
+        assert isinstance(transaction["indexLockStageIno"], int)
+        assert (data / "index.lock").is_dir()
+        assert not (data / transaction["indexLockStageName"]).exists()
+
+        item._remove_created_snapshot_artifacts(transaction)
+
+        assert not (data / "index.lock").exists()
+    finally:
+        os.close(read_fd)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX crash semantics")
+def test_staged_snapshot_lock_recovers_sigkill_after_publish_before_final_checkpoint(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    data = item.paths.project_root / "data"
+    data.mkdir(mode=0o700)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    item.store.write({
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "phase": "quiescing",
+        "ownership": item._ownership_payload(),
+    })
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        transaction = item.store.read()
+        real_publish = core._rename_noreplace_at
+
+        def checkpoint(receipt: dict[str, Any]) -> None:
+            transaction.update(receipt)
+            item.store.write(transaction)
+
+        def publish_then_block(
+            source_fd: int, source: str, target_fd: int, target: str,
+        ) -> None:
+            real_publish(source_fd, source, target_fd, target)
+            if target == ".snapshot-run.lock":
+                os.write(write_fd, b"ready")
+                signal.pause()
+
+        core._rename_noreplace_at = publish_then_block
+        try:
+            with item._runtime_quiescence_guard(checkpoint=checkpoint):
+                os._exit(2)
+        finally:
+            os._exit(3)
+
+    os.close(write_fd)
+    try:
+        assert read_pipe_with_timeout(read_fd) == b"ready"
+        os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFSIGNALED(status)
+        transaction = item.store.read()
+        assert transaction["indexLockPublished"] is True
+        assert transaction["snapshotLockPublished"] is False
+        assert transaction.get("snapshotLockCreated") is not True
+        assert (data / "index.lock").is_dir()
+        assert (item.snapshot_root / ".snapshot-run.lock").is_file()
+
+        item._remove_created_snapshot_artifacts(transaction)
+
+        assert not (data / "index.lock").exists()
+        assert not (item.snapshot_root / ".snapshot-run.lock").exists()
     finally:
         os.close(read_fd)
         try:
@@ -1479,7 +2203,7 @@ def test_sigkill_while_waiting_preserves_preexisting_snapshot_lock(tmp_path: Pat
 
     os.close(write_fd)
     try:
-        assert os.read(read_fd, 5) == b"ready"
+        assert read_pipe_with_timeout(read_fd) == b"ready"
         os.kill(pid, signal.SIGKILL)
         _, status = os.waitpid(pid, 0)
         assert os.WIFSIGNALED(status)
@@ -1518,11 +2242,11 @@ def test_recovery_rejects_replaced_index_lock_without_deleting_it(tmp_path: Path
     index_lock = data / "index.lock"
     index_lock.mkdir(mode=0o700)
     original = index_lock.stat()
+    replacement_path = data / "index.lock.replacement"
+    replacement_path.mkdir(mode=0o700)
+    replacement = replacement_path.stat()
     index_lock.rmdir()
-    index_lock.mkdir(mode=0o700)
-    replacement = index_lock.stat()
-    if (replacement.st_dev, replacement.st_ino) == (original.st_dev, original.st_ino):
-        pytest.skip("filesystem immediately reused the lock inode")
+    replacement_path.rename(index_lock)
     transaction = {
         "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
         "ownership": item._ownership_payload(),
@@ -1537,6 +2261,137 @@ def test_recovery_rejects_replaced_index_lock_without_deleting_it(tmp_path: Path
         item._remove_created_snapshot_artifacts(transaction)
 
     assert index_lock.is_dir()
+
+
+def test_recovery_removes_index_lock_published_before_final_checkpoint(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    data = item.paths.project_root / "data"
+    data.mkdir(mode=0o700)
+    final = data / "index.lock"
+    final.mkdir(mode=0o700)
+    metadata = final.stat()
+    transaction = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "indexLockStageName": ".index.lock.install-11111111111111111111111111111111",
+        "indexLockStageDev": metadata.st_dev,
+        "indexLockStageIno": metadata.st_ino,
+        "indexLockPublished": False,
+        "indexLockCreated": False,
+        "snapshotLockCreated": False,
+        "snapshotRootCreated": False,
+    }
+
+    item._remove_created_snapshot_artifacts(transaction)
+
+    assert not final.exists()
+
+
+def test_recovery_preserves_unrelated_final_when_unpublished_stage_is_absent(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    data = item.paths.project_root / "data"
+    data.mkdir(mode=0o700)
+    unrelated = data / "index.lock"
+    unrelated.mkdir(mode=0o700)
+    unrelated_meta = unrelated.stat()
+    transaction = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "indexLockStageName": ".index.lock.install-22222222222222222222222222222222",
+        "indexLockStageDev": unrelated_meta.st_dev,
+        "indexLockStageIno": unrelated_meta.st_ino + 1000000,
+        "indexLockPublished": False,
+        "indexLockCreated": False,
+        "snapshotLockCreated": False,
+        "snapshotRootCreated": False,
+    }
+
+    item._remove_created_snapshot_artifacts(transaction)
+
+    assert unrelated.is_dir()
+
+
+def test_recovery_rejects_replaced_unpublished_index_stage(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    data = item.paths.project_root / "data"
+    data.mkdir(mode=0o700)
+    stage_name = ".index.lock.install-33333333333333333333333333333333"
+    stage = data / stage_name
+    stage.mkdir(mode=0o700)
+    original = stage.stat()
+    replacement_path = data / ".index.lock.replacement"
+    replacement_path.mkdir(mode=0o700)
+    replacement = replacement_path.stat()
+    stage.rmdir()
+    replacement_path.rename(stage)
+    transaction = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "indexLockStageName": stage_name,
+        "indexLockStageDev": original.st_dev,
+        "indexLockStageIno": original.st_ino,
+        "indexLockPublished": False,
+        "indexLockCreated": False,
+        "snapshotLockCreated": False,
+        "snapshotRootCreated": False,
+    }
+
+    with pytest.raises(RuntimeError, match="Staged runtime lock changed"):
+        item._remove_created_snapshot_artifacts(transaction)
+
+    assert stage.is_dir()
+
+
+def test_recovery_rejects_replaced_snapshot_lock_without_deleting_it(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    snapshot_lock = item.snapshot_root / ".snapshot-run.lock"
+    snapshot_lock.touch(mode=0o600)
+    original = snapshot_lock.stat()
+    replacement_path = item.snapshot_root / ".snapshot-run.lock.replacement"
+    replacement_path.touch(mode=0o600)
+    replacement_path.chmod(0o600)
+    replacement = replacement_path.stat()
+    snapshot_lock.unlink()
+    replacement_path.rename(snapshot_lock)
+    transaction = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "indexLockCreated": False,
+        "snapshotLockCreated": True,
+        "snapshotLockDev": original.st_dev,
+        "snapshotLockIno": original.st_ino,
+        "snapshotRootCreated": False,
+    }
+
+    with pytest.raises(RuntimeError, match="Created snapshot lock changed"):
+        item._remove_created_snapshot_artifacts(transaction)
+
+    assert snapshot_lock.is_file()
+
+
+def test_recovery_removes_snapshot_lock_published_before_final_checkpoint(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    final = item.snapshot_root / ".snapshot-run.lock"
+    final.touch(mode=0o600)
+    final.chmod(0o600)
+    metadata = final.stat()
+    transaction = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "indexLockCreated": False,
+        "snapshotLockStageName": ".snapshot-run.lock.install-44444444444444444444444444444444",
+        "snapshotLockStageDev": metadata.st_dev,
+        "snapshotLockStageIno": metadata.st_ino,
+        "snapshotLockPublished": False,
+        "snapshotLockCreated": False,
+        "snapshotRootCreated": False,
+    }
+
+    item._remove_created_snapshot_artifacts(transaction)
+
+    assert not final.exists()
 
 
 def initial_job(item: core.IntegrationManager, *, enabled: bool = True) -> dict[str, Any]:
@@ -1744,7 +2599,7 @@ def _write_precise_runtime_transaction(
     item: core.IntegrationManager,
     *,
     cron_mutation_started: bool = False,
-    **markers: bool,
+    **markers: Any,
 ) -> dict[str, Any]:
     config = item.paths.home / ".openclaw/openclaw.json"
     config.parent.mkdir(parents=True, exist_ok=True)
@@ -1790,6 +2645,269 @@ def _write_precise_runtime_transaction(
     }
     item.store.write(transaction)
     return transaction
+
+
+def test_contract_v1_rollback_fails_closed_before_any_side_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = manager(tmp_path)
+    transaction = _write_precise_runtime_transaction(item)
+    transaction["contractVersion"] = 1
+    transaction.pop("ownership", None)
+    item.store.write(transaction)
+    snapshot_checked = False
+
+    def verify_snapshot(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal snapshot_checked
+        snapshot_checked = True
+
+    monkeypatch.setattr(item, "_verify_config_snapshot", verify_snapshot)
+
+    with pytest.raises(RuntimeError, match="Legacy rollback receipt lacks exact"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    assert snapshot_checked is False
+    assert item.cli.calls == []
+    assert item.paths.project_root.is_dir()
+
+
+def test_legacy_v2_created_project_root_without_identity_is_preserved_and_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = manager(tmp_path)
+    _write_precise_runtime_transaction(item, projectCreated=True)
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_args, **_kwargs: None)
+
+    result = item._rollback_locked(require_exact_post_config=False)
+
+    assert result == {
+        "ok": True,
+        "status": "ROLLED_BACK",
+        "outcome": "restored_with_preserved_artifacts",
+    }
+    assert item.paths.project_root.is_dir()
+    receipt = item.store.read()
+    assert receipt["legacyUnverifiedProjectRootPreserved"] is True
+    assert "projectRoot" in receipt["rollbackPreservedResources"]
+
+
+def test_current_created_project_root_missing_identity_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = manager(tmp_path)
+    _write_precise_runtime_transaction(
+        item,
+        projectCreatePlanned=True,
+        projectCreated=True,
+    )
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="project identity is missing"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    assert item.paths.project_root.is_dir()
+
+
+def test_recovery_quarantines_receipted_project_root_stage(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    item.paths.project_root.rmdir()
+    stage_name = ".qwen-project-root.install-11111111111111111111111111111111"
+    stage = item.paths.project_root.parent / stage_name
+    stage.mkdir(mode=0o700)
+    metadata = stage.stat()
+    transaction = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "projectRootStageName": stage_name,
+        "projectRootStageDev": metadata.st_dev,
+        "projectRootStageIno": metadata.st_ino,
+        "projectRootPublished": False,
+        "projectCreated": False,
+        "indexLockCreated": False,
+        "snapshotLockCreated": False,
+        "snapshotRootCreated": False,
+    }
+    item.store.write(transaction)
+
+    item._remove_created_snapshot_artifacts(transaction)
+
+    assert not stage.exists()
+    quarantine = item.paths.project_root.parent / transaction["projectRootQuarantineName"]
+    assert quarantine.is_dir()
+    assert (quarantine.stat().st_dev, quarantine.stat().st_ino) == (
+        metadata.st_dev,
+        metadata.st_ino,
+    )
+
+
+def test_recovery_quarantines_project_root_published_before_created_checkpoint(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    item.paths.project_root.chmod(0o700)
+    metadata = item.paths.project_root.stat()
+    transaction = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "projectRootStageName": ".qwen-project-root.install-22222222222222222222222222222222",
+        "projectRootStageDev": metadata.st_dev,
+        "projectRootStageIno": metadata.st_ino,
+        "projectRootPublished": False,
+        "projectCreated": False,
+        "indexLockCreated": False,
+        "snapshotLockCreated": False,
+        "snapshotRootCreated": False,
+    }
+    item.store.write(transaction)
+
+    item._remove_created_snapshot_artifacts(transaction)
+
+    assert not item.paths.project_root.exists()
+    assert (
+        item.paths.project_root.parent / transaction["projectRootQuarantineName"]
+    ).is_dir()
+
+
+def test_recovery_rejects_project_stage_and_final_collision(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    stage_name = ".qwen-project-root.install-33333333333333333333333333333333"
+    stage = item.paths.project_root.parent / stage_name
+    stage.mkdir(mode=0o700)
+    metadata = stage.stat()
+    transaction = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "projectRootStageName": stage_name,
+        "projectRootStageDev": metadata.st_dev,
+        "projectRootStageIno": metadata.st_ino,
+        "projectRootPublished": False,
+        "projectCreated": False,
+        "indexLockCreated": False,
+        "snapshotLockCreated": False,
+        "snapshotRootCreated": False,
+    }
+    item.store.write(transaction)
+
+    with pytest.raises(RuntimeError, match="collided with the final path"):
+        item._remove_created_snapshot_artifacts(transaction)
+
+    assert stage.is_dir()
+    assert item.paths.project_root.is_dir()
+
+
+def test_fresh_project_root_can_be_created_after_stage_recovery(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    item.paths.project_root.rmdir()
+    stage_name = ".qwen-project-root.install-44444444444444444444444444444444"
+    stage = item.paths.project_root.parent / stage_name
+    stage.mkdir(mode=0o700)
+    metadata = stage.stat()
+    interrupted = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "projectRootStageName": stage_name,
+        "projectRootStageDev": metadata.st_dev,
+        "projectRootStageIno": metadata.st_ino,
+        "projectRootPublished": False,
+        "projectCreated": False,
+        "indexLockCreated": False,
+        "snapshotLockCreated": False,
+        "snapshotRootCreated": False,
+    }
+    item.store.write(interrupted)
+    item._remove_created_snapshot_artifacts(interrupted)
+
+    fresh = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "projectExisted": False,
+        "projectCreatePlanned": True,
+        "projectCreated": False,
+    }
+    item.store.write(fresh)
+    item._prepare_project_root(fresh)
+
+    assert item.paths.project_root.is_dir()
+    assert fresh["projectCreated"] is True
+    assert type(fresh["projectRootDev"]) is int
+    assert type(fresh["projectRootIno"]) is int
+
+
+def test_unreceipted_planned_project_root_is_preserved_during_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = manager(tmp_path)
+    transaction = _write_precise_runtime_transaction(
+        item,
+        projectCreatePlanned=True,
+        projectCreated=False,
+        snapshotRootCreatePlanned=True,
+        snapshotRootCreated=False,
+    )
+    marker = item.paths.project_root / "replacement-owned-by-someone-else"
+    marker.write_text("preserve", encoding="utf-8")
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+
+    result = item._rollback_locked(require_exact_post_config=False)
+
+    assert result["status"] == "ROLLED_BACK"
+    assert marker.read_text(encoding="utf-8") == "preserve"
+    assert item.snapshot_root.is_dir()
+    assert transaction["projectCreated"] is False
+
+
+def test_created_project_root_replacement_is_refused_and_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = manager(tmp_path)
+    original = item.paths.project_root.stat()
+    _write_precise_runtime_transaction(
+        item,
+        projectCreatePlanned=True,
+        projectCreated=True,
+        projectRootDev=original.st_dev,
+        projectRootIno=original.st_ino,
+    )
+    replacement_path = item.paths.project_root.with_name("project-root-replacement")
+    replacement_path.mkdir(mode=0o700)
+    replacement = replacement_path.stat()
+    item.paths.project_root.rmdir()
+    replacement_path.rename(item.paths.project_root)
+    assert (replacement.st_dev, replacement.st_ino) != (original.st_dev, original.st_ino)
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    assert item.paths.project_root.is_dir()
+
+
+def test_created_project_root_missing_is_idempotent_during_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = manager(tmp_path)
+    original = item.paths.project_root.stat()
+    _write_precise_runtime_transaction(
+        item,
+        projectCreatePlanned=True,
+        projectCreated=True,
+        projectRootDev=original.st_dev,
+        projectRootIno=original.st_ino,
+    )
+    item.paths.project_root.rmdir()
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+
+    result = item._rollback_locked(require_exact_post_config=False)
+
+    assert result["status"] == "ROLLED_BACK"
+    assert not item.paths.project_root.exists()
 
 
 def test_failure_before_plugin_install_preserves_existing_plugin(
@@ -2018,7 +3136,7 @@ def test_successful_integration_commits_after_activation_verification_and_reinst
     monkeypatch.setattr(item.store, "write", record_write)
     monkeypatch.setattr(item, "begin", lambda: dict(base))
     monkeypatch.setattr(item, "_preflight_cron_inventory", lambda: ([], []))
-    monkeypatch.setattr(item, "_prepare_snapshot_root", lambda: True)
+    monkeypatch.setattr(item, "_prepare_snapshot_root", lambda _transaction: create_snapshot_root(item))
 
     @contextmanager
     def guard(*, checkpoint=None) -> Iterator[dict[str, Any]]:

@@ -1,7 +1,7 @@
 # Qwen local fresh-install snapshot automation security gate
 
 Date: 2026-09-04
-Status: `PASS`
+Status: `REVIEW_PENDING`
 Scope: local CLI, OpenClaw cron reconciliation, installer-owned runtime files,
 immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
 
@@ -64,6 +64,10 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
   checkpointed before any subsequent blocking wait; recovery removes only an exact
   installer-created stale lock. Rollback and verification are bound to the private
   transaction's canonical custom snapshot root and reject conflicting CLI overrides.
+  Atomic no-replace capability is proven before cron/runtime mutation on the nearest
+  existing safe ancestor, including fresh custom roots whose parent is not yet present.
+  Root publication and lock recovery use staged identities, directory fsync, exact
+  inode checks, and fail-closed quarantine receipts.
   Launchd activation and rollback apply bounded retry followed by service
   readback, and cron restoration begins only after runtime restoration.
 - A07 Authentication Failures — `NOT_APPLICABLE_WITH_EVIDENCE`. This change adds no
@@ -92,14 +96,16 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
   cron-before-runtime rollback ordering, exact cron definition round trips,
   interrupted index-lock recovery, pre-yield SIGKILL recovery for new and existing
   snapshot locks, replacement-inode refusal, idempotent created-lock cleanup,
-  stored custom snapshot-root binding, stale transaction staging files, and Linux
-  home-boundary fixtures.
+  stored custom snapshot-root binding, missing custom-root parents, staged root
+  publication interruption, stale transaction staging files, legacy receipt policy,
+  native Darwin/Linux no-replace ABI and errno mapping, and Linux home-boundary
+  fixtures.
 
 ## Verification evidence
 
-- Python suite: crash-recovery closeout rerun `283 passed` locally; Linux CI remains a
-  mandatory release gate.
-- Focused CLI and reconciliation rollback suites: `113 passed`.
+- Python suite: `327 passed` on macOS and `327 passed` in a non-root Python 3.12
+  Linux container.
+- Focused reconciliation and integration-contract suites: `167 passed`.
 - Qwen template Node suite: `28 passed`.
 - OpenClaw Plugin Node suite: `5 passed`; syntax check and official Plugin validation
   passed.
@@ -118,12 +124,14 @@ The attacker-oriented review covered unauthorized cron adoption, declaration dri
 inventory truncation, secret-bearing env/receipts, concurrent runtime replacement,
 snapshot path/file substitution, same-day rollback attacks, immutable snapshot
 overwrite, retention escape, cloud fallback, and rollback failure. Independent
-review identified three P1s: an index/snapshot absence-check TOCTOU gap, unsafe index
-lock creation failures misreported as normal contention, and unconditional manual
-runtime restart after an unverified rollback. The shared atomic lock protocol,
-owner/type/permission-aware lock helper, typed recovery outcomes, and adversarial
-regressions close them. Final independent review passed with
-`P0/P1/P2/P3 = 0/0/0/0`; no known release blocker remains in this scope.
+review identified and the implementation closed the index/snapshot absence-check
+TOCTOU gap, unsafe lock-error classification, unverified-runtime restart, missing-root
+custom snapshot path, root/lock crash recovery, and current-receipt ownership gaps.
+The current implementation and cross-platform suites have no known P0/P1. One P2 is
+explicitly retained: a crash or rollback may leave an exact, randomly named private
+quarantine artifact instead of risking deletion after namespace replacement; the
+transaction reports it as a preserved artifact and never claims exact restoration.
+Final independent review of the frozen commit remains a mandatory release gate.
 
 `ASVS_LEVEL_TARGET`: `NOT_APPLICABLE_WITH_EVIDENCE`. There is no Web application or
 public product API in this change. Equivalent local CLI/filesystem/process controls

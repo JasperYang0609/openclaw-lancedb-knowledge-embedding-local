@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import ctypes
+import errno
 import json
 import os
 import plistlib
@@ -72,6 +74,45 @@ SENSITIVE_VALUE_PATTERNS = (
     re.compile(r"(?:^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}(?:$|[^A-Za-z0-9])"),
     re.compile(r"(?:^|[^A-Za-z0-9])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
 )
+
+INDEX_LOCK_STAGE_RE = re.compile(r"^\.index\.lock\.install-[0-9a-f]{32}$")
+SNAPSHOT_LOCK_STAGE_RE = re.compile(r"^\.snapshot-run\.lock\.install-[0-9a-f]{32}$")
+PROJECT_ROOT_STAGE_RE = re.compile(r"^\.qwen-project-root\.install-[0-9a-f]{32}$")
+SNAPSHOT_ROOT_STAGE_RE = re.compile(r"^\.qwen-snapshot-root\.install-[0-9a-f]{32}$")
+QUARANTINE_RE = re.compile(r"^\.qwen-recovery-quarantine-[0-9a-f]{32}$")
+CAPABILITY_PROBE_STAGE_RE = re.compile(r"^\.qwen-capability-probe-[0-9a-f]{32}$")
+CAPABILITY_PROBE_FINAL_RE = re.compile(r"^\.qwen-capability-probe-published-[0-9a-f]{32}$")
+
+
+def _rename_noreplace_at(source_fd: int, source: str, target_fd: int, target: str) -> None:
+    """Atomically publish one same-filesystem path without replacing an existing target."""
+    for value in (source, target):
+        if not value or value in {".", ".."} or "/" in value or "\x00" in value:
+            raise RuntimeError("Atomic publication path is unsafe")
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    target_bytes = os.fsencode(target)
+    if sys.platform == "darwin":
+        operation = getattr(libc, "renameatx_np", None)
+        flag = 0x00000004  # RENAME_EXCL
+    elif sys.platform.startswith("linux"):
+        operation = getattr(libc, "renameat2", None)
+        flag = 0x00000001  # RENAME_NOREPLACE
+    else:
+        operation = None
+        flag = 0
+    if operation is None:
+        raise RuntimeError("Atomic no-replace publication is unavailable on this platform")
+    operation.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    operation.restype = ctypes.c_int
+    if operation(source_fd, source_bytes, target_fd, target_bytes, flag) == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, os.strerror(error_number), target)
+    if error_number in {errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL}:
+        raise RuntimeError("Atomic no-replace publication is unavailable on this filesystem")
+    raise OSError(error_number, os.strerror(error_number), target)
 
 
 class IntegrationRollbackIncomplete(RuntimeError):
@@ -1300,15 +1341,120 @@ class IntegrationManager:
             payload["approvedDisabledCollision"] = self.approved_disabled_collision.receipt()
         return payload
 
-    def _prepare_snapshot_root(self) -> bool:
-        existed = self.snapshot_root.exists()
-        if not existed:
-            self.snapshot_root.mkdir(parents=True, mode=0o700)
-        os.chmod(self.snapshot_root, 0o700)
-        metadata = self.snapshot_root.stat()
-        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
-            raise RuntimeError("Snapshot root ownership or permissions are unsafe")
-        return not existed
+    def _prepare_owned_root(
+        self, transaction: dict[str, Any], *, root: Path, prefix: str,
+        planned_key: str, created_key: str, stage_name: str,
+    ) -> bool:
+        planned = transaction.get(planned_key)
+        if type(planned) is not bool or transaction.get(created_key) is not False:
+            raise RuntimeError("Managed root creation does not match the transaction plan")
+        if not planned:
+            if not os.path.lexists(root):
+                raise RuntimeError("Pre-existing managed root disappeared after preflight")
+            root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                metadata = os.fstat(root_fd)
+                if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() \
+                        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    raise RuntimeError("Pre-existing managed root is unsafe")
+            finally:
+                os.close(root_fd)
+            return False
+        if os.path.lexists(root):
+            raise RuntimeError("Fresh managed root appeared after integration preflight")
+        with self._open_private_directory(root.parent, create=True) as parent_fd:
+            stage_fd: int | None = None
+            stage_identity: tuple[int, int] | None = None
+            published = False
+            try:
+                parent_meta = os.fstat(parent_fd)
+                if not stat.S_ISDIR(parent_meta.st_mode) or parent_meta.st_uid != os.getuid() \
+                        or parent_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    raise RuntimeError("Managed root parent is unsafe")
+                os.mkdir(stage_name, 0o700, dir_fd=parent_fd)
+                stage_fd = os.open(
+                    stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+                metadata = os.fstat(stage_fd)
+                if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() \
+                        or metadata.st_mode & 0o077:
+                    raise RuntimeError("Fresh managed root staging directory is unsafe")
+                stage_identity = (metadata.st_dev, metadata.st_ino)
+                transaction.update({
+                    f"{prefix}StageName": stage_name,
+                    f"{prefix}StageDev": metadata.st_dev,
+                    f"{prefix}StageIno": metadata.st_ino,
+                    f"{prefix}Published": False,
+                })
+                self.store.write(transaction)
+                os.fsync(stage_fd)
+                os.fsync(parent_fd)
+                _rename_noreplace_at(parent_fd, stage_name, parent_fd, root.name)
+                published = True
+                os.fsync(parent_fd)
+                final_meta = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(final_meta.st_mode) or final_meta.st_uid != os.getuid() \
+                        or final_meta.st_mode & 0o077 \
+                        or (final_meta.st_dev, final_meta.st_ino) != stage_identity:
+                    raise RuntimeError("Published managed root identity changed")
+                transaction.update({
+                    f"{prefix}Published": True,
+                    created_key: True,
+                    f"{prefix}Dev": final_meta.st_dev,
+                    f"{prefix}Ino": final_meta.st_ino,
+                })
+                self.store.write(transaction)
+                return True
+            finally:
+                cleanup_error: Exception | None = None
+                if stage_identity is not None and not published:
+                    try:
+                        self._quarantine_transaction_path(
+                            transaction,
+                            receipt_prefix=prefix,
+                            parent_fd=parent_fd,
+                            name=stage_name,
+                            expected_identity=stage_identity,
+                            directory=True,
+                        )
+                    except Exception as error:
+                        cleanup_error = error
+                if stage_fd is not None:
+                    try:
+                        os.close(stage_fd)
+                    except Exception as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
+                if cleanup_error is not None:
+                    raise RuntimeError("Managed root staging cleanup was incomplete") from cleanup_error
+
+    def _prepare_snapshot_root(self, transaction: dict[str, Any]) -> bool:
+        return self._prepare_owned_root(
+            transaction,
+            root=self.snapshot_root,
+            prefix="snapshotRoot",
+            planned_key="snapshotRootCreatePlanned",
+            created_key="snapshotRootCreated",
+            stage_name=f".qwen-snapshot-root.install-{uuid.uuid4().hex}",
+        )
+
+    def _prepare_project_root(self, transaction: dict[str, Any]) -> None:
+        """Create and durably receipt a fresh managed project before bootstrap can block."""
+        if transaction.get("projectExisted") is True \
+                or transaction.get("projectCreatePlanned") is not True:
+            raise RuntimeError("Fresh project creation does not match the transaction plan")
+        if transaction.get("projectCreated") is not False \
+                or "projectRootDev" in transaction or "projectRootIno" in transaction:
+            raise RuntimeError("Fresh project ownership was already checkpointed")
+        self._prepare_owned_root(
+            transaction,
+            root=self.paths.project_root,
+            prefix="projectRoot",
+            planned_key="projectCreatePlanned",
+            created_key="projectCreated",
+            stage_name=f".qwen-project-root.install-{uuid.uuid4().hex}",
+        )
 
     def _incremental_spec(self) -> ManagedCronSpec:
         script = self.paths.project_root / "scripts/knowledge_index_incremental.sh"
@@ -1425,6 +1571,408 @@ class IntegrationManager:
             raise RuntimeError("Unknown cron definitions changed during owned-job quiescence")
         return enabled_before
 
+    @staticmethod
+    def _validate_index_lock(metadata: os.stat_result) -> None:
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() \
+                or metadata.st_mode & 0o077:
+            raise RuntimeError("Qwen index lock is unsafe")
+
+    @staticmethod
+    def _validate_snapshot_lock(metadata: os.stat_result) -> None:
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() \
+                or metadata.st_nlink != 1 or metadata.st_mode & 0o077 or metadata.st_size != 0:
+            raise RuntimeError("Qwen snapshot run lock is unsafe")
+
+    def _quarantine_exact_path(
+        self, parent_fd: int, name: str, expected_identity: tuple[int, int], *,
+        directory: bool, quarantine_name: str | None = None,
+    ) -> str | None:
+        if quarantine_name is None:
+            quarantine_name = f".qwen-recovery-quarantine-{uuid.uuid4().hex}"
+        if QUARANTINE_RE.fullmatch(quarantine_name) is None:
+            raise RuntimeError("Qwen recovery quarantine identity is unsafe")
+
+        def validate(metadata: os.stat_result) -> None:
+            if directory:
+                self._validate_index_lock(metadata)
+            else:
+                self._validate_snapshot_lock(metadata)
+
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                quarantined = os.stat(
+                    quarantine_name, dir_fd=parent_fd, follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return None
+            validate(quarantined)
+            if (quarantined.st_dev, quarantined.st_ino) != expected_identity:
+                raise RuntimeError("Qwen recovery quarantine identity changed")
+            return quarantine_name
+        validate(metadata)
+        if (metadata.st_dev, metadata.st_ino) != expected_identity:
+            raise RuntimeError("Qwen runtime lock identity changed")
+        try:
+            _rename_noreplace_at(parent_fd, name, parent_fd, quarantine_name)
+        except FileNotFoundError:
+            return self._quarantine_exact_path(
+                parent_fd,
+                name,
+                expected_identity,
+                directory=directory,
+                quarantine_name=quarantine_name,
+            )
+        moved = os.stat(quarantine_name, dir_fd=parent_fd, follow_symlinks=False)
+        try:
+            validate(moved)
+            if (moved.st_dev, moved.st_ino) != expected_identity:
+                raise RuntimeError("Qwen recovery candidate changed during quarantine")
+        except Exception as validation_error:
+            try:
+                _rename_noreplace_at(parent_fd, quarantine_name, parent_fd, name)
+            except Exception as restore_error:
+                raise RuntimeError(
+                    "Qwen recovery candidate changed and was preserved in quarantine"
+                ) from restore_error
+            raise validation_error
+        os.fsync(parent_fd)
+        return quarantine_name
+
+    def _quarantine_transaction_path(
+        self, transaction: dict[str, Any], *, receipt_prefix: str, parent_fd: int,
+        name: str, expected_identity: tuple[int, int], directory: bool,
+    ) -> bool:
+        name_key = f"{receipt_prefix}QuarantineName"
+        state_key = f"{receipt_prefix}Quarantined"
+        quarantine_name = transaction.get(name_key)
+        if quarantine_name is None:
+            quarantine_name = f".qwen-recovery-quarantine-{uuid.uuid4().hex}"
+            transaction[name_key] = quarantine_name
+            self.store.write(transaction)
+        elif not isinstance(quarantine_name, str) \
+                or QUARANTINE_RE.fullmatch(quarantine_name) is None:
+            raise RuntimeError("Qwen recovery quarantine receipt is malformed")
+        moved = self._quarantine_exact_path(
+            parent_fd,
+            name,
+            expected_identity,
+            directory=directory,
+            quarantine_name=quarantine_name,
+        )
+        if moved is not None:
+            if transaction.get(state_key) not in {None, True}:
+                raise RuntimeError("Qwen recovery quarantine state is not monotonic")
+            transaction[state_key] = True
+            self.store.write(transaction)
+            return True
+        return False
+
+    def _quarantine_checkpointed_path(
+        self, receipt: dict[str, Any], *, receipt_prefix: str, parent_fd: int,
+        name: str, expected_identity: tuple[int, int], directory: bool,
+        checkpoint: Callable[[dict[str, Any]], None],
+    ) -> bool:
+        name_key = f"{receipt_prefix}QuarantineName"
+        state_key = f"{receipt_prefix}Quarantined"
+        quarantine_name = receipt.get(name_key)
+        if quarantine_name is None:
+            quarantine_name = f".qwen-recovery-quarantine-{uuid.uuid4().hex}"
+            checkpoint({name_key: quarantine_name})
+            receipt[name_key] = quarantine_name
+        elif not isinstance(quarantine_name, str) \
+                or QUARANTINE_RE.fullmatch(quarantine_name) is None:
+            raise RuntimeError("Qwen recovery quarantine receipt is malformed")
+        moved = self._quarantine_exact_path(
+            parent_fd,
+            name,
+            expected_identity,
+            directory=directory,
+            quarantine_name=quarantine_name,
+        )
+        if moved is not None:
+            checkpoint({state_key: True})
+            receipt[state_key] = True
+            return True
+        return False
+
+    def _purge_exact_quarantine(
+        self, parent_fd: int, quarantine_name: str, expected_identity: tuple[int, int], *,
+        directory: bool,
+    ) -> bool:
+        """Remove one exact transaction quarantine after it has left the public namespace."""
+        if QUARANTINE_RE.fullmatch(quarantine_name) is None:
+            raise RuntimeError("Qwen recovery quarantine identity is unsafe")
+        try:
+            metadata = os.stat(
+                quarantine_name, dir_fd=parent_fd, follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        if directory:
+            self._validate_index_lock(metadata)
+        else:
+            self._validate_snapshot_lock(metadata)
+        if (metadata.st_dev, metadata.st_ino) != expected_identity:
+            raise RuntimeError("Qwen recovery quarantine identity changed before purge")
+        if directory:
+            self._remove_tree_at(parent_fd, quarantine_name, expected_identity)
+        else:
+            descriptor = os.open(
+                quarantine_name,
+                os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            try:
+                opened = os.fstat(descriptor)
+                self._validate_snapshot_lock(opened)
+                if (opened.st_dev, opened.st_ino) != expected_identity:
+                    raise RuntimeError("Qwen recovery quarantine identity changed before purge")
+                current = os.stat(
+                    quarantine_name, dir_fd=parent_fd, follow_symlinks=False,
+                )
+                if (current.st_dev, current.st_ino) != expected_identity:
+                    raise RuntimeError("Qwen recovery quarantine identity changed before purge")
+                os.unlink(quarantine_name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            finally:
+                os.close(descriptor)
+        return True
+
+    def _purge_transaction_quarantine(
+        self, transaction: dict[str, Any], *, receipt_prefix: str, parent_fd: int,
+        expected_identity: tuple[int, int], directory: bool,
+    ) -> bool:
+        quarantine_name = transaction.get(f"{receipt_prefix}QuarantineName")
+        if not isinstance(quarantine_name, str) \
+                or QUARANTINE_RE.fullmatch(quarantine_name) is None:
+            raise RuntimeError("Qwen recovery quarantine receipt is malformed")
+        purged = self._purge_exact_quarantine(
+            parent_fd,
+            quarantine_name,
+            expected_identity,
+            directory=directory,
+        )
+        if transaction.get(f"{receipt_prefix}QuarantinePurged") not in {None, True}:
+            raise RuntimeError("Qwen recovery quarantine purge state is not monotonic")
+        transaction[f"{receipt_prefix}QuarantinePurged"] = True
+        self.store.write(transaction)
+        return purged
+
+    def _probe_atomic_publication_capability(
+        self, transaction: dict[str, Any], *, parent: Path, receipt_prefix: str,
+    ) -> None:
+        """Prove no-replace support before any cron or runtime mutation."""
+        if not os.path.lexists(parent):
+            raise RuntimeError("Atomic publication probe parent must already exist")
+        stage_name = f".qwen-capability-probe-{uuid.uuid4().hex}"
+        final_name = f".qwen-capability-probe-published-{uuid.uuid4().hex}"
+        stage_fd: int | None = None
+        identity: tuple[int, int] | None = None
+        published = False
+        cleanup_error: Exception | None = None
+        with self._open_private_directory(parent) as parent_fd:
+            try:
+                os.mkdir(stage_name, 0o700, dir_fd=parent_fd)
+                stage_fd = os.open(
+                    stage_name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+                metadata = os.fstat(stage_fd)
+                self._validate_restricted_directory(metadata)
+                identity = (metadata.st_dev, metadata.st_ino)
+                transaction.update({
+                    f"{receipt_prefix}Parent": str(Path(os.path.abspath(parent))),
+                    f"{receipt_prefix}StageName": stage_name,
+                    f"{receipt_prefix}StageDev": metadata.st_dev,
+                    f"{receipt_prefix}StageIno": metadata.st_ino,
+                    f"{receipt_prefix}FinalName": final_name,
+                    f"{receipt_prefix}Published": False,
+                })
+                self.store.write(transaction)
+                os.fsync(stage_fd)
+                os.fsync(parent_fd)
+                _rename_noreplace_at(parent_fd, stage_name, parent_fd, final_name)
+                published = True
+                os.fsync(parent_fd)
+                final_meta = os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+                self._validate_restricted_directory(final_meta)
+                if (final_meta.st_dev, final_meta.st_ino) != identity:
+                    raise RuntimeError("Atomic publication probe identity changed")
+                transaction[f"{receipt_prefix}Published"] = True
+                self.store.write(transaction)
+                self._quarantine_transaction_path(
+                    transaction,
+                    receipt_prefix=receipt_prefix,
+                    parent_fd=parent_fd,
+                    name=final_name,
+                    expected_identity=identity,
+                    directory=True,
+                )
+                self._purge_transaction_quarantine(
+                    transaction,
+                    receipt_prefix=receipt_prefix,
+                    parent_fd=parent_fd,
+                    expected_identity=identity,
+                    directory=True,
+                )
+            finally:
+                if identity is not None and transaction.get(
+                    f"{receipt_prefix}QuarantinePurged"
+                ) is not True:
+                    candidate = final_name if published else stage_name
+                    try:
+                        if transaction.get(f"{receipt_prefix}Quarantined") is not True:
+                            self._quarantine_transaction_path(
+                                transaction,
+                                receipt_prefix=receipt_prefix,
+                                parent_fd=parent_fd,
+                                name=candidate,
+                                expected_identity=identity,
+                                directory=True,
+                            )
+                        self._purge_transaction_quarantine(
+                            transaction,
+                            receipt_prefix=receipt_prefix,
+                            parent_fd=parent_fd,
+                            expected_identity=identity,
+                            directory=True,
+                        )
+                    except Exception as error:
+                        cleanup_error = error
+                        transaction[f"{receipt_prefix}Preserved"] = True
+                        self.store.write(transaction)
+                if stage_fd is not None:
+                    try:
+                        os.close(stage_fd)
+                    except Exception as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
+                if cleanup_error is not None:
+                    raise RuntimeError("Atomic publication capability probe cleanup was incomplete") \
+                        from cleanup_error
+
+    def _nearest_existing_capability_parent(self, target_parent: Path) -> Path:
+        """Choose an existing ancestor on the filesystem that will host a fresh managed root."""
+        target = Path(os.path.abspath(target_parent))
+        home = Path(os.path.abspath(self.paths.home))
+        if target != home and home not in target.parents:
+            raise RuntimeError("Atomic publication probe parent is outside the managed home")
+        _assert_no_symlink_components(target)
+        candidate = target
+        while not os.path.lexists(candidate):
+            if candidate == home:
+                raise RuntimeError("Managed home disappeared before atomic publication probe")
+            candidate = candidate.parent
+        if candidate != home and home not in candidate.parents:
+            raise RuntimeError("Atomic publication probe ancestor escaped the managed home")
+        return candidate
+
+    def _capability_parent_from_transaction(
+        self, transaction: dict[str, Any], *, receipt_prefix: str, target_parent: Path,
+    ) -> Path:
+        """Validate the receipted probe ancestor without recomputing it after paths are created."""
+        stored = transaction.get(f"{receipt_prefix}Parent")
+        target = Path(os.path.abspath(target_parent))
+        if stored is None:
+            return target
+        if not isinstance(stored, str) or not stored:
+            raise RuntimeError("Atomic publication capability parent receipt is malformed")
+        raw = Path(stored).expanduser()
+        if not raw.is_absolute():
+            raise RuntimeError("Atomic publication capability parent receipt must be absolute")
+        parent = Path(os.path.abspath(raw))
+        home = Path(os.path.abspath(self.paths.home))
+        if parent != home and home not in parent.parents:
+            raise RuntimeError("Atomic publication capability parent escaped the managed home")
+        if parent != target and parent not in target.parents:
+            raise RuntimeError("Atomic publication capability parent is not an ancestor of its target")
+        _assert_no_symlink_components(parent)
+        return parent
+
+    def _recover_capability_probe(
+        self, transaction: dict[str, Any], *, receipt_prefix: str, expected_parent: Path,
+    ) -> None:
+        stage_name = transaction.get(f"{receipt_prefix}StageName")
+        final_name = transaction.get(f"{receipt_prefix}FinalName")
+        stage_dev = transaction.get(f"{receipt_prefix}StageDev")
+        stage_ino = transaction.get(f"{receipt_prefix}StageIno")
+        published = transaction.get(f"{receipt_prefix}Published")
+        parent_value = transaction.get(f"{receipt_prefix}Parent")
+        fields = (stage_name, final_name, stage_dev, stage_ino, published, parent_value)
+        if all(value is None for value in fields):
+            return
+        if not isinstance(stage_name, str) \
+                or CAPABILITY_PROBE_STAGE_RE.fullmatch(stage_name) is None \
+                or not isinstance(final_name, str) \
+                or CAPABILITY_PROBE_FINAL_RE.fullmatch(final_name) is None \
+                or type(stage_dev) is not int or type(stage_ino) is not int \
+                or type(published) is not bool or not isinstance(parent_value, str):
+            raise RuntimeError("Atomic publication capability receipt is malformed")
+        parent = Path(os.path.abspath(Path(parent_value).expanduser()))
+        if parent != Path(os.path.abspath(expected_parent)):
+            raise RuntimeError("Atomic publication capability parent changed")
+        if not os.path.lexists(parent):
+            transaction[f"{receipt_prefix}Preserved"] = False
+            self.store.write(transaction)
+            return
+        expected = (stage_dev, stage_ino)
+        with self._open_private_directory(parent) as parent_fd:
+            matches: list[str] = []
+            for name in (stage_name, final_name):
+                try:
+                    metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                self._validate_restricted_directory(metadata)
+                if (metadata.st_dev, metadata.st_ino) != expected:
+                    raise RuntimeError("Atomic publication capability artifact changed")
+                matches.append(name)
+            quarantine_name = transaction.get(f"{receipt_prefix}QuarantineName")
+            if quarantine_name is not None and (
+                not isinstance(quarantine_name, str)
+                or QUARANTINE_RE.fullmatch(quarantine_name) is None
+            ):
+                raise RuntimeError("Atomic publication capability quarantine receipt is malformed")
+            if isinstance(quarantine_name, str):
+                try:
+                    metadata = os.stat(
+                        quarantine_name, dir_fd=parent_fd, follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    self._validate_restricted_directory(metadata)
+                    if (metadata.st_dev, metadata.st_ino) != expected:
+                        raise RuntimeError("Atomic publication capability quarantine changed")
+                    matches.append(quarantine_name)
+            if len(matches) > 1:
+                raise RuntimeError("Atomic publication capability artifact exists at multiple paths")
+            if matches:
+                candidate = matches[0]
+                if candidate != quarantine_name:
+                    self._quarantine_transaction_path(
+                        transaction,
+                        receipt_prefix=receipt_prefix,
+                        parent_fd=parent_fd,
+                        name=candidate,
+                        expected_identity=expected,
+                        directory=True,
+                    )
+                self._purge_transaction_quarantine(
+                    transaction,
+                    receipt_prefix=receipt_prefix,
+                    parent_fd=parent_fd,
+                    expected_identity=expected,
+                    directory=True,
+                )
+                transaction[f"{receipt_prefix}Preserved"] = False
+            else:
+                transaction[f"{receipt_prefix}Preserved"] = False
+            self.store.write(transaction)
+
     @contextmanager
     def _runtime_quiescence_guard(
         self, *, timeout_seconds: float = 1800, poll_seconds: float = 1.0,
@@ -1434,6 +1982,8 @@ class IntegrationManager:
         if not self.paths.project_root.exists():
             yield {"snapshotLockCreated": False}
             return
+        if checkpoint is None:
+            raise RuntimeError("Runtime quiescence requires a durable transaction checkpoint")
         project = self.paths.project_root
         data = project / "data"
         _assert_no_symlink_components(data)
@@ -1442,12 +1992,19 @@ class IntegrationManager:
         if not stat.S_ISDIR(data_meta.st_mode) or data_meta.st_uid != os.getuid() \
                 or data_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise RuntimeError("Qwen data directory is unsafe for runtime quiescence")
-        index_lock = data / "index.lock"
         deadline = time.monotonic() + max(0.0, timeout_seconds)
+        data_fd = os.open(data, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        index_stage_name = f".index.lock.install-{uuid.uuid4().hex}"
+        index_stage_fd: int | None = None
         index_identity: tuple[int, int] | None = None
+        index_published = False
+        snapshot_root_fd: int | None = None
+        snapshot_stage_name: str | None = None
+        snapshot_stage_fd: int | None = None
         snapshot_fd: int | None = None
         snapshot_locked = False
         snapshot_lock_created = False
+        snapshot_published = False
         snapshot_identity: tuple[int, int] | None = None
         lock_receipt: dict[str, Any] = {
             "indexLockCreated": False,
@@ -1457,52 +2014,143 @@ class IntegrationManager:
             "persisted": False,
         }
         try:
-            while index_identity is None:
+            os.mkdir(index_stage_name, 0o700, dir_fd=data_fd)
+            index_stage_fd = os.open(
+                index_stage_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=data_fd,
+            )
+            index_meta = os.fstat(index_stage_fd)
+            self._validate_index_lock(index_meta)
+            index_identity = (index_meta.st_dev, index_meta.st_ino)
+            lock_receipt.update({
+                "indexLockStageName": index_stage_name,
+                "indexLockStageDev": index_meta.st_dev,
+                "indexLockStageIno": index_meta.st_ino,
+                "indexLockPublished": False,
+            })
+            checkpoint({
+                "indexLockStageName": index_stage_name,
+                "indexLockStageDev": index_meta.st_dev,
+                "indexLockStageIno": index_meta.st_ino,
+                "indexLockPublished": False,
+            })
+            lock_receipt["indexLockPersisted"] = True
+            os.fsync(index_stage_fd)
+            os.fsync(data_fd)
+            while not index_published:
                 try:
-                    os.mkdir(index_lock, 0o700)
-                    metadata = index_lock.lstat()
-                    index_identity = (metadata.st_dev, metadata.st_ino)
-                    lock_receipt.update({
-                        "indexLockCreated": True,
-                        "indexLockDev": metadata.st_dev,
-                        "indexLockIno": metadata.st_ino,
-                    })
-                    data_fd = os.open(
-                        data, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    )
-                    try:
-                        os.fsync(data_fd)
-                    finally:
-                        os.close(data_fd)
-                    if checkpoint is not None:
-                        checkpoint({
-                            "indexLockCreated": True,
-                            "indexLockDev": metadata.st_dev,
-                            "indexLockIno": metadata.st_ino,
-                        })
-                        lock_receipt["indexLockPersisted"] = True
+                    _rename_noreplace_at(data_fd, index_stage_name, data_fd, "index.lock")
                 except FileExistsError:
-                    if index_lock.is_symlink() or not index_lock.is_dir():
-                        raise RuntimeError("Qwen index lock path is unsafe")
+                    self._validate_index_lock(os.stat(
+                        "index.lock", dir_fd=data_fd, follow_symlinks=False,
+                    ))
                     if time.monotonic() >= deadline:
                         raise RuntimeError("Qwen index run did not quiesce before the bounded deadline")
                     time.sleep(min(max(0.01, poll_seconds), max(0.01, deadline - time.monotonic())))
-            snapshot_root = self.snapshot_root
-            snapshot_lock = snapshot_root / ".snapshot-run.lock"
+                    continue
+                published_meta = os.stat("index.lock", dir_fd=data_fd, follow_symlinks=False)
+                self._validate_index_lock(published_meta)
+                if (published_meta.st_dev, published_meta.st_ino) != index_identity:
+                    raise RuntimeError("Published Qwen index lock identity changed")
+                os.fsync(data_fd)
+                lock_receipt.update({
+                    "indexLockCreated": True,
+                    "indexLockDev": published_meta.st_dev,
+                    "indexLockIno": published_meta.st_ino,
+                    "indexLockPublished": True,
+                })
+                checkpoint({
+                    "indexLockCreated": True,
+                    "indexLockDev": published_meta.st_dev,
+                    "indexLockIno": published_meta.st_ino,
+                    "indexLockPublished": True,
+                })
+                index_published = True
+
+            snapshot_root_fd = os.open(
+                self.snapshot_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
             try:
                 snapshot_fd = os.open(
-                    snapshot_lock,
+                    ".snapshot-run.lock", os.O_RDWR | os.O_NOFOLLOW,
+                    dir_fd=snapshot_root_fd,
+                )
+            except FileNotFoundError:
+                snapshot_stage_name = f".snapshot-run.lock.install-{uuid.uuid4().hex}"
+                snapshot_stage_fd = os.open(
+                    snapshot_stage_name,
                     os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                     0o600,
+                    dir_fd=snapshot_root_fd,
                 )
-                snapshot_lock_created = True
-            except FileExistsError:
-                snapshot_fd = os.open(snapshot_lock, os.O_RDWR | os.O_NOFOLLOW)
+                snapshot_stage_meta = os.fstat(snapshot_stage_fd)
+                self._validate_snapshot_lock(snapshot_stage_meta)
+                snapshot_identity = (snapshot_stage_meta.st_dev, snapshot_stage_meta.st_ino)
+                lock_receipt.update({
+                    "snapshotLockStageName": snapshot_stage_name,
+                    "snapshotLockStageDev": snapshot_stage_meta.st_dev,
+                    "snapshotLockStageIno": snapshot_stage_meta.st_ino,
+                    "snapshotLockPublished": False,
+                })
+                checkpoint({
+                    "snapshotLockStageName": snapshot_stage_name,
+                    "snapshotLockStageDev": snapshot_stage_meta.st_dev,
+                    "snapshotLockStageIno": snapshot_stage_meta.st_ino,
+                    "snapshotLockPublished": False,
+                })
+                lock_receipt["snapshotLockPersisted"] = True
+                os.fsync(snapshot_stage_fd)
+                os.fsync(snapshot_root_fd)
+                while snapshot_fd is None:
+                    try:
+                        _rename_noreplace_at(
+                            snapshot_root_fd, snapshot_stage_name,
+                            snapshot_root_fd, ".snapshot-run.lock",
+                        )
+                    except FileExistsError:
+                        try:
+                            existing_fd = os.open(
+                                ".snapshot-run.lock", os.O_RDWR | os.O_NOFOLLOW,
+                                dir_fd=snapshot_root_fd,
+                            )
+                        except FileNotFoundError:
+                            if time.monotonic() >= deadline:
+                                raise RuntimeError(
+                                    "Qwen snapshot lock namespace did not stabilize before the bounded deadline"
+                                )
+                            time.sleep(min(
+                                max(0.01, poll_seconds),
+                                max(0.01, deadline - time.monotonic()),
+                            ))
+                            continue
+                        snapshot_fd = existing_fd
+                        existing_meta = os.fstat(snapshot_fd)
+                        self._validate_snapshot_lock(existing_meta)
+                        self._quarantine_checkpointed_path(
+                            lock_receipt,
+                            receipt_prefix="snapshotLock",
+                            parent_fd=snapshot_root_fd,
+                            name=snapshot_stage_name,
+                            expected_identity=snapshot_identity,
+                            directory=False,
+                            checkpoint=checkpoint,
+                        )
+                        os.close(snapshot_stage_fd)
+                        snapshot_stage_fd = None
+                        snapshot_identity = (existing_meta.st_dev, existing_meta.st_ino)
+                        snapshot_lock_created = False
+                    else:
+                        os.fsync(snapshot_root_fd)
+                        snapshot_fd = snapshot_stage_fd
+                        snapshot_stage_fd = None
+                        snapshot_lock_created = True
+                        snapshot_published = True
+                    break
+            else:
                 snapshot_lock_created = False
             snapshot_meta = os.fstat(snapshot_fd)
-            if not stat.S_ISREG(snapshot_meta.st_mode) or snapshot_meta.st_uid != os.getuid() \
-                    or snapshot_meta.st_nlink != 1 or snapshot_meta.st_mode & 0o077:
-                raise RuntimeError("Qwen snapshot run lock is unsafe")
+            self._validate_snapshot_lock(snapshot_meta)
             snapshot_identity = (snapshot_meta.st_dev, snapshot_meta.st_ino)
             lock_receipt.update({
                 "snapshotLockCreated": snapshot_lock_created,
@@ -1510,21 +2158,14 @@ class IntegrationManager:
                 "snapshotLockIno": snapshot_meta.st_ino,
             })
             if snapshot_lock_created:
-                os.fsync(snapshot_fd)
-                snapshot_root_fd = os.open(
-                    snapshot_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                )
-                try:
-                    os.fsync(snapshot_root_fd)
-                finally:
-                    os.close(snapshot_root_fd)
-            if checkpoint is not None:
-                checkpoint({
-                    "snapshotLockCreated": snapshot_lock_created,
-                    "snapshotLockDev": snapshot_meta.st_dev,
-                    "snapshotLockIno": snapshot_meta.st_ino,
-                })
-                lock_receipt["snapshotLockPersisted"] = True
+                lock_receipt["snapshotLockPublished"] = True
+            checkpoint({
+                "snapshotLockCreated": snapshot_lock_created,
+                "snapshotLockDev": snapshot_meta.st_dev,
+                "snapshotLockIno": snapshot_meta.st_ino,
+                **({"snapshotLockPublished": True} if snapshot_lock_created else {}),
+            })
+            lock_receipt["snapshotLockPersisted"] = True
             while not snapshot_locked:
                 try:
                     fcntl.flock(snapshot_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1535,32 +2176,71 @@ class IntegrationManager:
                     time.sleep(min(max(0.01, poll_seconds), max(0.01, deadline - time.monotonic())))
             yield lock_receipt
         finally:
+            cleanup_errors: list[Exception] = []
+
+            def cleanup(action: Callable[[], Any]) -> None:
+                try:
+                    action()
+                except Exception as error:
+                    cleanup_errors.append(error)
+
             if snapshot_fd is not None:
-                try:
-                    if snapshot_locked:
-                        fcntl.flock(snapshot_fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(snapshot_fd)
-            if snapshot_lock_created \
-                    and lock_receipt.get("snapshotLockPersisted") is not True \
-                    and lock_receipt.get("persisted") is not True \
-                    and snapshot_identity is not None:
-                try:
-                    metadata = snapshot_lock.lstat()
-                    if (metadata.st_dev, metadata.st_ino) != snapshot_identity \
-                            or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                        raise RuntimeError("Qwen snapshot quiescence lock identity changed")
-                    snapshot_lock.unlink()
-                except FileNotFoundError:
-                    pass
+                if snapshot_locked:
+                    cleanup(lambda: fcntl.flock(snapshot_fd, fcntl.LOCK_UN))
+                cleanup(lambda: os.close(snapshot_fd))
+            if snapshot_root_fd is not None:
+                if snapshot_stage_fd is not None and snapshot_stage_name is not None \
+                        and snapshot_identity is not None:
+                    cleanup(lambda: self._quarantine_checkpointed_path(
+                        lock_receipt,
+                        receipt_prefix="snapshotLock",
+                        parent_fd=snapshot_root_fd,
+                        name=snapshot_stage_name,
+                        expected_identity=snapshot_identity,
+                        directory=False,
+                        checkpoint=checkpoint,
+                    ))
+                elif snapshot_published and snapshot_lock_created \
+                        and lock_receipt.get("snapshotLockPersisted") is not True \
+                        and snapshot_identity is not None:
+                    cleanup(lambda: self._quarantine_checkpointed_path(
+                        lock_receipt,
+                        receipt_prefix="snapshotLock",
+                        parent_fd=snapshot_root_fd,
+                        name=".snapshot-run.lock",
+                        expected_identity=snapshot_identity,
+                        directory=False,
+                        checkpoint=checkpoint,
+                    ))
+            if snapshot_stage_fd is not None:
+                cleanup(lambda: os.close(snapshot_stage_fd))
+            if snapshot_root_fd is not None:
+                cleanup(lambda: os.close(snapshot_root_fd))
             if index_identity is not None:
-                try:
-                    metadata = index_lock.lstat()
-                    if (metadata.st_dev, metadata.st_ino) != index_identity or not stat.S_ISDIR(metadata.st_mode):
-                        raise RuntimeError("Qwen index quiescence lock identity changed")
-                    os.rmdir(index_lock)
-                except FileNotFoundError as error:
-                    raise RuntimeError("Qwen index quiescence lock disappeared") from error
+                lock_name = "index.lock" if index_published else index_stage_name
+                removed: list[bool] = []
+
+                def quarantine_index() -> None:
+                    removed.append(self._quarantine_checkpointed_path(
+                        lock_receipt,
+                        receipt_prefix="indexLock",
+                        parent_fd=data_fd,
+                        name=lock_name,
+                        expected_identity=index_identity,
+                        directory=True,
+                        checkpoint=checkpoint,
+                    ))
+
+                cleanup(quarantine_index)
+                if index_published and removed == [False]:
+                    cleanup_errors.append(RuntimeError("Qwen index quiescence lock disappeared"))
+            if index_stage_fd is not None:
+                cleanup(lambda: os.close(index_stage_fd))
+            cleanup(lambda: os.close(data_fd))
+            if cleanup_errors:
+                raise RuntimeError(
+                    f"Qwen runtime quiescence cleanup was incomplete ({len(cleanup_errors)} errors)"
+                ) from cleanup_errors[0]
 
     @staticmethod
     def _job_id_from_add(payload: Any) -> str:
@@ -2457,18 +3137,49 @@ class IntegrationManager:
             transaction["disabledGeminiJobs"] = planned_gemini_disables
             transaction["ownership"] = self._ownership_payload()
             transaction["runtimePort"] = int(runtime_manifest["runtimePort"])
-            transaction["snapshotRootCreated"] = not self.snapshot_root.exists()
-            transaction["projectCreated"] = not transaction.get("projectExisted", False)
+            transaction["snapshotRootCreatePlanned"] = not self.snapshot_root.exists()
+            transaction["snapshotRootCreated"] = False
+            transaction["projectCreatePlanned"] = not transaction.get("projectExisted", False)
+            transaction["projectCreated"] = False
             transaction["phase"] = "preflight_complete"
             self.store.write(transaction)
+            project_probe_target = (
+                self.paths.project_root
+                if transaction.get("projectExisted") is True
+                else self.paths.project_root.parent
+            )
+            snapshot_probe_target = (
+                self.snapshot_root
+                if transaction["snapshotRootCreatePlanned"] is False
+                else self.snapshot_root.parent
+            )
+            project_probe_parent = self._nearest_existing_capability_parent(
+                project_probe_target
+            )
+            snapshot_probe_parent = self._nearest_existing_capability_parent(
+                snapshot_probe_target
+            )
+            self._probe_atomic_publication_capability(
+                transaction,
+                parent=project_probe_parent,
+                receipt_prefix="projectParentCapabilityProbe",
+            )
+            if Path(os.path.abspath(snapshot_probe_parent)) != Path(
+                os.path.abspath(project_probe_parent)
+            ):
+                self._probe_atomic_publication_capability(
+                    transaction,
+                    parent=snapshot_probe_parent,
+                    receipt_prefix="snapshotParentCapabilityProbe",
+                )
             transaction["cronMutationStarted"] = True
             transaction["phase"] = "quiescing"
             self.store.write(transaction)
             transaction["quiescedCronIds"] = self._quiesce_prior_jobs(
                 jobs_before, target_ids, inventory_hashes_before,
             )
-            created_snapshot_root = self._prepare_snapshot_root()
-            if created_snapshot_root != transaction["snapshotRootCreated"]:
+            created_snapshot_root = self._prepare_snapshot_root(transaction)
+            if created_snapshot_root != transaction["snapshotRootCreatePlanned"]:
                 raise RuntimeError("Snapshot root identity changed during integration preflight")
             transaction["phase"] = "quiesced"
             self.store.write(transaction)
@@ -2476,7 +3187,11 @@ class IntegrationManager:
             def checkpoint_quiescence_lock(lock_receipt: dict[str, Any]) -> None:
                 for key, value in lock_receipt.items():
                     if key in transaction and transaction[key] != value:
-                        raise RuntimeError("Quiescence lock receipt attempted to change identity")
+                        if key in {"indexLockPublished", "snapshotLockPublished"} \
+                                and transaction[key] is False and value is True:
+                            pass
+                        else:
+                            raise RuntimeError("Quiescence lock receipt attempted to change identity")
                     transaction[key] = value
                 self.store.write(transaction)
 
@@ -2494,10 +3209,20 @@ class IntegrationManager:
                 transaction["runtimeMutationStarted"] = True
                 transaction["phase"] = "staging"
                 self.store.write(transaction)
+                if transaction["projectCreatePlanned"]:
+                    self._prepare_project_root(transaction)
                 actual_project_created = self.bootstrap_project(runtime_manifest)
-                if actual_project_created != transaction["projectCreated"] and not transaction.get("projectExisted"):
+                if actual_project_created != transaction["projectCreated"]:
                     raise RuntimeError("Qwen project creation state changed during integration")
-                transaction["projectCreated"] = actual_project_created
+                transaction["projectBootstrapped"] = actual_project_created
+                if transaction["projectCreated"]:
+                    project_meta = self.paths.project_root.lstat()
+                    if not stat.S_ISDIR(project_meta.st_mode) or project_meta.st_uid != os.getuid() \
+                            or project_meta.st_mode & 0o077 \
+                            or (project_meta.st_dev, project_meta.st_ino) != (
+                                transaction["projectRootDev"], transaction["projectRootIno"],
+                            ):
+                        raise RuntimeError("Fresh Qwen project identity changed during bootstrap")
                 if not actual_project_created:
                     self.synchronize_project_runtime()
                 self.store.write(transaction)
@@ -2702,7 +3427,9 @@ class IntegrationManager:
 
     def _snapshot_root_from_transaction(self, transaction: dict[str, Any]) -> Path:
         if transaction.get("contractVersion") != INTEGRATION_CONTRACT_VERSION:
-            return self.snapshot_root
+            raise RuntimeError(
+                "Legacy rollback receipt lacks exact snapshot-root ownership"
+            )
         ownership = transaction.get("ownership")
         if not isinstance(ownership, dict) or ownership.get("schema") != OWNERSHIP_SCHEMA:
             raise RuntimeError("Rollback snapshot ownership is missing or malformed")
@@ -2723,13 +3450,229 @@ class IntegrationManager:
             raise RuntimeError("Rollback snapshot root is inside the live Qwen project")
         return root
 
+    def _project_root_from_transaction(self, transaction: dict[str, Any]) -> Path:
+        if transaction.get("contractVersion") != INTEGRATION_CONTRACT_VERSION:
+            raise RuntimeError(
+                "Legacy rollback receipt lacks exact project-root ownership"
+            )
+        ownership = transaction.get("ownership")
+        if not isinstance(ownership, dict) or ownership.get("schema") != OWNERSHIP_SCHEMA:
+            raise RuntimeError("Rollback project ownership is missing or malformed")
+        stored = ownership.get("projectRoot")
+        if not isinstance(stored, str) or not stored:
+            raise RuntimeError("Rollback project ownership is missing or malformed")
+        raw = Path(stored).expanduser()
+        if not raw.is_absolute():
+            raise RuntimeError("Rollback project ownership must be absolute")
+        root = Path(os.path.abspath(raw))
+        _assert_no_symlink_components(root)
+        _assert_specific_child(root, self.paths.workspace, "rollback project root")
+        if root != self.paths.project_root:
+            raise RuntimeError("Rollback project root does not match transaction ownership")
+        return root
+
+    @staticmethod
+    def _legacy_unverified_created_root(
+        transaction: dict[str, Any], *, prefix: str, planned_key: str, created_key: str,
+    ) -> bool:
+        if transaction.get("contractVersion") != INTEGRATION_CONTRACT_VERSION \
+                or transaction.get(created_key) is not True:
+            return False
+        fields = (
+            planned_key,
+            f"{prefix}StageName",
+            f"{prefix}StageDev",
+            f"{prefix}StageIno",
+            f"{prefix}Published",
+            f"{prefix}Dev",
+            f"{prefix}Ino",
+        )
+        return all(field not in transaction for field in fields)
+
+    def _remove_staged_runtime_lock(
+        self, transaction: dict[str, Any], *, prefix: str, parent: Path,
+        final_name: str, stage_pattern: re.Pattern[str], directory: bool,
+    ) -> bool:
+        stage_name = transaction.get(f"{prefix}StageName")
+        stage_dev = transaction.get(f"{prefix}StageDev")
+        stage_ino = transaction.get(f"{prefix}StageIno")
+        published = transaction.get(f"{prefix}Published")
+        fields = (stage_name, stage_dev, stage_ino, published)
+        if all(value is None for value in fields):
+            return False
+        if not isinstance(stage_name, str) or stage_pattern.fullmatch(stage_name) is None \
+                or type(stage_dev) is not int or type(stage_ino) is not int \
+                or type(published) is not bool:
+            raise RuntimeError("Staged runtime lock receipt is missing or malformed")
+        if not os.path.lexists(parent):
+            return True
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        expected = (stage_dev, stage_ino)
+        try:
+            parent_meta = os.fstat(parent_fd)
+            if not stat.S_ISDIR(parent_meta.st_mode) or parent_meta.st_uid != os.getuid() \
+                    or parent_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise RuntimeError("Runtime lock parent is unsafe during rollback")
+
+            def metadata_for(name: str) -> os.stat_result | None:
+                try:
+                    return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return None
+
+            stage_meta = metadata_for(stage_name)
+            final_meta = metadata_for(final_name)
+            if stage_meta is not None:
+                if directory:
+                    self._validate_index_lock(stage_meta)
+                else:
+                    self._validate_snapshot_lock(stage_meta)
+                if (stage_meta.st_dev, stage_meta.st_ino) != expected:
+                    raise RuntimeError("Staged runtime lock changed before rollback")
+                if final_meta is not None:
+                    raise RuntimeError("Staged runtime lock collided with the final path")
+                self._quarantine_transaction_path(
+                    transaction,
+                    receipt_prefix=prefix,
+                    parent_fd=parent_fd,
+                    name=stage_name,
+                    expected_identity=expected,
+                    directory=directory,
+                )
+                return True
+            if final_meta is not None and (final_meta.st_dev, final_meta.st_ino) == expected:
+                self._quarantine_transaction_path(
+                    transaction,
+                    receipt_prefix=prefix,
+                    parent_fd=parent_fd,
+                    name=final_name,
+                    expected_identity=expected,
+                    directory=directory,
+                )
+                return True
+            if published is True or transaction.get(f"{prefix}Created") is True:
+                if final_meta is not None:
+                    raise RuntimeError("Published runtime lock changed before rollback")
+            return True
+        finally:
+            os.close(parent_fd)
+
+    def _quarantine_staged_root(
+        self, transaction: dict[str, Any], *, prefix: str, created_key: str,
+        parent: Path, final_name: str, stage_pattern: re.Pattern[str],
+    ) -> bool:
+        stage_name = transaction.get(f"{prefix}StageName")
+        stage_dev = transaction.get(f"{prefix}StageDev")
+        stage_ino = transaction.get(f"{prefix}StageIno")
+        published = transaction.get(f"{prefix}Published")
+        fields = (stage_name, stage_dev, stage_ino, published)
+        if all(value is None for value in fields):
+            return False
+        if not isinstance(stage_name, str) or stage_pattern.fullmatch(stage_name) is None \
+                or type(stage_dev) is not int or type(stage_ino) is not int \
+                or type(published) is not bool:
+            raise RuntimeError("Staged managed root receipt is missing or malformed")
+        if not os.path.lexists(parent):
+            return True
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        expected = (stage_dev, stage_ino)
+        try:
+            self._validate_private_directory(os.fstat(parent_fd))
+
+            def metadata_for(name: str) -> os.stat_result | None:
+                try:
+                    return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return None
+
+            stage_meta = metadata_for(stage_name)
+            final_meta = metadata_for(final_name)
+            if stage_meta is not None:
+                self._validate_restricted_directory(stage_meta)
+                if (stage_meta.st_dev, stage_meta.st_ino) != expected:
+                    raise RuntimeError("Staged managed root changed before rollback")
+                if final_meta is not None:
+                    raise RuntimeError("Staged managed root collided with the final path")
+                self._quarantine_transaction_path(
+                    transaction,
+                    receipt_prefix=prefix,
+                    parent_fd=parent_fd,
+                    name=stage_name,
+                    expected_identity=expected,
+                    directory=True,
+                )
+                return True
+            if transaction.get(created_key) is True:
+                return True
+            if final_meta is not None and (final_meta.st_dev, final_meta.st_ino) == expected:
+                self._quarantine_transaction_path(
+                    transaction,
+                    receipt_prefix=prefix,
+                    parent_fd=parent_fd,
+                    name=final_name,
+                    expected_identity=expected,
+                    directory=True,
+                )
+                return True
+            if final_meta is not None:
+                raise RuntimeError("Published managed root changed before rollback")
+            return True
+        finally:
+            os.close(parent_fd)
+
     def _remove_created_snapshot_artifacts(self, transaction: dict[str, Any]) -> None:
-        if transaction.get("indexLockCreated") is True:
+        project_root = self._project_root_from_transaction(transaction)
+        project_probe_target = (
+            project_root if transaction.get("projectExisted") is True else project_root.parent
+        )
+        snapshot_root = self._snapshot_root_from_transaction(transaction)
+        snapshot_probe_target = (
+            snapshot_root
+            if transaction.get("snapshotRootCreatePlanned") is False
+            else snapshot_root.parent
+        )
+        project_probe_parent = self._capability_parent_from_transaction(
+            transaction,
+            receipt_prefix="projectParentCapabilityProbe",
+            target_parent=project_probe_target,
+        )
+        snapshot_probe_parent = self._capability_parent_from_transaction(
+            transaction,
+            receipt_prefix="snapshotParentCapabilityProbe",
+            target_parent=snapshot_probe_target,
+        )
+        self._recover_capability_probe(
+            transaction,
+            receipt_prefix="projectParentCapabilityProbe",
+            expected_parent=project_probe_parent,
+        )
+        self._recover_capability_probe(
+            transaction,
+            receipt_prefix="snapshotParentCapabilityProbe",
+            expected_parent=snapshot_probe_parent,
+        )
+        self._quarantine_staged_root(
+            transaction,
+            prefix="projectRoot",
+            created_key="projectCreated",
+            parent=project_root.parent,
+            final_name=project_root.name,
+            stage_pattern=PROJECT_ROOT_STAGE_RE,
+        )
+        index_staged = self._remove_staged_runtime_lock(
+            transaction,
+            prefix="indexLock",
+            parent=project_root / "data",
+            final_name="index.lock",
+            stage_pattern=INDEX_LOCK_STAGE_RE,
+            directory=True,
+        )
+        if not index_staged and transaction.get("indexLockCreated") is True:
             expected_dev = transaction.get("indexLockDev")
             expected_ino = transaction.get("indexLockIno")
             if type(expected_dev) is not int or type(expected_ino) is not int:
                 raise RuntimeError("Created index lock identity is missing")
-            data = self.paths.project_root / "data"
+            data = project_root / "data"
             data_fd: int | None = None
             try:
                 data_fd = os.open(data, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -2746,71 +3689,113 @@ class IntegrationManager:
                             or not stat.S_ISDIR(lock_meta.st_mode) or lock_meta.st_uid != os.getuid() \
                             or lock_meta.st_mode & 0o077:
                         raise RuntimeError("Created index lock changed before rollback")
-                    os.rmdir("index.lock", dir_fd=data_fd)
-                    os.fsync(data_fd)
-                    try:
-                        os.stat("index.lock", dir_fd=data_fd, follow_symlinks=False)
-                    except FileNotFoundError:
-                        pass
-                    else:
-                        raise RuntimeError("Created index lock remained after rollback")
+                    self._quarantine_transaction_path(
+                        transaction,
+                        receipt_prefix="indexLock",
+                        parent_fd=data_fd,
+                        name="index.lock",
+                        expected_identity=(expected_dev, expected_ino),
+                        directory=True,
+                    )
             except OSError as error:
                 raise RuntimeError("Created index lock could not be safely removed") from error
             finally:
                 if data_fd is not None:
                     os.close(data_fd)
 
-        root = self._snapshot_root_from_transaction(transaction)
-        if transaction.get("snapshotLockCreated") is True:
+        root = snapshot_root
+        snapshot_staged = self._remove_staged_runtime_lock(
+            transaction,
+            prefix="snapshotLock",
+            parent=root,
+            final_name=".snapshot-run.lock",
+            stage_pattern=SNAPSHOT_LOCK_STAGE_RE,
+            directory=False,
+        )
+        if not snapshot_staged and transaction.get("snapshotLockCreated") is True:
             expected_dev = transaction.get("snapshotLockDev")
             expected_ino = transaction.get("snapshotLockIno")
             if type(expected_dev) is not int or type(expected_ino) is not int:
                 raise RuntimeError("Created snapshot lock identity is missing")
-            root_fd: int | None = None
-            try:
-                root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-                root_meta = os.fstat(root_fd)
-                if not stat.S_ISDIR(root_meta.st_mode) or root_meta.st_uid != os.getuid() \
-                        or root_meta.st_mode & 0o077:
-                    raise RuntimeError("Created snapshot root is unsafe during rollback")
+            if not os.path.lexists(root):
+                if transaction.get("snapshotRootCreated") is True:
+                    root = self._snapshot_root_from_transaction(transaction)
+                else:
+                    raise RuntimeError("Pre-existing snapshot root disappeared before rollback")
+            else:
+                root_fd: int | None = None
                 try:
-                    lock_meta = os.stat(
-                        ".snapshot-run.lock", dir_fd=root_fd, follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    lock_meta = None
-                if lock_meta is not None:
-                    if (lock_meta.st_dev, lock_meta.st_ino) != (expected_dev, expected_ino) \
-                            or not stat.S_ISREG(lock_meta.st_mode) or lock_meta.st_nlink != 1 \
-                            or lock_meta.st_uid != os.getuid() or lock_meta.st_mode & 0o077 \
-                            or lock_meta.st_size != 0:
-                        raise RuntimeError("Created snapshot lock changed before rollback")
-                    os.unlink(".snapshot-run.lock", dir_fd=root_fd)
-                    os.fsync(root_fd)
+                    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    root_meta = os.fstat(root_fd)
+                    if not stat.S_ISDIR(root_meta.st_mode) or root_meta.st_uid != os.getuid() \
+                            or root_meta.st_mode & 0o077:
+                        raise RuntimeError("Created snapshot root is unsafe during rollback")
                     try:
-                        os.stat(".snapshot-run.lock", dir_fd=root_fd, follow_symlinks=False)
+                        lock_meta = os.stat(
+                            ".snapshot-run.lock", dir_fd=root_fd, follow_symlinks=False,
+                        )
                     except FileNotFoundError:
-                        pass
-                    else:
-                        raise RuntimeError("Created snapshot lock remained after rollback")
-            except OSError as error:
-                raise RuntimeError("Created snapshot lock could not be safely removed") from error
-            finally:
-                if root_fd is not None:
-                    os.close(root_fd)
+                        lock_meta = None
+                    if lock_meta is not None:
+                        if (lock_meta.st_dev, lock_meta.st_ino) != (expected_dev, expected_ino) \
+                                or not stat.S_ISREG(lock_meta.st_mode) or lock_meta.st_nlink != 1 \
+                                or lock_meta.st_uid != os.getuid() or lock_meta.st_mode & 0o077 \
+                                or lock_meta.st_size != 0:
+                            raise RuntimeError("Created snapshot lock changed before rollback")
+                        self._quarantine_transaction_path(
+                            transaction,
+                            receipt_prefix="snapshotLock",
+                            parent_fd=root_fd,
+                            name=".snapshot-run.lock",
+                            expected_identity=(expected_dev, expected_ino),
+                            directory=False,
+                        )
+                except OSError as error:
+                    raise RuntimeError("Created snapshot lock could not be safely removed") from error
+                finally:
+                    if root_fd is not None:
+                        os.close(root_fd)
+        self._quarantine_staged_root(
+            transaction,
+            prefix="snapshotRoot",
+            created_key="snapshotRootCreated",
+            parent=root.parent,
+            final_name=root.name,
+            stage_pattern=SNAPSHOT_ROOT_STAGE_RE,
+        )
         if transaction.get("snapshotRootCreated") is True:
-            if root.is_symlink() or not root.is_dir():
-                raise RuntimeError("Created snapshot root changed before rollback")
-            metadata = root.lstat()
-            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() \
-                    or metadata.st_mode & 0o077:
-                raise RuntimeError("Created snapshot root is unsafe during rollback")
-            try:
-                root.rmdir()
-            except OSError as error:
-                raise RuntimeError("Created snapshot root is not empty during rollback") from error
-            if os.path.lexists(root):
-                raise RuntimeError("Created snapshot root remained after rollback")
+            if not os.path.lexists(root):
+                return
+            expected_dev = transaction.get("snapshotRootDev")
+            expected_ino = transaction.get("snapshotRootIno")
+            if type(expected_dev) is not int or type(expected_ino) is not int:
+                if self._legacy_unverified_created_root(
+                    transaction,
+                    prefix="snapshotRoot",
+                    planned_key="snapshotRootCreatePlanned",
+                    created_key="snapshotRootCreated",
+                ):
+                    transaction["legacyUnverifiedSnapshotRootPreserved"] = True
+                    self.store.write(transaction)
+                    return
+                raise RuntimeError("Created snapshot root identity is missing")
+            with self._open_private_directory(root.parent) as parent_fd:
+                try:
+                    metadata = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return
+                if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() \
+                        or metadata.st_mode & 0o077 \
+                        or (metadata.st_dev, metadata.st_ino) != (expected_dev, expected_ino):
+                    raise RuntimeError("Created snapshot root is unsafe during rollback")
+                self._quarantine_transaction_path(
+                    transaction,
+                    receipt_prefix="snapshotRoot",
+                    parent_fd=parent_fd,
+                    name=root.name,
+                    expected_identity=(expected_dev, expected_ino),
+                    directory=True,
+                )
 
     def _restore_plugin_from_snapshot(
         self, transaction: dict[str, Any], *, snapshot_path: Path,
@@ -2848,6 +3833,7 @@ class IntegrationManager:
     def _rollback_locked(self, *, require_exact_post_config: bool = True) -> dict[str, Any]:
         transaction = self.store.read()
         self._snapshot_root_from_transaction(transaction)
+        project_root = self._project_root_from_transaction(transaction)
         config = Path(transaction["configPath"])
         run_dev = transaction.get("snapshotRunDev")
         run_ino = transaction.get("snapshotRunIno")
@@ -2919,7 +3905,7 @@ class IntegrationManager:
             project_backup = Path(transaction["projectBackupPath"])
             if transaction.get("projectExisted"):
                 for relative in (Path("src"), Path("scripts"), Path("package.json"), Path("package-lock.json")):
-                    target = self.paths.project_root / relative
+                    target = project_root / relative
                     if target.is_symlink():
                         raise RuntimeError("Qwen project runtime became a symbolic link; refusing rollback")
                     if target.exists():
@@ -2928,9 +3914,36 @@ class IntegrationManager:
                     if source.exists():
                         shutil.copytree(source, target) if source.is_dir() else shutil.copy2(source, target)
             elif transaction.get("projectCreated"):
-                if self.paths.project_root.is_symlink():
-                    raise RuntimeError("Created Qwen project became a symbolic link; refusing rollback")
-                shutil.rmtree(self.paths.project_root)
+                if not os.path.lexists(project_root):
+                    pass
+                else:
+                    expected_dev = transaction.get("projectRootDev")
+                    expected_ino = transaction.get("projectRootIno")
+                    if type(expected_dev) is not int or type(expected_ino) is not int:
+                        if self._legacy_unverified_created_root(
+                            transaction,
+                            prefix="projectRoot",
+                            planned_key="projectCreatePlanned",
+                            created_key="projectCreated",
+                        ):
+                            transaction["legacyUnverifiedProjectRootPreserved"] = True
+                            self.store.write(transaction)
+                            expected_dev = None
+                            expected_ino = None
+                        else:
+                            raise RuntimeError("Created Qwen project identity is missing")
+                    if expected_dev is None or expected_ino is None:
+                        pass
+                    else:
+                        with self._open_private_directory(project_root.parent) as parent_fd:
+                            self._quarantine_transaction_path(
+                                transaction,
+                                receipt_prefix="projectRoot",
+                                parent_fd=parent_fd,
+                                name=project_root.name,
+                                expected_identity=(expected_dev, expected_ino),
+                                directory=True,
+                            )
             receipt_path = Path(transaction.get("healthReceiptPath", self.health_receipt_path))
             receipt_backup = Path(transaction.get(
                 "healthReceiptBackupPath", Path(transaction["configBackupPath"]).parent / "health-receipt.preinstall.json"
@@ -2985,9 +3998,35 @@ class IntegrationManager:
                 raise RuntimeError("Cron inventory changed before rollback could start")
         transaction["restoredCronIds"] = restored_cron_ids
         self._remove_created_snapshot_artifacts(transaction)
+        quarantined = [
+            resource for resource in (
+                "indexLock", "snapshotLock", "projectRoot", "snapshotRoot",
+                "projectParentCapabilityProbe", "snapshotParentCapabilityProbe",
+            )
+            if transaction.get(f"{resource}Quarantined") is True
+            and transaction.get(f"{resource}QuarantinePurged") is not True
+        ]
+        preserved = [
+            resource for resource, marker in (
+                ("projectRoot", "legacyUnverifiedProjectRootPreserved"),
+                ("snapshotRoot", "legacyUnverifiedSnapshotRootPreserved"),
+                ("projectParentCapabilityProbe", "projectParentCapabilityProbePreserved"),
+                ("snapshotParentCapabilityProbe", "snapshotParentCapabilityProbePreserved"),
+            )
+            if transaction.get(marker) is True
+        ]
+        transaction["rollbackQuarantinedResources"] = quarantined
+        transaction["rollbackPreservedResources"] = preserved
+        transaction["rollbackOutcome"] = (
+            "restored_with_preserved_artifacts" if quarantined or preserved else "restored_exactly"
+        )
         transaction["phase"] = "rolled_back"
         self.store.write(transaction)
-        return {"ok": True, "status": "ROLLED_BACK"}
+        return {
+            "ok": True,
+            "status": "ROLLED_BACK",
+            "outcome": transaction["rollbackOutcome"],
+        }
 
     def uninstall(self) -> dict[str, Any]:
         result = self.rollback(require_exact_post_config=True)
