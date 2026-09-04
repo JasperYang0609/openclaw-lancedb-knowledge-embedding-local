@@ -71,6 +71,13 @@ def main() -> None:
         )
         status = json.loads(result.stdout)
         assert status["provider"] == "qwen-local" and status["installed"] is False
+        help_result = subprocess.run(
+            [sys.executable, str(installed / "scripts/qwen_local.py"), "--help"],
+            capture_output=True, text=True, check=True,
+        )
+        assert "--approve-disabled-collision-job-id" in help_result.stdout
+        assert "--approve-disabled-collision-job-sha256" in help_result.stdout
+        assert "ID-inclusive SHA-256" in help_result.stdout
         differently_compressed = tmp / "stored.skill"
         repack(OUTPUT, differently_compressed)
         assert archive_manifest(OUTPUT) == archive_manifest(differently_compressed)

@@ -17,6 +17,7 @@ from src.installer.downloader import ArtifactDownloader
 from src.installer.qwen_installer import DEFAULT_TARGET, QwenInstaller
 from src.lifecycle.llama_server_manager import LlamaServerManager
 from src.openclaw_integration.core import (
+    ApprovedDisabledCronCollision,
     IntegrationManager,
     IntegrationPaths,
     IntegrationRollbackIncomplete,
@@ -91,18 +92,28 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--timezone", default="Asia/Taipei")
     root.add_argument("--legacy-snapshot-job-id", default="")
     root.add_argument("--legacy-snapshot-job-sha256", default="")
+    root.add_argument(
+        "--approve-disabled-collision-job-id", default="",
+        help=(
+            "Exact disabled legacy cron job ID printed by the fail-closed collision "
+            "diagnostic; requires the SHA-256 and role options"
+        ),
+    )
+    root.add_argument(
+        "--approve-disabled-collision-job-sha256", default="",
+        help=(
+            "ID-inclusive SHA-256 of the complete normalized cron contract printed by "
+            "the current-version collision diagnostic"
+        ),
+    )
+    root.add_argument(
+        "--approve-disabled-collision-role", choices=("incremental",), default="",
+        help="Exact approved collision role; only incremental is supported",
+    )
     return root
 
 
-def resolve_report_target(args: argparse.Namespace, state_root: Path) -> tuple[str, str | None, str]:
-    report_channel = str(getattr(args, "report_channel", "") or "")
-    report_to = str(getattr(args, "report_to", "") or "")
-    report_account_id = str(getattr(args, "report_account_id", "default") or "default")
-    if bool(report_channel) != bool(report_to):
-        raise RuntimeError("Failure alerts require both --report-channel and --report-to")
-    if report_channel and report_to:
-        return report_channel, report_to, report_account_id
-
+def load_stored_transaction(state_root: Path) -> dict | None:
     manifest = state_root / "transaction.json"
     if manifest.exists() or manifest.is_symlink():
         if manifest.is_symlink() or not manifest.is_file():
@@ -116,13 +127,43 @@ def resolve_report_target(args: argparse.Namespace, state_root: Path) -> tuple[s
             raise RuntimeError("Stored integration ownership receipt is malformed") from error
         ownership = payload.get("ownership") if isinstance(payload, dict) else None
         if isinstance(ownership, dict) and ownership.get("schema") == "qwen-local-openclaw.v2":
-            stored_channel = ownership.get("reportChannel")
-            stored_to = ownership.get("reportTo")
-            stored_account = ownership.get("reportAccountId", "default")
-            if isinstance(stored_channel, str) and stored_channel \
-                    and isinstance(stored_to, str) and stored_to \
-                    and isinstance(stored_account, str) and stored_account:
-                return stored_channel, stored_to, stored_account
+            return payload
+    return None
+
+
+def load_stored_ownership(state_root: Path) -> dict | None:
+    transaction = load_stored_transaction(state_root)
+    return transaction.get("ownership") if transaction is not None else None
+
+
+def load_committed_stored_ownership(state_root: Path) -> dict | None:
+    transaction = load_stored_transaction(state_root)
+    if transaction is None \
+            or type(transaction.get("schemaVersion")) is not int \
+            or transaction.get("schemaVersion") != 1 \
+            or transaction.get("phase") != "committed":
+        return None
+    return transaction["ownership"]
+
+
+def resolve_report_target(args: argparse.Namespace, state_root: Path) -> tuple[str, str | None, str]:
+    report_channel = str(getattr(args, "report_channel", "") or "")
+    report_to = str(getattr(args, "report_to", "") or "")
+    report_account_id = str(getattr(args, "report_account_id", "default") or "default")
+    if bool(report_channel) != bool(report_to):
+        raise RuntimeError("Failure alerts require both --report-channel and --report-to")
+    if report_channel and report_to:
+        return report_channel, report_to, report_account_id
+
+    ownership = load_stored_ownership(state_root)
+    if ownership is not None:
+        stored_channel = ownership.get("reportChannel")
+        stored_to = ownership.get("reportTo")
+        stored_account = ownership.get("reportAccountId", "default")
+        if isinstance(stored_channel, str) and stored_channel \
+                and isinstance(stored_to, str) and stored_to \
+                and isinstance(stored_account, str) and stored_account:
+            return stored_channel, stored_to, stored_account
 
     if getattr(args, "command", "integrate-openclaw") in {
         "rollback-openclaw", "uninstall-openclaw", "start", "stop",
@@ -131,6 +172,43 @@ def resolve_report_target(args: argparse.Namespace, state_root: Path) -> tuple[s
     raise RuntimeError(
         "Explicit --report-channel and --report-to are required for fresh integration or verification"
     )
+
+
+def resolve_disabled_collision_approval(
+    args: argparse.Namespace, state_root: Path,
+) -> ApprovedDisabledCronCollision | None:
+    if getattr(args, "command", "") not in {"integrate-openclaw", "verify-openclaw"}:
+        return None
+    job_id = str(getattr(args, "approve_disabled_collision_job_id", "") or "")
+    contract_sha256 = str(
+        getattr(args, "approve_disabled_collision_job_sha256", "") or ""
+    )
+    role = str(getattr(args, "approve_disabled_collision_role", "") or "")
+    values = (job_id, contract_sha256, role)
+    if any(values):
+        if not all(values):
+            raise RuntimeError(
+                "Disabled collision approval requires job id, SHA-256, and role together"
+            )
+        return ApprovedDisabledCronCollision(
+            job_id=job_id, contract_sha256=contract_sha256, role=role,
+        )
+
+    ownership = load_committed_stored_ownership(state_root)
+    if ownership is None or "approvedDisabledCollision" not in ownership:
+        return None
+    stored = ownership["approvedDisabledCollision"]
+    if not isinstance(stored, dict) or set(stored) != {"jobId", "contractSha256", "role"} \
+            or any(not isinstance(stored.get(key), str) for key in stored):
+        raise RuntimeError("Stored disabled collision approval receipt is malformed")
+    try:
+        return ApprovedDisabledCronCollision(
+            job_id=stored["jobId"],
+            contract_sha256=stored["contractSha256"],
+            role=stored["role"],
+        )
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("Stored disabled collision approval receipt is malformed") from error
 
 
 def integration_manager(args: argparse.Namespace) -> IntegrationManager:
@@ -150,6 +228,7 @@ def integration_manager(args: argparse.Namespace) -> IntegrationManager:
     if not openclaw or not node:
         raise RuntimeError("OpenClaw and Node.js executables are required for integration")
     report_channel, report_to, report_account_id = resolve_report_target(args, state_root)
+    approved_collision = resolve_disabled_collision_approval(args, state_root)
     return IntegrationManager(
         paths=paths, repo_root=ROOT, cli=OpenClawCli(openclaw, profile=args.profile or None),
         node_path=Path(node), agent=args.agent,
@@ -161,6 +240,7 @@ def integration_manager(args: argparse.Namespace) -> IntegrationManager:
         timezone_name=getattr(args, "timezone", "Asia/Taipei"),
         legacy_snapshot_job_id=getattr(args, "legacy_snapshot_job_id", "") or None,
         legacy_snapshot_job_sha256=getattr(args, "legacy_snapshot_job_sha256", "") or None,
+        approved_disabled_collision=approved_collision,
     )
 
 

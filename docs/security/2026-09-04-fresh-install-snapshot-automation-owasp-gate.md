@@ -15,14 +15,16 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
   existing customer jobs, Gemini rollback assets, and alert routing.
 - Abuse cases: declaration collision, partial inventory, concurrent index/snapshot
   mutation, symlink/hardlink/special-file substitution, stale or tampered snapshot,
-  secret-bearing rollback receipt, failed restoration, and cloud fallback.
+  secret-bearing rollback receipt, forged/stale disabled-collision approval, failed
+  restoration, and cloud fallback.
 
 ## OWASP Top 10:2025 closeout
 
 - A01 Broken Access Control — `PASS`. Absolute contained roots, current-user
   ownership, exact declaration identity, unknown-job collision blocking, exact
-  operator ID plus SHA-256 migration, and no mutation of unknown jobs are covered by
-  reconciliation, path, symlink, hardlink, and rollback tests.
+  operator ID plus ID-inclusive SHA-256 migration, committed-receipt-only approval
+  reuse, and no mutation of unknown jobs are covered by reconciliation, path,
+  symlink, hardlink, transaction, and rollback tests.
 - A02 Security Misconfiguration — `PASS`. Fresh install requires explicit Discord
   provider/channel/account routing; recurring jobs require exact description,
   isolated session, fixed schedule/argv/cwd/limits, delivery `none`, first-failure
@@ -34,8 +36,10 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
   validation window and did not weaken the pinned/offline gate.
 - A04 Cryptographic Failures — `PASS`. Snapshot assets, manifests, rollback config,
   archive contents, operator-selected legacy jobs, and health receipts use SHA-256
-  or exact byte/readback checks. No credential, token, corpus, query, or vector is
-  stored in the transaction or health receipt.
+  or exact byte/readback checks. Disabled-collision approval hashes the complete
+  normalized contract including the exact job ID, preventing identity substitution.
+  No credential, token, corpus, query, vector, argv, environment, or path is stored
+  in the approval receipt.
 - A05 Injection — `PASS`. Managed work uses fixed argv and `shell=False`; cron
   definition fields, timezones, account IDs, channel IDs, paths, names, and payload
   schemas are bounded. Retrieved/model content is never used to construct commands.
@@ -49,7 +53,8 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
   and stale state creates a distinct repair snapshot. A typed rollback-incomplete
   outcome prevents the CLI from restarting a prior manual runtime into uncertain
   launchd/runtime state; restart failure after verified rollback preserves both
-  failure types.
+  failure types. The sole disabled-collision exception is a closed incremental-only
+  contract and remains unknown inventory throughout install and rollback.
 - A07 Authentication Failures — `NOT_APPLICABLE_WITH_EVIDENCE`. This change adds no
   public endpoint, login, session, or credential store. Existing authenticated
   OpenClaw control-plane access is unchanged; local ownership is covered by A01/A02.
@@ -57,7 +62,8 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
   exact file set, SHA-256, freshness, isolated restore, LanceDB open, table identity,
   row count, immutability, and retention ordering. Receipt reads use bounded
   no-follow descriptors with pre/post identity checks. Rollback verifies restored
-  owned definitions and unchanged unknown-job hashes globally.
+  owned definitions and unchanged unknown-job hashes globally, including the exact
+  approved disabled job ID and ID-inclusive hash.
 - A09 Security Logging and Alerting Failures — `PASS`. Incremental, snapshot, and
   pending initial jobs have explicit first-failure announce alerts. The component
   receipt has exact producer/declaration/freshness schemas, private permissions,
@@ -67,12 +73,15 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
 - A10 Mishandling of Exceptional Conditions — `PASS`. Tests cover incomplete cron
   inventory, active-job wait, index/snapshot lock timeout, status-write failure,
   cron remove/enable failure, unconditional rollback, stale repair generations,
-  database timeout, checksum/tamper, unsafe nodes, and failed fresh-install cleanup.
+  database timeout, checksum/tamper, unsafe nodes, failed fresh-install cleanup,
+  unapproved collisions, incomplete approvals, ID/hash/role drift, enabled toggles,
+  declaration appearance, duplicate IDs, contract tamper, non-committed approval
+  receipts, fresh/upgrade idempotence, and exact fault rollback preservation.
 
 ## Verification evidence
 
-- Python suite: final deterministic-archive closeout rerun `206 passed`.
-- Focused lock/snapshot/reconciliation/CLI suite: `105 passed`.
+- Python suite: final hotfix closeout rerun `258 passed`.
+- Focused reconciliation/CLI hotfix suite: `88 passed`.
 - Qwen template Node suite: `28 passed`.
 - OpenClaw Plugin Node suite: `5 passed`; syntax check and official Plugin validation
   passed.

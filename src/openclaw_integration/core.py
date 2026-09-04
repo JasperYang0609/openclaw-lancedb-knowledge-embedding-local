@@ -59,6 +59,7 @@ CRON_DEFINITION_FIELDS = (
 )
 DISCORD_CHANNEL_TARGET_RE = re.compile(r"^channel:[1-9][0-9]{16,21}$")
 SAFE_ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+SAFE_CRON_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SENSITIVE_KEY_MARKERS = (
     "token", "secret", "password", "credential", "apikey", "accesskey", "privatekey",
     "authorization", "bearer", "cookie", "sessioncookie",
@@ -331,6 +332,31 @@ class ManagedCronSpec:
         return args
 
 
+@dataclass(frozen=True)
+class ApprovedDisabledCronCollision:
+    """One operator-reviewed disabled legacy collision that remains customer-owned."""
+
+    job_id: str
+    contract_sha256: str
+    role: str
+
+    def __post_init__(self) -> None:
+        if type(self.job_id) is not str or not SAFE_CRON_JOB_ID_RE.fullmatch(self.job_id):
+            raise ValueError("Approved disabled collision job id is invalid")
+        if type(self.contract_sha256) is not str \
+                or not re.fullmatch(r"[0-9a-f]{64}", self.contract_sha256):
+            raise ValueError("Approved disabled collision SHA-256 is invalid")
+        if type(self.role) is not str or self.role != "incremental":
+            raise ValueError("Approved disabled collision role must be incremental")
+
+    def receipt(self) -> dict[str, str]:
+        return {
+            "jobId": self.job_id,
+            "contractSha256": self.contract_sha256,
+            "role": self.role,
+        }
+
+
 def _job_argv(job: dict[str, Any]) -> list[str]:
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     current_argv = payload.get("argv")
@@ -395,8 +421,8 @@ def _cron_jobs(payload: Any) -> list[dict[str, Any]]:
             raise RuntimeError("OpenClaw cron inventory contains an invalid job id")
         ids.append(job_id)
         key = job.get("declarationKey")
-        if key is not None:
-            if not isinstance(key, str) or not key:
+        if key not in (None, ""):
+            if not isinstance(key, str):
                 raise RuntimeError("OpenClaw cron inventory contains an invalid declaration key")
             keys.append(key)
     if len(ids) != len(set(ids)) or len(keys) != len(set(keys)):
@@ -606,6 +632,7 @@ class IntegrationManager:
                  report_to: str | None = None, timezone_name: str = "Asia/Taipei",
                  legacy_snapshot_job_id: str | None = None,
                  legacy_snapshot_job_sha256: str | None = None,
+                 approved_disabled_collision: ApprovedDisabledCronCollision | None = None,
                  report_account_id: str = "default",
                  python_path: Path | None = None) -> None:
         self.paths = paths
@@ -622,6 +649,11 @@ class IntegrationManager:
         self.timezone_name = timezone_name
         self.legacy_snapshot_job_id = legacy_snapshot_job_id
         self.legacy_snapshot_job_sha256 = legacy_snapshot_job_sha256
+        if approved_disabled_collision is not None and not isinstance(
+            approved_disabled_collision, ApprovedDisabledCronCollision,
+        ):
+            raise TypeError("Approved disabled collision must use the closed approval contract")
+        self.approved_disabled_collision = approved_disabled_collision
         self.report_account_id = report_account_id
         self.python_path = Path(python_path or sys.executable).resolve()
         self.store = TransactionStore(paths.state_root)
@@ -1124,7 +1156,7 @@ class IntegrationManager:
         return self.paths.project_root / "reports/backup-health-component.qwen-local.json"
 
     def _ownership_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "schema": OWNERSHIP_SCHEMA,
             "contractVersion": INTEGRATION_CONTRACT_VERSION,
             "snapshotContract": SNAPSHOT_CONTRACT,
@@ -1146,6 +1178,9 @@ class IntegrationManager:
             "reportTo": self.report_to,
             "reportAccountId": self.report_account_id,
         }
+        if self.approved_disabled_collision is not None:
+            payload["approvedDisabledCollision"] = self.approved_disabled_collision.receipt()
+        return payload
 
     def _prepare_snapshot_root(self) -> bool:
         existed = self.snapshot_root.exists()
@@ -1509,14 +1544,98 @@ class IntegrationManager:
             raise RuntimeError("Legacy snapshot ownership is ambiguous")
         return candidates
 
+    def _job_matches_approved_disabled_incremental_collision(
+        self, job: dict[str, Any],
+    ) -> bool:
+        script = self.paths.project_root / "scripts/knowledge_index_incremental.sh"
+        actual = _cron_contract_payload(job, include_id=False)
+        if actual.get("declarationKey") == "":
+            actual["declarationKey"] = None
+        expected = {
+            "name": "LanceDB 知識庫每日增量索引",
+            "description": None,
+            "enabled": False,
+            "declarationKey": None,
+            "schedule": {
+                "kind": "cron", "expr": "30 6 * * *", "tz": self.timezone_name,
+            },
+            "payload": {
+                "kind": "command",
+                "argv": ["sh", "-lc", str(script)],
+                "timeoutSeconds": 1800,
+            },
+            "delivery": {
+                "mode": "announce", "channel": self.report_channel, "to": self.report_to,
+            },
+            "failureAlert": None,
+            "sessionTarget": "isolated",
+            "sessionKey": None,
+            "agentId": None,
+            "deleteAfterRun": None,
+        }
+        return (
+            job.get("enabled") is False
+            and _job_targets_exact_script(job, script)
+            and actual == expected
+        )
+
+    def _approved_disabled_collision_job(
+        self, jobs: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        approval = self.approved_disabled_collision
+        if approval is None:
+            return None
+        matches = [job for job in jobs if job.get("id") == approval.job_id]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Approved disabled collision job id was not found exactly once"
+            )
+        job = matches[0]
+        if approval.role != "incremental" \
+                or not self._job_matches_approved_disabled_incremental_collision(job):
+            raise RuntimeError(
+                "Approved disabled collision is outside the exact incremental contract"
+            )
+        if _job_contract_hash(job, include_id=True) != approval.contract_sha256:
+            raise RuntimeError("Approved disabled collision fingerprint does not match")
+        return job
+
+    def _verify_approved_collision_receipt(
+        self, transaction: dict[str, Any], jobs: list[dict[str, Any]],
+    ) -> None:
+        approval = self.approved_disabled_collision
+        if approval is None:
+            return
+        ownership = transaction.get("ownership")
+        if not isinstance(ownership, dict) \
+                or ownership.get("approvedDisabledCollision") != approval.receipt():
+            raise RuntimeError("Approved disabled collision ownership receipt drifted")
+        unknown_hashes = transaction.get("cronUnknownHashesBefore")
+        if not isinstance(unknown_hashes, dict) \
+                or unknown_hashes.get(approval.job_id) != approval.contract_sha256:
+            raise RuntimeError("Approved disabled collision unknown-inventory receipt drifted")
+        current = self._approved_disabled_collision_job(jobs)
+        if current is None or _job_contract_hash(current, include_id=True) != approval.contract_sha256:
+            raise RuntimeError("Approved disabled collision readback drifted")
+
     def _preflight_cron_inventory(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         jobs = self._inventory()
         self._validate_existing_owned_jobs(jobs)
         incremental = self.paths.project_root / "scripts/knowledge_index_incremental.sh"
         snapshot_wrapper = self.paths.project_root / "scripts/run_verified_snapshot.py"
+        approved = self._approved_disabled_collision_job(jobs)
+        approved_id = str(approved["id"]) if approved is not None else None
         for job in jobs:
             key = job.get("declarationKey")
             if _job_targets_exact_script(job, incremental) and key != CRON_DECLARATION_KEY:
+                if approved_id == str(job["id"]):
+                    continue
+                if self._job_matches_approved_disabled_incremental_collision(job):
+                    raise RuntimeError(
+                        "Disabled cron collision requires explicit approval: "
+                        f"job id {job['id']}, role incremental, ID-inclusive SHA-256 "
+                        f"{_job_contract_hash(job, include_id=True)}"
+                    )
                 raise RuntimeError("Unknown cron job targets the owned incremental wrapper")
             if _job_targets_snapshot_wrapper(job, snapshot_wrapper) and key != SNAPSHOT_CRON_DECLARATION_KEY:
                 raise RuntimeError("Unknown cron job targets the owned snapshot wrapper")
@@ -2034,6 +2153,7 @@ class IntegrationManager:
         jobs, legacy = self._preflight_cron_inventory()
         if legacy:
             raise RuntimeError("Legacy snapshot declaration remains during activation")
+        self._verify_approved_collision_receipt(transaction, jobs)
         for spec in (self._incremental_spec(), self._snapshot_spec()):
             job = self._job_by_key(jobs, spec.key)
             if job is None or not _job_matches_spec(job, spec, require_enabled=True):
@@ -2058,6 +2178,7 @@ class IntegrationManager:
         jobs, legacy = self._preflight_cron_inventory()
         if legacy:
             raise RuntimeError("Legacy snapshot declaration remains after committed reconciliation")
+        self._verify_approved_collision_receipt(manifest, jobs)
         incremental = self._job_by_key(jobs, CRON_DECLARATION_KEY)
         snapshot = self._job_by_key(jobs, SNAPSHOT_CRON_DECLARATION_KEY)
         if incremental is None or not _job_matches_spec(incremental, self._incremental_spec(), require_enabled=True):

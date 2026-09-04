@@ -283,6 +283,47 @@ def gemini_job(
     }
 
 
+def approved_disabled_incremental_collision_job(
+    item: core.IntegrationManager,
+    *,
+    job_id: str = "legacy-disabled-incremental",
+    enabled: bool = False,
+    declaration_key: str | None = None,
+) -> dict[str, Any]:
+    script = item.paths.project_root / "scripts/knowledge_index_incremental.sh"
+    return {
+        "id": job_id,
+        "name": "LanceDB 知識庫每日增量索引",
+        "description": None,
+        "enabled": enabled,
+        "declarationKey": declaration_key,
+        "sessionTarget": "isolated",
+        "sessionKey": None,
+        "agentId": None,
+        "deleteAfterRun": None,
+        "schedule": {
+            "kind": "cron", "expr": "30 6 * * *", "tz": item.timezone_name,
+        },
+        "payload": {
+            "kind": "command",
+            "argv": ["sh", "-lc", str(script)],
+            "timeoutSeconds": 1800,
+        },
+        "delivery": {
+            "mode": "announce", "channel": item.report_channel, "to": item.report_to,
+        },
+        "failureAlert": None,
+    }
+
+
+def collision_approval(job: dict[str, Any]) -> core.ApprovedDisabledCronCollision:
+    return core.ApprovedDisabledCronCollision(
+        job_id=str(job["id"]),
+        contract_sha256=core._job_contract_hash(job, include_id=True),
+        role="incremental",
+    )
+
+
 def test_complete_cron_inventory_rejects_pagination_count_and_duplicate_identities() -> None:
     one = {"id": "one", "declarationKey": "key-one"}
     two = {"id": "two", "declarationKey": "key-two"}
@@ -296,6 +337,9 @@ def test_complete_cron_inventory_rejects_pagination_count_and_duplicate_identiti
         core._cron_jobs(cron_payload([one, {**two, "id": "one"}]))
     with pytest.raises(RuntimeError, match="duplicate"):
         core._cron_jobs(cron_payload([one, {**two, "declarationKey": "key-one"}]))
+
+    empty_key = {"id": "empty-key", "declarationKey": ""}
+    assert core._cron_jobs(cron_payload([empty_key])) == [empty_key]
 
 
 def test_quiescence_disables_and_waits_for_managed_and_exact_gemini_jobs(
@@ -561,6 +605,409 @@ def test_unknown_job_with_extra_argv_or_shell_still_blocks_owned_wrapper(
         item._preflight_cron_inventory()
 
     assert item.cli.jobs[0]["declarationKey"] == f"customer-{owned}"
+
+
+@pytest.mark.parametrize("declaration_key", [None, ""])
+def test_exact_operator_approved_disabled_incremental_collision_is_preserved_as_unknown(
+    tmp_path: Path, declaration_key: str | None,
+) -> None:
+    base = manager(tmp_path)
+    collision = approved_disabled_incremental_collision_job(
+        base, declaration_key=declaration_key,
+    )
+    before = core._job_contract_hash(collision, include_id=True)
+    cli = StatefulCronCli()
+    item = manager(
+        tmp_path,
+        cli,
+        approved_disabled_collision=collision_approval(collision),
+    )
+    cli.jobs = [collision]
+
+    jobs, legacy = item._preflight_cron_inventory()
+
+    assert jobs == [collision]
+    assert legacy == []
+    assert core._job_contract_hash(cli.jobs[0], include_id=True) == before
+    assert not any(call[:2] in (["cron", "rm"], ["cron", "edit"], ["cron", "disable"])
+                   for call in cli.calls)
+    assert item._ownership_payload()["approvedDisabledCollision"] == {
+        "jobId": collision["id"],
+        "contractSha256": before,
+        "role": "incremental",
+    }
+
+
+def test_unapproved_exact_disabled_collision_fails_closed_with_safe_review_identity(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    collision = approved_disabled_incremental_collision_job(item)
+    before = core._job_contract_hash(collision, include_id=True)
+    item.cli.jobs = [collision]
+
+    with pytest.raises(RuntimeError) as caught:
+        item._preflight_cron_inventory()
+
+    message = str(caught.value)
+    assert collision["id"] in message
+    assert before in message
+    assert "incremental" in message
+    assert "ID-inclusive SHA-256" in message
+    assert core._job_contract_hash(item.cli.jobs[0], include_id=True) == before
+
+
+def test_disabled_collision_approval_hash_binds_the_job_id(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    one = approved_disabled_incremental_collision_job(item, job_id="legacy-one")
+    two = {**one, "id": "legacy-two"}
+
+    assert core._job_contract_hash(one, include_id=True) != core._job_contract_hash(
+        two, include_id=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"job_id": 1, "contract_sha256": "a" * 64, "role": "incremental"},
+        {"job_id": "legacy", "contract_sha256": 1, "role": "incremental"},
+        {"job_id": "legacy", "contract_sha256": "a" * 64, "role": 1},
+    ],
+)
+def test_disabled_collision_approval_contract_rejects_non_string_fields(
+    values: dict[str, Any],
+) -> None:
+    with pytest.raises(ValueError):
+        core.ApprovedDisabledCronCollision(**values)
+
+
+@pytest.mark.parametrize(
+    ("case", "mutation"),
+    [
+        ("enabled", lambda job, item: job.update(enabled=True)),
+        ("declaration", lambda job, item: job.update(declarationKey="customer-owned")),
+        ("extra-argv", lambda job, item: job["payload"]["argv"].append("--unexpected")),
+        ("alternate-shell", lambda job, item: job["payload"]["argv"].__setitem__(0, "bash")),
+        ("cwd", lambda job, item: job["payload"].update(cwd=str(item.paths.project_root))),
+        ("env", lambda job, item: job["payload"].update(env={"SAFE": "fixture"})),
+        ("tools", lambda job, item: job["payload"].update(toolsAllow=[])),
+        ("limit", lambda job, item: job["payload"].update(timeoutSeconds=1801)),
+        ("schedule", lambda job, item: job["schedule"].update(staggerMs=0)),
+        ("delivery", lambda job, item: job["delivery"].update(accountId="default")),
+        ("alert", lambda job, item: job.update(failureAlert={})),
+        (
+            "snapshot-role",
+            lambda job, item: job["payload"].update(argv=[
+                str(Path(sys.executable)),
+                str(item.paths.project_root / "scripts/run_verified_snapshot.py"),
+                "--ownership-manifest", str(item.ownership_manifest),
+            ]),
+        ),
+    ],
+)
+def test_recomputed_hash_cannot_approve_an_unsafe_disabled_collision_contract(
+    tmp_path: Path, case: str, mutation: Any,
+) -> None:
+    case_root = tmp_path / case
+    base = manager(case_root)
+    collision = approved_disabled_incremental_collision_job(base)
+    mutation(collision, base)
+    cli = StatefulCronCli()
+    item = manager(
+        case_root,
+        cli,
+        approved_disabled_collision=collision_approval(collision),
+    )
+    cli.jobs = [collision]
+
+    with pytest.raises(RuntimeError, match="approval|collision|contract"):
+        item._preflight_cron_inventory()
+
+    assert len(cli.calls) == 1
+
+
+@pytest.mark.parametrize("fault", ["wrong-id", "wrong-hash", "wrong-role", "missing-job"])
+def test_disabled_collision_approval_requires_exact_id_hash_role_and_presence(
+    tmp_path: Path, fault: str,
+) -> None:
+    case_root = tmp_path / fault
+    base = manager(case_root)
+    collision = approved_disabled_incremental_collision_job(base)
+    approval = collision_approval(collision)
+    if fault == "wrong-id":
+        approval = core.ApprovedDisabledCronCollision(
+            job_id="different-id", contract_sha256=approval.contract_sha256, role="incremental",
+        )
+    elif fault == "wrong-hash":
+        approval = core.ApprovedDisabledCronCollision(
+            job_id=approval.job_id, contract_sha256="0" * 64, role="incremental",
+        )
+    elif fault == "wrong-role":
+        with pytest.raises(ValueError, match="incremental"):
+            core.ApprovedDisabledCronCollision(
+                job_id=approval.job_id,
+                contract_sha256=approval.contract_sha256,
+                role="snapshot",
+            )
+        return
+    cli = StatefulCronCli()
+    item = manager(case_root, cli, approved_disabled_collision=approval)
+    cli.jobs = [] if fault == "missing-job" else [collision]
+
+    with pytest.raises(RuntimeError, match="approval|fingerprint|exactly once"):
+        item._preflight_cron_inventory()
+
+
+def test_duplicate_approved_id_and_second_wrapper_collision_both_fail_closed(
+    tmp_path: Path,
+) -> None:
+    base = manager(tmp_path)
+    approved = approved_disabled_incremental_collision_job(base)
+    approval = collision_approval(approved)
+
+    duplicate = manager(
+        tmp_path / "duplicate",
+        approved_disabled_collision=approval,
+    )
+    duplicate.cli.jobs = [approved, json.loads(json.dumps(approved))]
+    with pytest.raises(RuntimeError, match="duplicate"):
+        duplicate._preflight_cron_inventory()
+
+    second_root = tmp_path / "second"
+    second_base = manager(second_root)
+    first = approved_disabled_incremental_collision_job(second_base, job_id="first")
+    second = approved_disabled_incremental_collision_job(second_base, job_id="second")
+    with_second = manager(
+        second_root,
+        approved_disabled_collision=collision_approval(first),
+    )
+    with_second.cli.jobs = [first, second]
+    with pytest.raises(RuntimeError, match="requires explicit approval"):
+        with_second._preflight_cron_inventory()
+
+
+def prepare_collision_integration_runtime(
+    item: core.IntegrationManager,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_id: str,
+) -> None:
+    config = item.paths.home / ".openclaw/openclaw.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("{}", encoding="utf-8")
+    config.chmod(0o600)
+    base = {
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "runId": run_id,
+        "phase": "prepared",
+        "ownedAssets": [],
+        "configPath": str(config),
+        "healthReceiptExisted": False,
+        "projectExisted": True,
+    }
+
+    @contextmanager
+    def guard() -> Iterator[dict[str, Any]]:
+        yield {"snapshotLockCreated": False, "persisted": False}
+
+    monkeypatch.setattr(item, "begin", lambda: dict(base))
+    monkeypatch.setattr(item, "_prepare_snapshot_root", lambda: True)
+    monkeypatch.setattr(item, "_runtime_quiescence_guard", guard)
+    monkeypatch.setattr(item, "bootstrap_project", lambda _: False)
+    monkeypatch.setattr(item, "synchronize_project_runtime", lambda: None)
+    monkeypatch.setattr(item, "_allowed_projects", lambda: [])
+    monkeypatch.setattr(item, "configure_openclaw", lambda _: None)
+    monkeypatch.setattr(item, "install_launchd_plist", lambda _: None)
+    monkeypatch.setattr(item, "activate_launchd", lambda: None)
+    monkeypatch.setattr(item, "mark_ready_or_schedule_build", lambda: ("READY", None))
+    monkeypatch.setattr(item, "_sha256_config", lambda _: "0" * 64)
+    monkeypatch.setattr(item, "_verify_local_source_map", lambda: None)
+    monkeypatch.setattr(item, "_verify_runtime_contract_files", lambda: None)
+    monkeypatch.setattr(item, "_verify_snapshot_wrapper_contract", lambda: None)
+    monkeypatch.setattr(item, "_verify_plugin_skill_gateway", lambda: (True, True, True))
+    monkeypatch.setattr(item, "_health_receipt_status", lambda: "ok")
+
+    def write_health(**_: Any) -> None:
+        item.health_receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        item.health_receipt_path.write_text("{}", encoding="utf-8")
+        item.health_receipt_path.chmod(0o600)
+
+    monkeypatch.setattr(item, "_write_health_receipt", write_health)
+
+
+@pytest.mark.parametrize(
+    ("prior_contract", "expected_action"),
+    [(None, "committed"), (1, "upgraded")],
+)
+def test_approved_disabled_collision_survives_fresh_upgrade_and_idempotent_transactions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prior_contract: int | None,
+    expected_action: str,
+) -> None:
+    case_root = tmp_path / expected_action
+    base = manager(case_root)
+    collision = approved_disabled_incremental_collision_job(base)
+    approved_hash = core._job_contract_hash(collision, include_id=True)
+    collision_before = json.loads(json.dumps(collision))
+    cli = StatefulCronCli()
+    item = manager(
+        case_root,
+        cli,
+        approved_disabled_collision=collision_approval(collision),
+    )
+    cli.jobs = [collision]
+    if prior_contract is not None:
+        item.store.write({
+            "schemaVersion": 1,
+            "contractVersion": prior_contract,
+            "runId": "prior-install",
+            "phase": "committed",
+            "ownership": {"schema": "qwen-local-openclaw.v1"},
+        })
+    prepare_collision_integration_runtime(item, monkeypatch, run_id=expected_action)
+
+    result = item._integrate_locked({"runtimePort": 18888})
+
+    assert result["transaction"] == expected_action
+    transaction = item.store.read()
+    assert transaction["phase"] == "committed"
+    assert transaction["ownership"]["approvedDisabledCollision"] == {
+        "jobId": collision["id"],
+        "contractSha256": approved_hash,
+        "role": "incremental",
+    }
+    assert transaction["cronUnknownHashesBefore"] == {collision["id"]: approved_hash}
+    assert collision["id"] not in transaction["cronTargetIdsBefore"]
+    assert all(definition.get("id") != collision["id"]
+               for definition in transaction["cronDefinitionsBefore"])
+    preserved = next(job for job in cli.jobs if job["id"] == collision["id"])
+    assert preserved == collision_before
+    assert core._job_contract_hash(preserved, include_id=True) == approved_hash
+    assert not any(
+        call[:2] in (["cron", "rm"], ["cron", "edit"], ["cron", "disable"])
+        and len(call) > 2 and call[2] == collision["id"]
+        for call in cli.calls
+    )
+
+    mutation_count = sum(
+        call[:2] in (["cron", "add"], ["cron", "rm"], ["cron", "edit"], ["cron", "disable"])
+        for call in cli.calls
+    )
+    again = item._integrate_locked({"runtimePort": 18888})
+    assert again["transaction"] == "already_current"
+    assert mutation_count == sum(
+        call[:2] in (["cron", "add"], ["cron", "rm"], ["cron", "edit"], ["cron", "disable"])
+        for call in cli.calls
+    )
+    preserved_again = next(job for job in cli.jobs if job["id"] == collision["id"])
+    assert preserved_again == collision_before
+    assert core._job_contract_hash(preserved_again, include_id=True) == approved_hash
+
+
+def test_approved_disabled_collision_fault_rollback_preserves_exact_unknown_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = manager(tmp_path)
+    collision = approved_disabled_incremental_collision_job(base)
+    approved_hash = core._job_contract_hash(collision, include_id=True)
+    collision_before = json.loads(json.dumps(collision))
+    cli = StatefulCronCli()
+    item = manager(
+        tmp_path,
+        cli,
+        approved_disabled_collision=collision_approval(collision),
+    )
+    cli.jobs = [collision]
+    config = item.paths.home / ".openclaw/openclaw.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("{}", encoding="utf-8")
+    config.chmod(0o600)
+    base_transaction = {
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "runId": "approved-collision-fault",
+        "phase": "prepared",
+        "ownedAssets": [],
+        "configPath": str(config),
+        "configBackupPath": str(item.paths.state_root / "fixture-backup"),
+        "preConfigSha256": "1" * 64,
+        "snapshotRunMarkerSha256": "2" * 64,
+        "snapshotRunDev": 1,
+        "snapshotRunIno": 2,
+        "projectExisted": True,
+        "healthReceiptExisted": False,
+    }
+    monkeypatch.setattr(item, "begin", lambda: dict(base_transaction))
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
+    real_quiesce = item._quiesce_prior_jobs
+
+    def fail_after_quiescence(
+        jobs: list[dict[str, Any]], target_ids: set[str], hashes: dict[str, str],
+    ) -> list[str]:
+        real_quiesce(jobs, target_ids, hashes)
+        raise RuntimeError("fixture fault after cron preservation check")
+
+    monkeypatch.setattr(item, "_quiesce_prior_jobs", fail_after_quiescence)
+
+    with pytest.raises(RuntimeError, match="fixture fault"):
+        item._integrate_locked({"runtimePort": 18888})
+
+    transaction = item.store.read()
+    assert transaction["phase"] == "rolled_back"
+    assert transaction["cronUnknownHashesBefore"] == {collision["id"]: approved_hash}
+    assert transaction["cronTargetIdsBefore"] == []
+    assert cli.jobs == [collision_before]
+    assert core._job_contract_hash(cli.jobs[0], include_id=True) == approved_hash
+    assert not any(
+        call[:2] in (["cron", "rm"], ["cron", "edit"], ["cron", "disable"])
+        and len(call) > 2 and call[2] == collision["id"]
+        for call in cli.calls
+    )
+
+
+def test_approved_disabled_collision_hash_drift_blocks_before_any_cron_mutation(
+    tmp_path: Path,
+) -> None:
+    base = manager(tmp_path)
+    collision = approved_disabled_incremental_collision_job(base)
+    cli = StatefulCronCli()
+    item = manager(
+        tmp_path,
+        cli,
+        approved_disabled_collision=collision_approval(collision),
+    )
+    cli.jobs = [collision]
+    jobs, _ = item._preflight_cron_inventory()
+    hashes = item._inventory_hashes(jobs)
+    collision["schedule"]["expr"] = "31 6 * * *"
+
+    with pytest.raises(RuntimeError, match="changed between preflight and quiescence"):
+        item._quiesce_prior_jobs(jobs, set(), hashes)
+
+    assert not any(
+        call[:2] in (["cron", "rm"], ["cron", "edit"], ["cron", "disable"])
+        for call in cli.calls
+    )
+
+
+def test_approved_disabled_collision_receipt_tamper_fails_closed(tmp_path: Path) -> None:
+    base = manager(tmp_path)
+    collision = approved_disabled_incremental_collision_job(base)
+    item = manager(
+        tmp_path,
+        approved_disabled_collision=collision_approval(collision),
+    )
+    transaction = {
+        "ownership": item._ownership_payload(),
+        "cronUnknownHashesBefore": {collision["id"]: "0" * 64},
+    }
+
+    with pytest.raises(RuntimeError, match="unknown-inventory receipt drifted"):
+        item._verify_approved_collision_receipt(transaction, [collision])
 
 
 def test_activation_failure_invokes_rollback_before_commit(

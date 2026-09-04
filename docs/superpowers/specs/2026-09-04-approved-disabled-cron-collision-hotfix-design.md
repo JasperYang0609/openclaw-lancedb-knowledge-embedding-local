@@ -32,12 +32,18 @@ fails closed before installer mutation.
 Only `{jobId, contractSha256, role}` may be persisted in the private ownership
 receipt. Raw argv, environment, paths, and cron payloads are not added to approval
 metadata. A subsequent CLI invocation may reuse that private stored approval; an
-explicit CLI approval overrides it only when all three values are supplied.
+explicit CLI approval overrides it only when all three values are supplied. Stored
+approval reuse additionally requires the surrounding transaction receipt to have
+exact integer `schemaVersion: 1` and exact `phase: committed`; prepared, activation
+pending, failed, rollback-failed, rolled-back, malformed, and wrong-version receipts
+never authorize a collision. Recovery commands ignore this optional approval field.
 
 ## Operator flow
 
 Without approval, preflight continues to block and reports only the safe job ID,
-role, and canonical SHA-256 needed for review. After independent review, the
+role, and canonical ID-inclusive SHA-256 needed for review. The operator must use
+the fingerprint printed by the current-version diagnostic, not an older hash made
+without the job ID. After independent review, the
 operator reruns with:
 
 - `--approve-disabled-collision-job-id`

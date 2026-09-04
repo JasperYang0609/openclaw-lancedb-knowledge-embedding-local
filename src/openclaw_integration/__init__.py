@@ -1,6 +1,7 @@
 """Transactional OpenClaw integration for the Qwen-local knowledge product."""
 
 from .core import (
+    ApprovedDisabledCronCollision,
     IntegrationManager,
     IntegrationPaths,
     IntegrationRollbackIncomplete,
@@ -9,6 +10,7 @@ from .core import (
 )
 
 __all__ = [
+    "ApprovedDisabledCronCollision",
     "IntegrationManager",
     "IntegrationPaths",
     "IntegrationRollbackIncomplete",

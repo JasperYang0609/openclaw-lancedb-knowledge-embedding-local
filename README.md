@@ -33,6 +33,19 @@ The snapshot job waits for indexing to finish, then atomically owns the same ind
 
 The transaction backs up the existing OpenClaw configuration, installed Skill, runtime contract files, health receipt, and full definitions of installer-owned jobs. It only disables exactly identified Gemini incremental jobs and preserves all Gemini indexes, caches and settings for emergency rollback. Unknown/look-alike jobs are not changed; ambiguous ownership or configuration drift fails closed. A committed older installation is reconciled in place, while reinstalling an exact current contract is a no-op. If automatic rollback is incomplete, the CLI preserves that recovery state and does not restart the prior manual runtime into a possibly active managed service; a failed restart after verified rollback is reported together with the primary integration failure.
 
+If preflight finds the one supported pre-declaration Qwen incremental job already disabled, it still blocks by default and prints only its safe job ID, role, and **ID-inclusive** normalized-contract SHA-256. After independently reviewing that exact disabled job, an operator may rerun with all three approval options together:
+
+```bash
+./qwen-local integrate-openclaw \
+  --report-channel discord \
+  --report-to channel:YOUR_MONITORING_CHANNEL \
+  --approve-disabled-collision-job-id ID_FROM_CURRENT_DIAGNOSTIC \
+  --approve-disabled-collision-job-sha256 ID_INCLUSIVE_SHA256_FROM_CURRENT_DIAGNOSTIC \
+  --approve-disabled-collision-role incremental
+```
+
+Do not reuse an older hash calculated without the job ID. The approved job remains customer-owned unknown inventory: the installer never edits, enables, disables, removes, or adopts it, and any ID, hash, enabled-state, declaration-key, role, or contract drift blocks before mutation. Only the safe ID/hash/role receipt is stored, and automatic reuse is allowed only from the private committed transaction receipt. Snapshot collisions and all other unknown jobs remain unapprovable and fail closed.
+
 By default snapshots remain in the private integration state directory. Operators can configure an absolute private root and the failure-alert destination explicitly:
 
 ```bash
