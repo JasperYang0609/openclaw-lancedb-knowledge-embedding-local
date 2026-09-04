@@ -39,6 +39,7 @@ HEALTH_RECEIPT_SCHEMA = "backup-health-component.v1"
 HEALTH_RECEIPT_MAX_AGE_SECONDS = 36 * 60 * 60
 HEALTH_RECEIPT_MAX_BYTES = 16 * 1024
 HEALTH_RECEIPT_MAX_ITEMS = 20
+LAUNCHD_RETRY_DELAYS_SECONDS = (0.25, 0.5, 1.0, 2.0, 4.0)
 FORBIDDEN_MANIFEST_KEYS = {"token", "secret", "password", "credential", "apiKey", "api_key", "query", "corpus", "vector"}
 INCREMENTAL_CRON_DESCRIPTION = "Incrementally refresh the installer-owned local Qwen knowledge index."
 SNAPSHOT_CRON_DESCRIPTION = "Create and verify the installer-owned local Qwen recovery snapshot."
@@ -659,6 +660,7 @@ class IntegrationManager:
         self.store = TransactionStore(paths.state_root)
         self.plugin_source = self.repo_root / "plugin" / PLUGIN_ID
         self.skill_source = self.repo_root / "openclaw-lancedb-knowledge-local"
+        self.plugin_target = self.paths.home / ".openclaw" / "extensions" / PLUGIN_ID
 
     def preflight(self) -> dict[str, Any]:
         self.paths.validate()
@@ -668,6 +670,10 @@ class IntegrationManager:
         for directory in (self.plugin_source, self.skill_source):
             if directory.is_symlink() or not directory.is_dir():
                 raise RuntimeError("Integration source package is missing or unsafe")
+        _assert_no_symlink_components(self.plugin_target)
+        _assert_specific_child(self.plugin_target, self.paths.home, "plugin target")
+        if self.plugin_target.exists() and not self.plugin_target.is_dir():
+            raise RuntimeError("Existing OpenClaw plugin target is unsafe")
         try:
             ZoneInfo(self.timezone_name)
         except Exception as error:
@@ -940,20 +946,112 @@ class IntegrationManager:
             raise
         return True
 
+    @staticmethod
+    def _safe_plugin_symlink(root: Path, path: Path, *, label: str) -> str:
+        relative = path.relative_to(root)
+        if relative != Path("node_modules/openclaw"):
+            raise RuntimeError(f"{label} contains an unsupported symbolic link")
+        try:
+            target = os.readlink(path)
+        except OSError as error:
+            raise RuntimeError(f"{label} symbolic link could not be read safely") from error
+        if not target or len(target) > 4096 or "\x00" in target:
+            raise RuntimeError(f"{label} contains an unsafe symbolic link target")
+        target_path = Path(target)
+        if not target_path.is_absolute() or ".." in target_path.parts \
+                or target_path.parts[-3:] != ("lib", "node_modules", "openclaw"):
+            raise RuntimeError(f"{label} contains an unsafe symbolic link target")
+        try:
+            target_meta = target_path.lstat()
+        except OSError as error:
+            raise RuntimeError(f"{label} symbolic link destination is missing or unsafe") from error
+        if target_path.is_symlink() or not stat.S_ISDIR(target_meta.st_mode) \
+                or target_meta.st_uid != os.getuid() \
+                or target_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RuntimeError(f"{label} symbolic link destination is unsafe")
+        return target
+
+    @staticmethod
+    def _safe_tree_sha256(root: Path, *, label: str) -> str:
+        if root.is_symlink() or not root.is_dir():
+            raise RuntimeError(f"{label} is missing or unsafe")
+        digest = hashlib.sha256()
+        root_meta = root.stat()
+        if root_meta.st_uid != os.getuid() or root_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise RuntimeError(f"{label} ownership or permissions are unsafe")
+        for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+            relative = path.relative_to(root).as_posix()
+            metadata = path.lstat()
+            if path.is_symlink():
+                if metadata.st_uid != os.getuid():
+                    raise RuntimeError(f"{label} contains an unsafe symbolic link")
+                target = IntegrationManager._safe_plugin_symlink(root, path, label=label)
+                digest.update(b"L\0")
+                digest.update(relative.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(target.encode("utf-8"))
+                digest.update(b"\0")
+                continue
+            if metadata.st_uid != os.getuid() or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise RuntimeError(f"{label} contains an unsafe entry")
+            if stat.S_ISDIR(metadata.st_mode):
+                digest.update(b"D\0")
+                digest.update(relative.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(str(stat.S_IMODE(metadata.st_mode)).encode("ascii"))
+                digest.update(b"\0")
+                continue
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise RuntimeError(f"{label} contains a non-regular or multiply linked file")
+            digest.update(b"F\0")
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(stat.S_IMODE(metadata.st_mode)).encode("ascii"))
+            digest.update(b"\0")
+            with path.open("rb") as handle:
+                before = os.fstat(handle.fileno())
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                after = os.fstat(handle.fileno())
+            IntegrationManager._assert_stable_file(before, after)
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def _copy_safe_tree(self, source: Path, target: Path, *, label: str) -> str:
+        expected = self._safe_tree_sha256(source, label=label)
+        if target.exists() or target.is_symlink():
+            raise RuntimeError(f"{label} backup target already exists")
+        shutil.copytree(source, target, symlinks=True)
+        if self._safe_tree_sha256(target, label=f"{label} backup") != expected:
+            raise RuntimeError(f"{label} backup verification failed")
+        return expected
+
     def _snapshot_other_assets(self, snapshot_dir: Path) -> dict[str, Any]:
+        plugin_target = self.plugin_target
+        plugin_backup = snapshot_dir / "plugin.preinstall"
         skill_target = self.paths.workspace / "skills" / SKILL_ID
         skill_backup = snapshot_dir / "skill.preinstall"
         plist_backup = snapshot_dir / "launchd.preinstall.plist"
         project_backup = snapshot_dir / "project-runtime.preinstall"
         health_receipt = self.paths.project_root / "reports/backup-health-component.qwen-local.json"
         health_receipt_backup = snapshot_dir / "health-receipt.preinstall.json"
-        managed_backups = (skill_backup, plist_backup, project_backup, health_receipt_backup)
+        managed_backups = (
+            plugin_backup, skill_backup, plist_backup, project_backup, health_receipt_backup,
+        )
         if any(candidate.exists() or candidate.is_symlink() for candidate in managed_backups):
             raise RuntimeError("A non-config preinstall snapshot already exists")
+        plugin_existed = plugin_target.exists()
         skill_existed = skill_target.exists()
         plist_existed = self.paths.launchd_plist.exists()
         project_existed = self.paths.project_root.exists()
         health_receipt_existed = health_receipt.exists()
+        plugin_sha256 = None
+        if plugin_target.is_symlink():
+            raise RuntimeError("Existing OpenClaw plugin is a symbolic link")
+        if plugin_existed:
+            plugin_sha256 = self._copy_safe_tree(
+                plugin_target, plugin_backup, label="Existing OpenClaw plugin",
+            )
         if skill_target.is_symlink():
             raise RuntimeError("Existing local knowledge skill is a symbolic link")
         if skill_existed:
@@ -987,6 +1085,8 @@ class IntegrationManager:
             shutil.copy2(health_receipt, health_receipt_backup)
             os.chmod(health_receipt_backup, 0o600)
         return {
+            "pluginTargetPath": str(plugin_target), "pluginBackupPath": str(plugin_backup),
+            "pluginExisted": plugin_existed, "pluginBackupSha256": plugin_sha256,
             "skillTargetPath": str(skill_target), "skillBackupPath": str(skill_backup),
             "skillExisted": skill_existed, "plistBackupPath": str(plist_backup), "plistExisted": plist_existed,
             "projectExisted": project_existed, "projectBackupPath": str(project_backup),
@@ -1092,10 +1192,20 @@ class IntegrationManager:
             os.fsync(handle.fileno())
         os.replace(temporary, self.paths.launchd_plist)
 
-    def configure_openclaw(self, allowed_projects: list[str]) -> None:
+    def _checkpoint_mutation(self, transaction: dict[str, Any] | None, field: str) -> None:
+        if transaction is None or transaction.get(field) is True:
+            return
+        transaction[field] = True
+        self.store.write(transaction)
+
+    def configure_openclaw(
+        self, allowed_projects: list[str], *, transaction: dict[str, Any] | None = None,
+    ) -> None:
         plugin_archive = self.package_plugin_archive()
         try:
-            self.cli.run(["plugins", "install", str(plugin_archive)], timeout=600)
+            self._checkpoint_mutation(transaction, "pluginMutationStarted")
+            self._checkpoint_mutation(transaction, "configMutationStarted")
+            self.cli.run(["plugins", "install", "--force", str(plugin_archive)], timeout=600)
         finally:
             staging = plugin_archive.parent
             if staging.exists() and not staging.is_symlink():
@@ -1116,6 +1226,7 @@ class IntegrationManager:
         if tool_allow_path is not None and tool_allow is not None:
             self.cli.run(["config", "set", tool_allow_path, json.dumps(tool_allow),
                           "--strict-json", "--replace"])
+        self._checkpoint_mutation(transaction, "skillMutationStarted")
         self.cli.run(["skills", "install", str(self.skill_source), "--as", SKILL_ID, "--force", "--agent", self.agent], timeout=300)
         self.cli.run(["config", "validate", "--json"])
 
@@ -1719,11 +1830,30 @@ class IntegrationManager:
         return subprocess.run([self.launchctl, *args], shell=False, check=check, text=True,
                               capture_output=True, timeout=120)
 
+    def _launchctl_retry(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        result: subprocess.CompletedProcess[str] | None = None
+        for attempt in range(len(LAUNCHD_RETRY_DELAYS_SECONDS) + 1):
+            result = self._launchctl(args, check=False)
+            if result.returncode == 0:
+                return result
+            if attempt < len(LAUNCHD_RETRY_DELAYS_SECONDS):
+                time.sleep(LAUNCHD_RETRY_DELAYS_SECONDS[attempt])
+        assert result is not None
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args, output=result.stdout, stderr=result.stderr,
+        )
+
+    def _bootstrap_launchd_plist(self, plist_path: Path) -> None:
+        domain = f"gui/{os.getuid()}"
+        service = f"{domain}/{LAUNCHD_LABEL}"
+        self._launchctl_retry(["bootstrap", domain, str(plist_path)])
+        self._launchctl_retry(["kickstart", "-k", service])
+        self._launchctl_retry(["print", service])
+
     def activate_launchd(self) -> None:
         domain = f"gui/{os.getuid()}"
         self._launchctl(["bootout", f"{domain}/{LAUNCHD_LABEL}"], check=False)
-        self._launchctl(["bootstrap", domain, str(self.paths.launchd_plist)])
-        self._launchctl(["kickstart", "-k", f"{domain}/{LAUNCHD_LABEL}"])
+        self._bootstrap_launchd_plist(self.paths.launchd_plist)
 
     def deactivate_launchd(self) -> None:
         self._launchctl(["bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], check=False)
@@ -2259,6 +2389,11 @@ class IntegrationManager:
             transaction["cronTargetIdsBefore"] = sorted(target_ids)
             transaction["cronMutationStarted"] = False
             transaction["runtimeMutationStarted"] = False
+            transaction["pluginMutationStarted"] = False
+            transaction["configMutationStarted"] = False
+            transaction["skillMutationStarted"] = False
+            transaction["plistMutationStarted"] = False
+            transaction["launchdMutationStarted"] = False
             transaction["disabledGeminiJobs"] = planned_gemini_disables
             transaction["ownership"] = self._ownership_payload()
             transaction["runtimePort"] = int(runtime_manifest["runtimePort"])
@@ -2295,7 +2430,8 @@ class IntegrationManager:
                     self.synchronize_project_runtime()
                 self.store.write(transaction)
 
-                self.configure_openclaw(self._allowed_projects())
+                self.configure_openclaw(self._allowed_projects(), transaction=transaction)
+                self._checkpoint_mutation(transaction, "plistMutationStarted")
                 self.install_launchd_plist(runtime_manifest)
                 transaction["ownedAssets"] = [
                     PLUGIN_ID, SKILL_ID, LAUNCHD_LABEL, CRON_DECLARATION_KEY,
@@ -2304,6 +2440,7 @@ class IntegrationManager:
                 transaction["phase"] = "activating"
                 self.store.write(transaction)
 
+                self._checkpoint_mutation(transaction, "launchdMutationStarted")
                 self.activate_launchd()
                 transaction["cronId"] = self._apply_managed_spec(self._incremental_spec())
                 transaction["snapshotCronId"] = self._apply_managed_spec(self._snapshot_spec())
@@ -2538,6 +2675,39 @@ class IntegrationManager:
             if os.path.lexists(root):
                 raise RuntimeError("Created snapshot root remained after rollback")
 
+    def _restore_plugin_from_snapshot(
+        self, transaction: dict[str, Any], *, snapshot_path: Path,
+    ) -> None:
+        target_value = transaction.get("pluginTargetPath")
+        backup_value = transaction.get("pluginBackupPath")
+        if not isinstance(target_value, str) or Path(target_value) != self.plugin_target:
+            raise RuntimeError("Rollback plugin target identity is missing or unsafe")
+        expected_backup = snapshot_path.parent / "plugin.preinstall"
+        if not isinstance(backup_value, str) or Path(backup_value) != expected_backup:
+            raise RuntimeError("Rollback plugin backup identity is missing or unsafe")
+        plugin_existed = transaction.get("pluginExisted") is True
+        expected_sha256 = transaction.get("pluginBackupSha256")
+        if plugin_existed:
+            if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
+                raise RuntimeError("Rollback plugin backup checksum is missing")
+            if self._safe_tree_sha256(expected_backup, label="Rollback plugin backup") != expected_sha256:
+                raise RuntimeError("Rollback plugin backup checksum mismatch")
+        elif expected_sha256 is not None:
+            raise RuntimeError("Rollback plugin backup receipt is inconsistent")
+        if self.plugin_target.is_symlink() or (
+            self.plugin_target.exists() and not self.plugin_target.is_dir()
+        ):
+            raise RuntimeError("Installed plugin became unsafe before rollback")
+        self.cli.run(["plugins", "uninstall", PLUGIN_ID, "--force"], check=False)
+        if self.plugin_target.exists():
+            shutil.rmtree(self.plugin_target)
+        if plugin_existed:
+            restored_sha256 = self._copy_safe_tree(
+                expected_backup, self.plugin_target, label="Rollback OpenClaw plugin",
+            )
+            if restored_sha256 != expected_sha256:
+                raise RuntimeError("Rollback plugin restoration did not match its snapshot")
+
     def _rollback_locked(self, *, require_exact_post_config: bool = True) -> dict[str, Any]:
         transaction = self.store.read()
         config = Path(transaction["configPath"])
@@ -2574,42 +2744,40 @@ class IntegrationManager:
             if not isinstance(raw_definitions, list) or any(not isinstance(item, dict) for item in raw_definitions):
                 raise RuntimeError("Rollback cron receipt is malformed")
             prior_cron_definitions = raw_definitions
-            if cron_mutation_started:
-                current_jobs = self._inventory()
-                target_ids_before = transaction.get("cronTargetIdsBefore", [])
-                managed_ids_after = transaction.get("managedCronIdsAfter", [])
-                if not isinstance(target_ids_before, list) or not isinstance(managed_ids_after, list):
-                    raise RuntimeError("Rollback cron target receipt is malformed")
-                removable_ids = {
-                    *(str(value) for value in target_ids_before),
-                    *(str(value) for value in managed_ids_after),
-                }
-                for job in current_jobs:
-                    job_id = str(job["id"])
-                    if job.get("declarationKey") in MANAGED_CRON_KEYS | {LEGACY_SNAPSHOT_DECLARATION_KEY} \
-                            or job_id in removable_ids:
-                        self.cli.run(["cron", "rm", job_id])
-        else:
-            if transaction.get("cronId"):
-                self.cli.run(["cron", "rm", str(transaction["cronId"])], check=False)
-            if transaction.get("initialIndexJobId"):
-                self.cli.run(["cron", "rm", str(transaction["initialIndexJobId"])], check=False)
         if runtime_mutation_started:
-            self.deactivate_launchd()
-            plist_backup = Path(transaction["plistBackupPath"])
-            if transaction.get("plistExisted"):
-                self._restore_regular_file(plist_backup, self.paths.launchd_plist)
-                self._launchctl(["bootstrap", f"gui/{os.getuid()}", str(self.paths.launchd_plist)])
-            else:
-                self.paths.launchd_plist.unlink(missing_ok=True)
-            self.cli.run(["plugins", "uninstall", PLUGIN_ID, "--force"])
-            skill_target = Path(transaction["skillTargetPath"])
-            if skill_target.exists():
-                if skill_target.is_symlink():
-                    raise RuntimeError("Installed skill became a symbolic link; refusing rollback deletion")
-                shutil.rmtree(skill_target)
-            if transaction.get("skillExisted"):
-                shutil.copytree(Path(transaction["skillBackupPath"]), skill_target)
+            precise_markers = any(
+                field in transaction for field in (
+                    "pluginMutationStarted", "configMutationStarted", "skillMutationStarted",
+                    "plistMutationStarted", "launchdMutationStarted",
+                )
+            )
+            legacy_runtime_receipt = not precise_markers
+            plugin_mutation_started = transaction.get("pluginMutationStarted") is True
+            config_mutation_started = transaction.get("configMutationStarted") is True \
+                or legacy_runtime_receipt
+            skill_mutation_started = transaction.get("skillMutationStarted") is True
+            plist_mutation_started = transaction.get("plistMutationStarted") is True \
+                or legacy_runtime_receipt
+            launchd_mutation_started = transaction.get("launchdMutationStarted") is True \
+                or legacy_runtime_receipt
+            if launchd_mutation_started:
+                self.deactivate_launchd()
+            if plist_mutation_started:
+                plist_backup = Path(transaction["plistBackupPath"])
+                if transaction.get("plistExisted"):
+                    self._restore_regular_file(plist_backup, self.paths.launchd_plist)
+                else:
+                    self.paths.launchd_plist.unlink(missing_ok=True)
+            if plugin_mutation_started:
+                self._restore_plugin_from_snapshot(transaction, snapshot_path=snapshot_path)
+            if skill_mutation_started:
+                skill_target = Path(transaction["skillTargetPath"])
+                if skill_target.exists():
+                    if skill_target.is_symlink():
+                        raise RuntimeError("Installed skill became a symbolic link; refusing rollback deletion")
+                    shutil.rmtree(skill_target)
+                if transaction.get("skillExisted"):
+                    shutil.copytree(Path(transaction["skillBackupPath"]), skill_target)
             project_backup = Path(transaction["projectBackupPath"])
             if transaction.get("projectExisted"):
                 for relative in (Path("src"), Path("scripts"), Path("package.json"), Path("package-lock.json")):
@@ -2635,15 +2803,39 @@ class IntegrationManager:
                 os.chmod(receipt_path, 0o600)
             elif receipt_path.exists() and not receipt_path.is_symlink():
                 receipt_path.unlink()
-            self._restore_config_file(
-                snapshot_path, config,
-                expected_sha256=pre_config_sha256,
-                expected_run_identity=(run_dev, run_ino),
-                expected_marker_sha256=marker_sha256,
-            )
-            self.cli.run(["config", "validate", "--json"])
-            self.cli.run(["gateway", "restart", "--safe", "--json"], timeout=300)
+            if config_mutation_started:
+                self._restore_config_file(
+                    snapshot_path, config,
+                    expected_sha256=pre_config_sha256,
+                    expected_run_identity=(run_dev, run_ino),
+                    expected_marker_sha256=marker_sha256,
+                )
+                self.cli.run(["config", "validate", "--json"])
+            if launchd_mutation_started and transaction.get("plistExisted"):
+                self._bootstrap_launchd_plist(self.paths.launchd_plist)
+            if config_mutation_started:
+                self.cli.run(["gateway", "restart", "--safe", "--json"], timeout=300)
         if cron_mutation_started:
+            if transaction.get("contractVersion") == INTEGRATION_CONTRACT_VERSION:
+                current_jobs = self._inventory()
+                target_ids_before = transaction.get("cronTargetIdsBefore", [])
+                managed_ids_after = transaction.get("managedCronIdsAfter", [])
+                if not isinstance(target_ids_before, list) or not isinstance(managed_ids_after, list):
+                    raise RuntimeError("Rollback cron target receipt is malformed")
+                removable_ids = {
+                    *(str(value) for value in target_ids_before),
+                    *(str(value) for value in managed_ids_after),
+                }
+                for job in current_jobs:
+                    job_id = str(job["id"])
+                    if job.get("declarationKey") in MANAGED_CRON_KEYS | {LEGACY_SNAPSHOT_DECLARATION_KEY} \
+                            or job_id in removable_ids:
+                        self.cli.run(["cron", "rm", job_id])
+            else:
+                if transaction.get("cronId"):
+                    self.cli.run(["cron", "rm", str(transaction["cronId"])], check=False)
+                if transaction.get("initialIndexJobId"):
+                    self.cli.run(["cron", "rm", str(transaction["initialIndexJobId"])], check=False)
             restored_cron_ids = [self._restore_cron_definition(item) for item in prior_cron_definitions]
             self._verify_rollback_cron_state(
                 prior_definitions=prior_cron_definitions,

@@ -162,16 +162,15 @@ class StatefulCronCli:
                     "after": 1,
                     "cooldownMs": 3600000,
                     "includeSkipped": "--failure-alert-include-skipped" in args,
-                    "mode": args[args.index("--failure-alert-mode") + 1],
                     "channel": args[args.index("--failure-alert-channel") + 1],
                 }
+                if "--failure-alert-mode" in args:
+                    job["failureAlert"]["mode"] = args[args.index("--failure-alert-mode") + 1]
                 if "--failure-alert-to" in args:
                     job["failureAlert"]["to"] = args[args.index("--failure-alert-to") + 1]
                 if "--failure-alert-account-id" in args:
                     job["failureAlert"]["accountId"] = args[args.index("--failure-alert-account-id") + 1]
                 job["enabled"] = False
-                job["delivery"] = {"mode": "none"}
-                job["payload"].pop("toolsAllow", None)
             if "--enable" in args:
                 job["enabled"] = True
             if "--disable" in args:
@@ -818,7 +817,7 @@ def prepare_collision_integration_runtime(
     monkeypatch.setattr(item, "bootstrap_project", lambda _: False)
     monkeypatch.setattr(item, "synchronize_project_runtime", lambda: None)
     monkeypatch.setattr(item, "_allowed_projects", lambda: [])
-    monkeypatch.setattr(item, "configure_openclaw", lambda _: None)
+    monkeypatch.setattr(item, "configure_openclaw", lambda _allowed, **_: None)
     monkeypatch.setattr(item, "install_launchd_plist", lambda _: None)
     monkeypatch.setattr(item, "activate_launchd", lambda: None)
     monkeypatch.setattr(item, "mark_ready_or_schedule_build", lambda: ("READY", None))
@@ -1036,7 +1035,7 @@ def test_activation_failure_invokes_rollback_before_commit(
     monkeypatch.setattr(item, "bootstrap_project", lambda _: False)
     monkeypatch.setattr(item, "synchronize_project_runtime", lambda: events.append("sync"))
     monkeypatch.setattr(item, "_allowed_projects", lambda: [])
-    monkeypatch.setattr(item, "configure_openclaw", lambda _: events.append("configure"))
+    monkeypatch.setattr(item, "configure_openclaw", lambda _allowed, **_: events.append("configure"))
     monkeypatch.setattr(item, "install_launchd_plist", lambda _: events.append("plist"))
     monkeypatch.setattr(item, "activate_launchd", lambda: events.append("launchd"))
     staged = iter(["incremental", "snapshot"])
@@ -1438,6 +1437,309 @@ def test_cron_rollback_receipt_preserves_one_shot_and_alert_definition(tmp_path:
     assert cli.run_calls[-1] == ["cron", "edit", "restored", "--enable"]
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_cron_rollback_round_trips_legacy_definition_exactly(
+    tmp_path: Path, enabled: bool,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    original = legacy_snapshot_job(item, enabled=enabled)
+    definition = core._job_definition(original)
+
+    restored_id = item._restore_cron_definition(definition)
+
+    restored = next(job for job in cli.jobs if job["id"] == restored_id)
+    assert core._job_contract_hash(restored) == core._job_contract_hash(definition)
+    add = next(call for call in cli.calls if call[:2] == ["cron", "add"])
+    assert "--disabled" in add
+    assert add[add.index("--declaration-key") + 1] == core.LEGACY_SNAPSHOT_DECLARATION_KEY
+    assert (any(call[:3] == ["cron", "edit", restored_id] and "--enable" in call
+                for call in cli.calls)) is enabled
+
+
+def test_configure_openclaw_force_replaces_existing_plugin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ConfigureCli:
+        def __init__(self) -> None:
+            self.executable = str(Path(sys.executable).resolve())
+            self.calls: list[list[str]] = []
+
+        def config_get(self, _path: str) -> list[str]:
+            return []
+
+        def run(self, args: list[str], *, timeout: int = 120, check: bool = True):
+            self.calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+    cli = ConfigureCli()
+    item = manager(tmp_path, cli)
+    archive = tmp_path / "plugin-package" / "plugin.tgz"
+    archive.parent.mkdir()
+    archive.write_bytes(b"fixture")
+    monkeypatch.setattr(item, "package_plugin_archive", lambda: archive)
+
+    item.configure_openclaw([])
+
+    install = next(call for call in cli.calls if call[:2] == ["plugins", "install"])
+    assert install == ["plugins", "install", "--force", str(archive)]
+    assert not archive.parent.exists()
+
+
+def _write_precise_runtime_transaction(
+    item: core.IntegrationManager,
+    *,
+    cron_mutation_started: bool = False,
+    **markers: bool,
+) -> dict[str, Any]:
+    config = item.paths.home / ".openclaw/openclaw.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("{}", encoding="utf-8")
+    config.chmod(0o600)
+    snapshot_dir = item.paths.state_root / "snapshots/run-00000000-0000-0000-0000-000000000099"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    config_backup = snapshot_dir / "openclaw-config.preinstall"
+    config_backup.write_text("{}", encoding="utf-8")
+    config_backup.chmod(0o600)
+    transaction: dict[str, Any] = {
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "runId": "precise-runtime-fixture",
+        "phase": "failed",
+        "ownedAssets": [],
+        "configPath": str(config),
+        "configBackupPath": str(config_backup),
+        "preConfigSha256": "1" * 64,
+        "snapshotRunMarkerSha256": "2" * 64,
+        "snapshotRunDev": 1,
+        "snapshotRunIno": 2,
+        "runtimeMutationStarted": True,
+        "pluginMutationStarted": False,
+        "configMutationStarted": False,
+        "skillMutationStarted": False,
+        "plistMutationStarted": False,
+        "launchdMutationStarted": False,
+        "projectExisted": False,
+        "projectCreated": False,
+        "projectBackupPath": str(snapshot_dir / "project-runtime.preinstall"),
+        "healthReceiptExisted": False,
+        "cronMutationStarted": cron_mutation_started,
+        "cronDefinitionsBefore": [],
+        "cronUnknownHashesBefore": {},
+        "cronInventoryHashesBefore": {},
+        "cronTargetIdsBefore": [],
+        "managedCronIdsAfter": [],
+        "snapshotRootCreated": False,
+        "snapshotLockCreated": False,
+        **markers,
+    }
+    item.store.write(transaction)
+    return transaction
+
+
+def test_failure_before_plugin_install_preserves_existing_plugin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    item.plugin_target.mkdir(parents=True)
+    installed = item.plugin_target / "index.js"
+    installed.write_text("existing-plugin", encoding="utf-8")
+    _write_precise_runtime_transaction(item)
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
+
+    result = item._rollback_locked(require_exact_post_config=False)
+
+    assert result["status"] == "ROLLED_BACK"
+    assert installed.read_text(encoding="utf-8") == "existing-plugin"
+    assert not any(call[:2] == ["plugins", "uninstall"] for call in cli.calls)
+
+
+def test_plugin_snapshot_restores_exact_tree_after_forced_upgrade(
+    tmp_path: Path,
+) -> None:
+    class PluginCli(StatefulCronCli):
+        def run(self, args: list[str], *, timeout: int = 120, check: bool = True):
+            if args[:2] == ["plugins", "uninstall"]:
+                self.calls.append(list(args))
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return super().run(args, timeout=timeout, check=check)
+
+    cli = PluginCli()
+    item = manager(tmp_path, cli)
+    item.plugin_target.mkdir(parents=True)
+    (item.plugin_target / "index.js").write_text("old", encoding="utf-8")
+    nested = item.plugin_target / "dist"
+    nested.mkdir()
+    (nested / "runtime.js").write_text("old-runtime", encoding="utf-8")
+    openclaw_package = tmp_path / "opt/homebrew/lib/node_modules/openclaw"
+    openclaw_package.mkdir(parents=True)
+    (openclaw_package / "package.json").write_text('{"name":"openclaw"}', encoding="utf-8")
+    node_modules = item.plugin_target / "node_modules"
+    node_modules.mkdir()
+    (node_modules / "openclaw").symlink_to(openclaw_package, target_is_directory=True)
+    snapshot_dir = item.paths.state_root / "snapshots/run-00000000-0000-0000-0000-000000000100"
+    snapshot_dir.mkdir(parents=True)
+    receipt = item._snapshot_other_assets(snapshot_dir)
+    backup_link = snapshot_dir / "plugin.preinstall/node_modules/openclaw"
+    assert backup_link.is_symlink()
+    assert os.readlink(backup_link) == str(openclaw_package)
+    (item.plugin_target / "index.js").write_text("new", encoding="utf-8")
+    (item.plugin_target / "added.js").write_text("new-file", encoding="utf-8")
+
+    item._restore_plugin_from_snapshot(
+        receipt, snapshot_path=snapshot_dir / "openclaw-config.preinstall",
+    )
+
+    assert (item.plugin_target / "index.js").read_text(encoding="utf-8") == "old"
+    assert (item.plugin_target / "dist/runtime.js").read_text(encoding="utf-8") == "old-runtime"
+    restored_link = item.plugin_target / "node_modules/openclaw"
+    assert restored_link.is_symlink()
+    assert os.readlink(restored_link) == str(openclaw_package)
+    assert not (item.plugin_target / "added.js").exists()
+    assert item._safe_tree_sha256(item.plugin_target, label="restored plugin") == receipt[
+        "pluginBackupSha256"
+    ]
+    assert ["plugins", "uninstall", core.PLUGIN_ID, "--force"] in cli.calls
+
+
+def test_plugin_snapshot_tamper_fails_before_uninstall(
+    tmp_path: Path,
+) -> None:
+    class PluginCli(StatefulCronCli):
+        def run(self, args: list[str], *, timeout: int = 120, check: bool = True):
+            if args[:2] == ["plugins", "uninstall"]:
+                self.calls.append(list(args))
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return super().run(args, timeout=timeout, check=check)
+
+    cli = PluginCli()
+    item = manager(tmp_path, cli)
+    item.plugin_target.mkdir(parents=True)
+    installed = item.plugin_target / "index.js"
+    installed.write_text("existing", encoding="utf-8")
+    snapshot_dir = item.paths.state_root / "snapshots/run-00000000-0000-0000-0000-000000000101"
+    snapshot_dir.mkdir(parents=True)
+    receipt = item._snapshot_other_assets(snapshot_dir)
+    (snapshot_dir / "plugin.preinstall/index.js").write_text("tampered", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        item._restore_plugin_from_snapshot(
+            receipt, snapshot_path=snapshot_dir / "openclaw-config.preinstall",
+        )
+
+    assert installed.read_text(encoding="utf-8") == "existing"
+    assert not any(call[:2] == ["plugins", "uninstall"] for call in cli.calls)
+
+
+def test_plugin_snapshot_rejects_traversal_symlink_without_following_it(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    item.plugin_target.mkdir(parents=True)
+    node_modules = item.plugin_target / "node_modules"
+    node_modules.mkdir()
+    (node_modules / "openclaw").symlink_to("../../outside", target_is_directory=True)
+    outside = item.plugin_target.parent / "outside"
+    outside.mkdir()
+    marker = outside / "private.txt"
+    marker.write_text("must-not-copy", encoding="utf-8")
+    snapshot_dir = item.paths.state_root / "snapshots/run-00000000-0000-0000-0000-000000000102"
+    snapshot_dir.mkdir(parents=True)
+
+    with pytest.raises(RuntimeError, match="unsafe symbolic link target"):
+        item._snapshot_other_assets(snapshot_dir)
+
+    assert marker.read_text(encoding="utf-8") == "must-not-copy"
+    assert not (snapshot_dir / "plugin.preinstall").exists()
+
+
+def test_launchd_activation_retries_transient_error_37_and_reads_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = manager(tmp_path)
+    attempts = {"bootstrap": 0, "kickstart": 0, "print": 0}
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def launchctl(args: list[str], *, check: bool = True):
+        calls.append(list(args))
+        command = args[0]
+        if command == "bootout":
+            return subprocess.CompletedProcess(args, 0, "", "")
+        attempts[command] += 1
+        return_code = 37 if command in {"bootstrap", "print"} and attempts[command] == 1 else 0
+        return subprocess.CompletedProcess(args, return_code, "", "Operation already in progress")
+
+    monkeypatch.setattr(item, "_launchctl", launchctl)
+    monkeypatch.setattr(core.time, "sleep", sleeps.append)
+
+    item.activate_launchd()
+
+    assert attempts == {"bootstrap": 2, "kickstart": 1, "print": 2}
+    assert sleeps == [core.LAUNCHD_RETRY_DELAYS_SECONDS[0]] * 2
+    assert calls[-1][0] == "print"
+
+
+def test_launchd_retry_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = manager(tmp_path)
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def always_busy(args: list[str], *, check: bool = True):
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, 37, "", "Operation already in progress")
+
+    monkeypatch.setattr(item, "_launchctl", always_busy)
+    monkeypatch.setattr(core.time, "sleep", sleeps.append)
+
+    with pytest.raises(subprocess.CalledProcessError) as failure:
+        item._launchctl_retry(["bootstrap", "gui/1", "/tmp/fixture.plist"])
+
+    assert failure.value.returncode == 37
+    assert len(calls) == len(core.LAUNCHD_RETRY_DELAYS_SECONDS) + 1
+    assert sleeps == list(core.LAUNCHD_RETRY_DELAYS_SECONDS)
+
+
+def test_launchd_rollback_failure_occurs_before_any_cron_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    managed = job_for_spec(item._incremental_spec(), job_id="managed", enabled=False)
+    cli.jobs = [managed]
+    transaction = _write_precise_runtime_transaction(
+        item,
+        cron_mutation_started=True,
+        plistMutationStarted=True,
+        launchdMutationStarted=True,
+    )
+    plist_backup = Path(transaction["configBackupPath"]).parent / "launchd.preinstall.plist"
+    plist_backup.write_text("old-plist", encoding="utf-8")
+    item.paths.launchd_plist.write_text("new-plist", encoding="utf-8")
+    transaction.update({
+        "plistBackupPath": str(plist_backup),
+        "plistExisted": True,
+        "cronTargetIdsBefore": ["managed"],
+        "managedCronIdsAfter": ["managed"],
+    })
+    item.store.write(transaction)
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "deactivate_launchd", lambda: None)
+    monkeypatch.setattr(
+        item, "_bootstrap_launchd_plist",
+        lambda _plist: (_ for _ in ()).throw(RuntimeError("launchd restore still busy")),
+    )
+
+    with pytest.raises(RuntimeError, match="still busy"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    assert item.paths.launchd_plist.read_text(encoding="utf-8") == "old-plist"
+    assert cli.jobs == [managed]
+    assert not any(call[:2] == ["cron", "rm"] for call in cli.calls)
+
+
 def test_successful_integration_commits_after_activation_verification_and_reinstall_is_noop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1471,7 +1773,7 @@ def test_successful_integration_commits_after_activation_verification_and_reinst
     monkeypatch.setattr(item, "bootstrap_project", lambda _: False)
     monkeypatch.setattr(item, "synchronize_project_runtime", lambda: events.append("sync"))
     monkeypatch.setattr(item, "_allowed_projects", lambda: [])
-    monkeypatch.setattr(item, "configure_openclaw", lambda _: events.append("configure"))
+    monkeypatch.setattr(item, "configure_openclaw", lambda _allowed, **_: events.append("configure"))
     monkeypatch.setattr(item, "install_launchd_plist", lambda _: events.append("plist"))
     monkeypatch.setattr(item, "activate_launchd", lambda: events.append("launchd"))
     monkeypatch.setattr(item, "_apply_managed_spec", lambda spec: f"job:{spec.key}")
