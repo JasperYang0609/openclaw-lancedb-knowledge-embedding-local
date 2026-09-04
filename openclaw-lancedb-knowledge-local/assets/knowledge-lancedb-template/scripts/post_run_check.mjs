@@ -36,6 +36,7 @@ record("Discord raw is opt-in", !sourceMap.sources.some((source) => source.sourc
 record("Discord raw privacy gate is explicit", sourceMap.privacy?.discordRawApproval === "NOT_CONFIRMED" && sourceMap.privacy?.exactMessageIdValidation === "SKIPPED_PRIVACY_GATE");
 record("synthetic summary indexes are excluded", JSON.stringify(sourceMap).includes("_inventory-index"));
 record("snapshot tool exists", await exists("scripts/snapshot_knowledge_assets.py"));
+record("shared index lock helper exists", await exists("scripts/index_lock.py"));
 record("cron tooling audit exists", await exists("scripts/audit_cron_tooling.py"));
 
 const benchmark = await readJson("config/benchmark.example.json");
@@ -43,8 +44,13 @@ record("release benchmark scaffold has at least 20 cases", Array.isArray(benchma
 record("enrichment contract exists", await exists("config/enrichment-contract.md"));
 
 const wrapper = await fs.readFile(path.join(root, "scripts/knowledge_index_incremental.sh"), "utf8");
-record("incremental wrapper uses lock", wrapper.includes("index.lock") && wrapper.includes("mkdir \"$LOCK_DIR\""));
+const fullWrapper = await fs.readFile(path.join(root, "scripts/knowledge_index_full.sh"), "utf8");
+const indexLockHelper = await fs.readFile(path.join(root, "scripts/index_lock.py"), "utf8");
+record("index wrappers use verified shared lock", [wrapper, fullWrapper].every((value) => value.includes("index.lock") && value.includes("$LOCK_HELPER\" acquire") && value.includes("$LOCK_HELPER\" release")));
+record("index lock helper distinguishes contention and unsafe failures", indexLockHelper.includes("except FileExistsError") && indexLockHelper.includes("EXIT_BUSY = 75") && indexLockHelper.includes("EXIT_UNSAFE = 74") && indexLockHelper.includes("def release("));
 record("incremental wrapper rotates reports", wrapper.includes("rotate_reports"));
+const snapshotWrapper = await fs.readFile(path.join(root, "scripts/run_verified_snapshot.py"), "utf8");
+record("snapshot shares verified index lock atomically", snapshotWrapper.includes("def snapshot_index_lock") && snapshotWrapper.includes("acquire_index_lock(lock)") && snapshotWrapper.includes("release_index_lock(lock, identity)") && snapshotWrapper.includes("with snapshot_index_lock("));
 
 const testDir = path.join(root, "test");
 const testFiles = (await fs.readdir(testDir)).filter((name) => name.endsWith(".test.js"));

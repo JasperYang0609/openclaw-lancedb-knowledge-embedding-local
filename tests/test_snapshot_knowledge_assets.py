@@ -77,7 +77,13 @@ def main() -> None:
         assert (snapshots_root / "daily-2026-01-31").is_dir()
         assert (snapshots_root / "manual-2026-01-01").is_dir()
 
+        snapshot.chmod(0o700)
+        (snapshot / "src").chmod(0o700)
+        (snapshot / "src/metadata.js").chmod(0o600)
         (snapshot / "src/metadata.js").write_text("tampered\n", encoding="utf-8")
+        (snapshot / "src/metadata.js").chmod(0o400)
+        (snapshot / "src").chmod(0o500)
+        snapshot.chmod(0o500)
         verify = run("--verify-snapshot", str(snapshot))
         assert verify.returncode != 0
         assert "checksum mismatch" in (verify.stderr + verify.stdout)

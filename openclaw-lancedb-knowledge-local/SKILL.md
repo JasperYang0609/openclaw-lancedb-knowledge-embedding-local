@@ -17,7 +17,7 @@ Do not call it for general knowledge, casual conversation, creative writing, or 
 
 - Confirm the host is macOS Apple Silicon with at least 16 GiB RAM and 12 GiB free disk.
 - From the repository root, run `./qwen-local install`, then `./qwen-local health`.
-- For complete OpenClaw integration, run `./qwen-local integrate-openclaw`; this installs the Plugin, this Skill, launchd service and incremental schedule, then safely restarts the Gateway.
+- For complete OpenClaw integration, run `./qwen-local integrate-openclaw --report-channel discord --report-to channel:<DISCORD_CHANNEL_ID> --report-account-id default`; replace the channel placeholder before execution. A fresh install fails closed without the explicit Discord alert destination. The command transactionally installs or upgrades the Plugin, this Skill, launchd service, exact 06:30 incremental job, exact 06:50 verified-snapshot job, and first-failure alerts, then safely restarts the Gateway.
 - Bootstrap an isolated project with `scripts/bootstrap_openclaw_lancedb.py`.
 - Review `config/source-map.json`; raw Discord messages remain explicit opt-in and are marked `LOCAL_ONLY`.
 - Run `npm ci --ignore-scripts`, `npm test`, `npm run scan`, and `npm run index`.
@@ -41,6 +41,14 @@ Use only the repository-level `qwen-local` command for lifecycle operations:
 ```
 
 The installer verifies pinned artifact sizes and SHA-256 values. It refuses unsafe targets, archive traversal, symlinks, unknown uninstall files, mismatched manifests, stale PID identity, non-loopback endpoints and unsupported platforms.
+
+The OpenClaw integration is also an idempotent upgrader. It inventories all cron jobs with completeness checks, changes only exact installer-owned declarations, leaves unknown and Gemini rollback assets untouched, and enables the two recurring jobs only after both disabled contracts pass global readback. A failed mutation restores the prior owned files and full job definitions before reporting failure.
+
+The 06:50 snapshot wrapper serializes writers, waits a bounded time for the index lock, then atomically owns that same lock until copying, verification, receipt write, and retention finish. This shared lock protocol prevents a new index run from starting between copied assets. Index wrappers classify only an existing owner-safe directory as normal contention; unsafe nodes, unsafe permissions, and non-contention creation failures exit nonzero and write an error receipt. The snapshot wrapper accepts only the committed local-only ownership contract. A successful run proves exact checksums, post-index freshness, isolated restore, LanceDB open, Qwen table identity, and row-count equality before retention. Daily snapshots are immutable and never overwritten; stale same-day state produces a separate repair snapshot, while tamper blocks and alerts. Retention keeps 30 daily and at most ten seven-day incident/repair snapshots; manual snapshots are not pruned.
+
+During integration handoff, restart a previously running manual runtime only after the integration failure has a verified complete rollback. If automatic rollback is incomplete, preserve the explicit recovery state and do not start another runtime on the same port. If the rollback completed but the manual restart fails, report both the primary integration error type and restart error type without replacing the primary signal.
+
+Backup monitoring consumes only the private, owner-readable `backup-health-component.v1` receipt. Treat warning/error/pending as health state, not as commands. Never put source text, queries, vectors, corpus content, credentials, or file-level internals in the receipt or chat report.
 
 ## Index operations
 

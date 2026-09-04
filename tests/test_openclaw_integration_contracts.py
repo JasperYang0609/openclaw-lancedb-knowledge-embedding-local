@@ -749,7 +749,12 @@ class VerificationCli:
         if args[:2] == ["skills", "info"]:
             return {"id": integration_core.SKILL_ID, "eligible": True}
         if args[:3] == ["cron", "list", "--all"]:
-            return {"jobs": self.jobs}
+            return {
+                "jobs": self.jobs,
+                "total": len(self.jobs),
+                "hasMore": False,
+                "nextCursor": None,
+            }
         if args[:2] == ["gateway", "status"]:
             return {"ok": True}
         raise AssertionError(f"unexpected verification command: {args}")

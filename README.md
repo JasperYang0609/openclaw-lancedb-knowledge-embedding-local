@@ -9,10 +9,15 @@ Intel Mac, Linux and Windows are not supported by the first installer release. F
 ## One-command OpenClaw integration
 
 ```bash
-./qwen-local integrate-openclaw
+./qwen-local integrate-openclaw \
+  --report-channel discord \
+  --report-to channel:123456789012345678 \
+  --report-account-id default
 ```
 
-This command installs and verifies the pinned Qwen runtime, creates or adopts the isolated Qwen LanceDB project, installs the `openclaw-lancedb-knowledge-local` Plugin and Skill, registers the read-only `local_knowledge_search` tool, installs the per-user launchd service, creates one idempotent daily incremental command job, validates configuration, and safely restarts the OpenClaw Gateway.
+Replace the example channel ID with the customer's dedicated backup-monitoring Discord channel. A fresh integration fails closed unless this explicit alert destination is supplied.
+
+This command installs and verifies the pinned Qwen runtime, creates or adopts the isolated Qwen LanceDB project, installs the `openclaw-lancedb-knowledge-local` Plugin and Skill, registers the read-only `local_knowledge_search` tool, installs the per-user launchd service, and reconciles two installer-owned jobs: the 06:30 incremental index and the 06:50 verified recovery snapshot. Both jobs use fixed argv, bounded runtime/output, no delivery spam, and a failure alert after the first real error. The installer validates configuration and safely restarts the OpenClaw Gateway only inside its rollback-capable transaction.
 
 After the index is reconciled, OpenClaw proactively uses `local_knowledge_search` for questions about prior decisions, project status, handoffs, meeting notes, backups and internal documents. The user does not need to ask it to search. The Skill also tells OpenClaw not to search for unrelated general-knowledge or creative requests. Search and indexing have no Gemini or other cloud embedding fallback.
 
@@ -24,7 +29,21 @@ If a fresh full index is still running, the tool returns `INDEX_BUILDING` and ne
 ./qwen-local uninstall-openclaw
 ```
 
-The transaction backs up the existing OpenClaw configuration and local Skill, only disables exactly identified Gemini incremental jobs, and preserves all Gemini indexes, caches and settings for emergency rollback. Unknown ownership or configuration drift fails closed.
+The snapshot job waits for indexing to finish, then atomically owns the same index lock for the entire copy and verification transaction so a new index run cannot start between assets. Index wrappers treat only an existing owner-safe directory as normal contention; files, symlinks, unsafe permissions, and lock-creation failures fail nonzero and write an error health receipt. The snapshot requires SHA-256 integrity, post-index freshness, an isolated restore canary, LanceDB open, exact table identity, and matching row count. Daily snapshots are immutable and never overwritten. A stale same-day snapshot creates a separate repair snapshot; a tampered same-day snapshot blocks and alerts. Retention keeps 30 daily snapshots and a seven-day/ten-item combined window for incident/repair snapshots, while manual snapshots remain untouched.
+
+The transaction backs up the existing OpenClaw configuration, installed Skill, runtime contract files, health receipt, and full definitions of installer-owned jobs. It only disables exactly identified Gemini incremental jobs and preserves all Gemini indexes, caches and settings for emergency rollback. Unknown/look-alike jobs are not changed; ambiguous ownership or configuration drift fails closed. A committed older installation is reconciled in place, while reinstalling an exact current contract is a no-op. If automatic rollback is incomplete, the CLI preserves that recovery state and does not restart the prior manual runtime into a possibly active managed service; a failed restart after verified rollback is reported together with the primary integration failure.
+
+By default snapshots remain in the private integration state directory. Operators can configure an absolute private root and the failure-alert destination explicitly:
+
+```bash
+./qwen-local integrate-openclaw \
+  --snapshot-root "$HOME/OpenClawBackups/qwen-local" \
+  --timezone Asia/Taipei \
+  --report-channel discord \
+  --report-to channel:YOUR_MONITORING_CHANNEL
+```
+
+The Qwen component also writes a private, bounded `backup-health-component.v1` receipt for a consolidated plain-language backup report. It never puts source text, queries, vectors, corpus content, tokens, or API keys in that receipt.
 
 ## Manage only the Qwen runtime
 

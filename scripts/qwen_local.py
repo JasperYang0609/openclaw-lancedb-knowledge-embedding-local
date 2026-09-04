@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -15,12 +16,47 @@ from src.installer.artifacts import LLAMA_CPP, QWEN_MODEL, validate_manifest
 from src.installer.downloader import ArtifactDownloader
 from src.installer.qwen_installer import DEFAULT_TARGET, QwenInstaller
 from src.lifecycle.llama_server_manager import LlamaServerManager
-from src.openclaw_integration.core import IntegrationManager, IntegrationPaths, OpenClawCli
+from src.openclaw_integration.core import (
+    IntegrationManager,
+    IntegrationPaths,
+    IntegrationRollbackIncomplete,
+    OpenClawCli,
+)
 from src.openclaw_integration.launchd import LAUNCHD_LABEL
 
 
 def emit(payload: dict) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+class RuntimeHandoffRecoveryError(RuntimeError):
+    """The primary integration failure survived, but manual-runtime recovery failed."""
+
+    def __init__(self, original_error: Exception, restart_error: Exception) -> None:
+        super().__init__(
+            "Integration failed after verified rollback, and the prior manual runtime could not be restarted"
+        )
+        self.original_error = original_error
+        self.restart_error = restart_error
+        self.recovery_state = "manual_runtime_restart_failed"
+
+
+def recovery_error_fields(error: Exception) -> dict[str, str]:
+    if isinstance(error, IntegrationRollbackIncomplete):
+        return {
+            "recoveryState": error.recovery_state,
+            "primaryErrorType": type(error.original_error).__name__,
+            "rollbackErrorType": type(error.rollback_error).__name__,
+            "manualRuntimeRestart": "not_attempted",
+        }
+    if isinstance(error, RuntimeHandoffRecoveryError):
+        return {
+            "recoveryState": error.recovery_state,
+            "primaryErrorType": type(error.original_error).__name__,
+            "restartErrorType": type(error.restart_error).__name__,
+            "manualRuntimeRestart": "failed",
+        }
+    return {}
 
 
 def manager_for(installer: QwenInstaller, port: int) -> LlamaServerManager:
@@ -48,27 +84,83 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--node", default="")
     root.add_argument("--profile", default="")
     root.add_argument("--agent", default="main")
+    root.add_argument("--snapshot-root", default="")
+    root.add_argument("--report-channel", default="")
+    root.add_argument("--report-to", default="")
+    root.add_argument("--report-account-id", default="default")
+    root.add_argument("--timezone", default="Asia/Taipei")
+    root.add_argument("--legacy-snapshot-job-id", default="")
+    root.add_argument("--legacy-snapshot-job-sha256", default="")
     return root
+
+
+def resolve_report_target(args: argparse.Namespace, state_root: Path) -> tuple[str, str | None, str]:
+    report_channel = str(getattr(args, "report_channel", "") or "")
+    report_to = str(getattr(args, "report_to", "") or "")
+    report_account_id = str(getattr(args, "report_account_id", "default") or "default")
+    if bool(report_channel) != bool(report_to):
+        raise RuntimeError("Failure alerts require both --report-channel and --report-to")
+    if report_channel and report_to:
+        return report_channel, report_to, report_account_id
+
+    manifest = state_root / "transaction.json"
+    if manifest.exists() or manifest.is_symlink():
+        if manifest.is_symlink() or not manifest.is_file():
+            raise RuntimeError("Stored integration ownership receipt is unsafe")
+        metadata = manifest.stat()
+        if metadata.st_uid != os.getuid() or metadata.st_nlink != 1 or metadata.st_mode & 0o077:
+            raise RuntimeError("Stored integration ownership receipt permissions are unsafe")
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError("Stored integration ownership receipt is malformed") from error
+        ownership = payload.get("ownership") if isinstance(payload, dict) else None
+        if isinstance(ownership, dict) and ownership.get("schema") == "qwen-local-openclaw.v2":
+            stored_channel = ownership.get("reportChannel")
+            stored_to = ownership.get("reportTo")
+            stored_account = ownership.get("reportAccountId", "default")
+            if isinstance(stored_channel, str) and stored_channel \
+                    and isinstance(stored_to, str) and stored_to \
+                    and isinstance(stored_account, str) and stored_account:
+                return stored_channel, stored_to, stored_account
+
+    if getattr(args, "command", "integrate-openclaw") in {
+        "rollback-openclaw", "uninstall-openclaw", "start", "stop",
+    }:
+        return "last", None, report_account_id
+    raise RuntimeError(
+        "Explicit --report-channel and --report-to are required for fresh integration or verification"
+    )
 
 
 def integration_manager(args: argparse.Namespace) -> IntegrationManager:
     home = Path.home().resolve()
-    workspace = Path(args.workspace).expanduser().resolve()
+    workspace = Path(os.path.abspath(Path(args.workspace).expanduser()))
+    state_root = Path(os.path.abspath(Path(args.integration_state).expanduser()))
     paths = IntegrationPaths(
         home=home,
         workspace=workspace,
         project_root=workspace / "knowledge-lancedb-qwen-local",
-        runtime_root=Path(args.target).expanduser().resolve(),
-        state_root=Path(args.integration_state).expanduser().resolve(),
+        runtime_root=Path(os.path.abspath(Path(args.target).expanduser())),
+        state_root=state_root,
         launchd_plist=home / "Library/LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
     )
     openclaw = args.openclaw or shutil.which("openclaw")
     node = args.node or shutil.which("node")
     if not openclaw or not node:
         raise RuntimeError("OpenClaw and Node.js executables are required for integration")
+    report_channel, report_to, report_account_id = resolve_report_target(args, state_root)
     return IntegrationManager(
         paths=paths, repo_root=ROOT, cli=OpenClawCli(openclaw, profile=args.profile or None),
         node_path=Path(node), agent=args.agent,
+        snapshot_root=(Path(os.path.abspath(Path(getattr(args, "snapshot_root", "")).expanduser()))
+                       if getattr(args, "snapshot_root", "") else None),
+        report_channel=report_channel,
+        report_to=report_to,
+        report_account_id=report_account_id,
+        timezone_name=getattr(args, "timezone", "Asia/Taipei"),
+        legacy_snapshot_job_id=getattr(args, "legacy_snapshot_job_id", "") or None,
+        legacy_snapshot_job_sha256=getattr(args, "legacy_snapshot_job_sha256", "") or None,
     )
 
 
@@ -102,9 +194,14 @@ def integrate_with_runtime_handoff(
         runtime_manager.stop()
     try:
         return integration.integrate(runtime_manifest)
-    except Exception:
+    except IntegrationRollbackIncomplete:
+        raise
+    except Exception as original_error:
         if runtime_was_running:
-            runtime_manager.start()
+            try:
+                runtime_manager.start()
+            except Exception as restart_error:
+                raise RuntimeHandoffRecoveryError(original_error, restart_error) from original_error
         raise
 
 
@@ -186,7 +283,13 @@ def main(argv: list[str] | None = None) -> int:
             emit({"ok": True, "command": "uninstall-openclaw", **result})
         return 0
     except Exception as error:
-        emit({"ok": False, "command": args.command, "errorType": type(error).__name__, "message": str(error)})
+        emit({
+            "ok": False,
+            "command": args.command,
+            "errorType": type(error).__name__,
+            "message": str(error),
+            **recovery_error_fields(error),
+        })
         return 1
 
 
