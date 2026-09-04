@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -550,6 +551,20 @@ def test_transaction_receipt_rejects_case_insensitive_keys_and_token_shaped_valu
     assert not store.manifest_path.exists()
 
 
+def test_transaction_store_ignores_stale_interrupted_temporary_file(tmp_path: Path) -> None:
+    state = tmp_path / "private-state"
+    state.mkdir(mode=0o700)
+    stale = state / "transaction.json.tmp"
+    stale.write_text("partial", encoding="utf-8")
+    stale.chmod(0o600)
+    store = core.TransactionStore(state)
+
+    store.write({"schemaVersion": 1, "phase": "checkpointed"})
+
+    assert store.read()["phase"] == "checkpointed"
+    assert stale.read_text(encoding="utf-8") == "partial"
+
+
 def test_both_recurring_jobs_are_verified_disabled_before_global_enable(tmp_path: Path) -> None:
     cli = StatefulCronCli()
     item = manager(tmp_path, cli)
@@ -824,7 +839,7 @@ def prepare_collision_integration_runtime(
     }
 
     @contextmanager
-    def guard() -> Iterator[dict[str, Any]]:
+    def guard(*, checkpoint=None) -> Iterator[dict[str, Any]]:
         yield {"snapshotLockCreated": False, "persisted": False}
 
     monkeypatch.setattr(item, "begin", lambda: dict(base))
@@ -1041,7 +1056,7 @@ def test_activation_failure_invokes_rollback_before_commit(
     }
 
     @contextmanager
-    def guard() -> Iterator[dict[str, Any]]:
+    def guard(*, checkpoint=None) -> Iterator[dict[str, Any]]:
         yield {"snapshotLockCreated": False, "persisted": False}
 
     monkeypatch.setattr(item, "_preflight_cron_inventory", lambda: ([], []))
@@ -1187,6 +1202,7 @@ def write_rollback_transaction(
     item.store.write({
         "schemaVersion": 1,
         "contractVersion": 2,
+        "ownership": item._ownership_payload(),
         "runId": "rollback-fixture",
         "phase": "failed",
         "ownedAssets": [],
@@ -1298,6 +1314,8 @@ def test_failed_fresh_install_removes_only_recorded_empty_snapshot_root_and_lock
     metadata = lock.stat()
 
     item._remove_created_snapshot_artifacts({
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
         "indexLockCreated": True,
         "indexLockDev": index_metadata.st_dev,
         "indexLockIno": index_metadata.st_ino,
@@ -1317,6 +1335,8 @@ def test_created_lock_cleanup_is_idempotent_when_locks_are_already_absent(tmp_pa
     item.snapshot_root.mkdir(parents=True, mode=0o700)
 
     item._remove_created_snapshot_artifacts({
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
         "indexLockCreated": True,
         "indexLockDev": 1,
         "indexLockIno": 2,
@@ -1327,6 +1347,196 @@ def test_created_lock_cleanup_is_idempotent_when_locks_are_already_absent(tmp_pa
     })
 
     assert item.snapshot_root.is_dir()
+
+
+def test_created_snapshot_cleanup_is_bound_to_transaction_ownership(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    unrelated = item.paths.home / "unrelated-private-snapshots"
+    unrelated.mkdir(mode=0o700)
+    mismatched = manager(tmp_path, snapshot_root=unrelated)
+    transaction = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "indexLockCreated": False,
+        "snapshotLockCreated": False,
+        "snapshotRootCreated": True,
+    }
+
+    with pytest.raises(RuntimeError, match="does not match transaction ownership"):
+        mismatched._remove_created_snapshot_artifacts(transaction)
+
+    assert item.snapshot_root.is_dir()
+    assert unrelated.is_dir()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX crash semantics")
+def test_quiescence_lock_identities_survive_sigkill_before_guard_yields(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    data = item.paths.project_root / "data"
+    data.mkdir(mode=0o700)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    item.store.write({
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "phase": "quiescing",
+        "ownership": item._ownership_payload(),
+    })
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        transaction = item.store.read()
+
+        def checkpoint(receipt: dict[str, Any]) -> None:
+            transaction.update({
+                key: value for key, value in receipt.items()
+                if key not in {
+                    "persisted", "indexLockPersisted", "snapshotLockPersisted",
+                }
+            })
+            item.store.write(transaction)
+            if "snapshotLockDev" in receipt:
+                os.write(write_fd, b"ready")
+                signal.pause()
+
+        try:
+            with item._runtime_quiescence_guard(checkpoint=checkpoint):
+                os._exit(2)
+        finally:
+            os._exit(3)
+
+    os.close(write_fd)
+    try:
+        assert os.read(read_fd, 5) == b"ready"
+        os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFSIGNALED(status)
+        transaction = item.store.read()
+        assert transaction["indexLockCreated"] is True
+        assert transaction["snapshotLockCreated"] is True
+        assert isinstance(transaction["indexLockDev"], int)
+        assert isinstance(transaction["indexLockIno"], int)
+        assert isinstance(transaction["snapshotLockDev"], int)
+        assert isinstance(transaction["snapshotLockIno"], int)
+        assert (data / "index.lock").is_dir()
+        assert (item.snapshot_root / ".snapshot-run.lock").is_file()
+
+        item._remove_created_snapshot_artifacts(transaction)
+
+        assert not (data / "index.lock").exists()
+        assert not (item.snapshot_root / ".snapshot-run.lock").exists()
+        assert item.snapshot_root.is_dir()
+    finally:
+        os.close(read_fd)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX crash semantics")
+def test_sigkill_while_waiting_preserves_preexisting_snapshot_lock(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    data = item.paths.project_root / "data"
+    data.mkdir(mode=0o700)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+    snapshot_lock = item.snapshot_root / ".snapshot-run.lock"
+    snapshot_fd = os.open(
+        snapshot_lock, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+    )
+    core.fcntl.flock(snapshot_fd, core.fcntl.LOCK_EX | core.fcntl.LOCK_NB)
+    snapshot_identity = snapshot_lock.stat()
+    item.store.write({
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "phase": "quiescing",
+        "ownership": item._ownership_payload(),
+    })
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        transaction = item.store.read()
+
+        def checkpoint(receipt: dict[str, Any]) -> None:
+            transaction.update(receipt)
+            item.store.write(transaction)
+            if "snapshotLockDev" in receipt:
+                os.write(write_fd, b"ready")
+
+        try:
+            with item._runtime_quiescence_guard(
+                checkpoint=checkpoint, timeout_seconds=60, poll_seconds=0.01,
+            ):
+                os._exit(2)
+        finally:
+            os._exit(3)
+
+    os.close(write_fd)
+    try:
+        assert os.read(read_fd, 5) == b"ready"
+        os.kill(pid, signal.SIGKILL)
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFSIGNALED(status)
+        transaction = item.store.read()
+        assert transaction["indexLockCreated"] is True
+        assert transaction["snapshotLockCreated"] is False
+        assert transaction["snapshotLockDev"] == snapshot_identity.st_dev
+        assert transaction["snapshotLockIno"] == snapshot_identity.st_ino
+
+        item._remove_created_snapshot_artifacts(transaction)
+
+        assert not (data / "index.lock").exists()
+        assert snapshot_lock.is_file()
+        after = snapshot_lock.stat()
+        assert (after.st_dev, after.st_ino) == (
+            snapshot_identity.st_dev, snapshot_identity.st_ino,
+        )
+    finally:
+        core.fcntl.flock(snapshot_fd, core.fcntl.LOCK_UN)
+        os.close(snapshot_fd)
+        os.close(read_fd)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+
+def test_recovery_rejects_replaced_index_lock_without_deleting_it(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    data = item.paths.project_root / "data"
+    data.mkdir(mode=0o700)
+    index_lock = data / "index.lock"
+    index_lock.mkdir(mode=0o700)
+    original = index_lock.stat()
+    index_lock.rmdir()
+    index_lock.mkdir(mode=0o700)
+    replacement = index_lock.stat()
+    if (replacement.st_dev, replacement.st_ino) == (original.st_dev, original.st_ino):
+        pytest.skip("filesystem immediately reused the lock inode")
+    transaction = {
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
+        "indexLockCreated": True,
+        "indexLockDev": original.st_dev,
+        "indexLockIno": original.st_ino,
+        "snapshotLockCreated": False,
+        "snapshotRootCreated": False,
+    }
+
+    with pytest.raises(RuntimeError, match="Created index lock changed"):
+        item._remove_created_snapshot_artifacts(transaction)
+
+    assert index_lock.is_dir()
 
 
 def initial_job(item: core.IntegrationManager, *, enabled: bool = True) -> dict[str, Any]:
@@ -1548,6 +1758,7 @@ def _write_precise_runtime_transaction(
     transaction: dict[str, Any] = {
         "schemaVersion": 1,
         "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "ownership": item._ownership_payload(),
         "runId": "precise-runtime-fixture",
         "phase": "failed",
         "ownedAssets": [],
@@ -1810,7 +2021,7 @@ def test_successful_integration_commits_after_activation_verification_and_reinst
     monkeypatch.setattr(item, "_prepare_snapshot_root", lambda: True)
 
     @contextmanager
-    def guard() -> Iterator[dict[str, Any]]:
+    def guard(*, checkpoint=None) -> Iterator[dict[str, Any]]:
         yield {"snapshotLockCreated": False, "persisted": False}
 
     monkeypatch.setattr(item, "_runtime_quiescence_guard", guard)

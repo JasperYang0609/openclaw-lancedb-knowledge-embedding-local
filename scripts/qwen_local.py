@@ -176,19 +176,31 @@ def resolve_report_target(args: argparse.Namespace, state_root: Path) -> tuple[s
 
 def resolve_snapshot_root(args: argparse.Namespace, state_root: Path) -> Path | None:
     explicit = str(getattr(args, "snapshot_root", "") or "")
-    if explicit:
-        return Path(os.path.abspath(Path(explicit).expanduser()))
-
     ownership = load_stored_ownership(state_root)
-    if ownership is None or "snapshotRoot" not in ownership:
-        return None
-    stored = ownership["snapshotRoot"]
-    if not isinstance(stored, str) or not stored:
-        raise RuntimeError("Stored snapshot root is malformed")
-    candidate = Path(stored).expanduser()
-    if not candidate.is_absolute():
-        raise RuntimeError("Stored snapshot root must be absolute")
-    return Path(os.path.abspath(candidate))
+    stored_root: Path | None = None
+    if ownership is not None:
+        if "snapshotRoot" not in ownership:
+            raise RuntimeError("Stored snapshot root is missing")
+        stored = ownership["snapshotRoot"]
+        if not isinstance(stored, str) or not stored:
+            raise RuntimeError("Stored snapshot root is malformed")
+        candidate = Path(stored).expanduser()
+        if not candidate.is_absolute():
+            raise RuntimeError("Stored snapshot root must be absolute")
+        stored_root = Path(os.path.abspath(candidate))
+
+    if explicit:
+        explicit_root = Path(os.path.abspath(Path(explicit).expanduser()))
+        recovery_commands = {
+            "rollback-openclaw", "uninstall-openclaw", "verify-openclaw",
+        }
+        if getattr(args, "command", "") in recovery_commands \
+                and stored_root is not None and explicit_root != stored_root:
+            raise RuntimeError(
+                "Explicit snapshot root does not match stored integration ownership"
+            )
+        return explicit_root
+    return stored_root
 
 
 def resolve_disabled_collision_approval(

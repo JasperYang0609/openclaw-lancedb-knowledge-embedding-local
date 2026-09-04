@@ -175,7 +175,7 @@ class TransactionStore:
         os.chmod(self.state_root, 0o700)
         if self.manifest_path.is_symlink():
             raise RuntimeError("Transaction manifest must not be a symbolic link")
-        temporary = self.manifest_path.with_suffix(".json.tmp")
+        temporary = self.state_root / f".transaction.{uuid.uuid4().hex}.tmp"
         try:
             descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except OSError as error:
@@ -188,6 +188,13 @@ class TransactionStore:
                 os.fsync(handle.fileno())
             os.replace(temporary, self.manifest_path)
             os.chmod(self.manifest_path, 0o600)
+            directory_fd = os.open(
+                self.state_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         except Exception:
             temporary.unlink(missing_ok=True)
             raise
@@ -1419,8 +1426,10 @@ class IntegrationManager:
         return enabled_before
 
     @contextmanager
-    def _runtime_quiescence_guard(self, *, timeout_seconds: float = 1800,
-                                  poll_seconds: float = 1.0) -> Iterator[dict[str, Any]]:
+    def _runtime_quiescence_guard(
+        self, *, timeout_seconds: float = 1800, poll_seconds: float = 1.0,
+        checkpoint: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Iterator[dict[str, Any]]:
         """Block new index/snapshot work while installer-owned runtime files are replaced."""
         if not self.paths.project_root.exists():
             yield {"snapshotLockCreated": False}
@@ -1443,6 +1452,8 @@ class IntegrationManager:
         lock_receipt: dict[str, Any] = {
             "indexLockCreated": False,
             "snapshotLockCreated": False,
+            "indexLockPersisted": False,
+            "snapshotLockPersisted": False,
             "persisted": False,
         }
         try:
@@ -1456,6 +1467,20 @@ class IntegrationManager:
                         "indexLockDev": metadata.st_dev,
                         "indexLockIno": metadata.st_ino,
                     })
+                    data_fd = os.open(
+                        data, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    )
+                    try:
+                        os.fsync(data_fd)
+                    finally:
+                        os.close(data_fd)
+                    if checkpoint is not None:
+                        checkpoint({
+                            "indexLockCreated": True,
+                            "indexLockDev": metadata.st_dev,
+                            "indexLockIno": metadata.st_ino,
+                        })
+                        lock_receipt["indexLockPersisted"] = True
                 except FileExistsError:
                     if index_lock.is_symlink() or not index_lock.is_dir():
                         raise RuntimeError("Qwen index lock path is unsafe")
@@ -1464,8 +1489,16 @@ class IntegrationManager:
                     time.sleep(min(max(0.01, poll_seconds), max(0.01, deadline - time.monotonic())))
             snapshot_root = self.snapshot_root
             snapshot_lock = snapshot_root / ".snapshot-run.lock"
-            snapshot_lock_created = not os.path.lexists(snapshot_lock)
-            snapshot_fd = os.open(snapshot_lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            try:
+                snapshot_fd = os.open(
+                    snapshot_lock,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                )
+                snapshot_lock_created = True
+            except FileExistsError:
+                snapshot_fd = os.open(snapshot_lock, os.O_RDWR | os.O_NOFOLLOW)
+                snapshot_lock_created = False
             snapshot_meta = os.fstat(snapshot_fd)
             if not stat.S_ISREG(snapshot_meta.st_mode) or snapshot_meta.st_uid != os.getuid() \
                     or snapshot_meta.st_nlink != 1 or snapshot_meta.st_mode & 0o077:
@@ -1476,6 +1509,22 @@ class IntegrationManager:
                 "snapshotLockDev": snapshot_meta.st_dev,
                 "snapshotLockIno": snapshot_meta.st_ino,
             })
+            if snapshot_lock_created:
+                os.fsync(snapshot_fd)
+                snapshot_root_fd = os.open(
+                    snapshot_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                )
+                try:
+                    os.fsync(snapshot_root_fd)
+                finally:
+                    os.close(snapshot_root_fd)
+            if checkpoint is not None:
+                checkpoint({
+                    "snapshotLockCreated": snapshot_lock_created,
+                    "snapshotLockDev": snapshot_meta.st_dev,
+                    "snapshotLockIno": snapshot_meta.st_ino,
+                })
+                lock_receipt["snapshotLockPersisted"] = True
             while not snapshot_locked:
                 try:
                     fcntl.flock(snapshot_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1492,7 +1541,9 @@ class IntegrationManager:
                         fcntl.flock(snapshot_fd, fcntl.LOCK_UN)
                 finally:
                     os.close(snapshot_fd)
-            if snapshot_lock_created and lock_receipt.get("persisted") is not True \
+            if snapshot_lock_created \
+                    and lock_receipt.get("snapshotLockPersisted") is not True \
+                    and lock_receipt.get("persisted") is not True \
                     and snapshot_identity is not None:
                 try:
                     metadata = snapshot_lock.lstat()
@@ -2422,9 +2473,21 @@ class IntegrationManager:
             transaction["phase"] = "quiesced"
             self.store.write(transaction)
 
-            with self._runtime_quiescence_guard() as lock_receipt:
+            def checkpoint_quiescence_lock(lock_receipt: dict[str, Any]) -> None:
+                for key, value in lock_receipt.items():
+                    if key in transaction and transaction[key] != value:
+                        raise RuntimeError("Quiescence lock receipt attempted to change identity")
+                    transaction[key] = value
+                self.store.write(transaction)
+
+            with self._runtime_quiescence_guard(
+                checkpoint=checkpoint_quiescence_lock,
+            ) as lock_receipt:
                 transaction.update({
-                    key: value for key, value in lock_receipt.items() if key != "persisted"
+                    key: value for key, value in lock_receipt.items()
+                    if key not in {
+                        "persisted", "indexLockPersisted", "snapshotLockPersisted",
+                    }
                 })
                 self.store.write(transaction)
                 lock_receipt["persisted"] = True
@@ -2637,6 +2700,29 @@ class IntegrationManager:
         with self._integration_lock():
             return self._rollback_locked(require_exact_post_config=require_exact_post_config)
 
+    def _snapshot_root_from_transaction(self, transaction: dict[str, Any]) -> Path:
+        if transaction.get("contractVersion") != INTEGRATION_CONTRACT_VERSION:
+            return self.snapshot_root
+        ownership = transaction.get("ownership")
+        if not isinstance(ownership, dict) or ownership.get("schema") != OWNERSHIP_SCHEMA:
+            raise RuntimeError("Rollback snapshot ownership is missing or malformed")
+        stored = ownership.get("snapshotRoot")
+        if not isinstance(stored, str) or not stored:
+            raise RuntimeError("Rollback snapshot ownership is missing or malformed")
+        raw = Path(stored).expanduser()
+        if not raw.is_absolute():
+            raise RuntimeError("Rollback snapshot ownership must be absolute")
+        root = Path(os.path.abspath(raw))
+        _assert_no_symlink_components(root)
+        _assert_specific_child(root, self.paths.home, "rollback snapshot root")
+        if root != self.snapshot_root:
+            raise RuntimeError("Rollback snapshot root does not match transaction ownership")
+        project = self.paths.project_root.resolve(strict=False)
+        resolved = root.resolve(strict=False)
+        if resolved == project or project in resolved.parents:
+            raise RuntimeError("Rollback snapshot root is inside the live Qwen project")
+        return root
+
     def _remove_created_snapshot_artifacts(self, transaction: dict[str, Any]) -> None:
         if transaction.get("indexLockCreated") is True:
             expected_dev = transaction.get("indexLockDev")
@@ -2674,7 +2760,7 @@ class IntegrationManager:
                 if data_fd is not None:
                     os.close(data_fd)
 
-        root = Path(os.path.abspath(self.snapshot_root))
+        root = self._snapshot_root_from_transaction(transaction)
         if transaction.get("snapshotLockCreated") is True:
             expected_dev = transaction.get("snapshotLockDev")
             expected_ino = transaction.get("snapshotLockIno")
@@ -2761,6 +2847,7 @@ class IntegrationManager:
 
     def _rollback_locked(self, *, require_exact_post_config: bool = True) -> dict[str, Any]:
         transaction = self.store.read()
+        self._snapshot_root_from_transaction(transaction)
         config = Path(transaction["configPath"])
         run_dev = transaction.get("snapshotRunDev")
         run_ino = transaction.get("snapshotRunIno")

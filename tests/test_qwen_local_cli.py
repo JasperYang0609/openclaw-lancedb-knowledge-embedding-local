@@ -152,6 +152,27 @@ def test_snapshot_root_explicit_value_takes_precedence(tmp_path: Path) -> None:
     ) == explicit.resolve()
 
 
+@pytest.mark.parametrize(
+    "command", ["rollback-openclaw", "uninstall-openclaw", "verify-openclaw"],
+)
+def test_recovery_snapshot_root_must_match_stored_ownership(
+    tmp_path: Path, command: str,
+) -> None:
+    state = tmp_path / "state"
+    stored = tmp_path / "stored"
+    explicit = tmp_path / "unrelated"
+    write_stored_ownership(state, None, snapshot_root=str(stored.resolve()))
+
+    with pytest.raises(RuntimeError, match="does not match stored integration ownership"):
+        resolve_snapshot_root(
+            SimpleNamespace(snapshot_root=str(explicit), command=command), state,
+        )
+
+    assert resolve_snapshot_root(
+        SimpleNamespace(snapshot_root=str(stored), command=command), state,
+    ) == stored.resolve()
+
+
 def test_parser_accepts_only_the_complete_incremental_disabled_collision_approval() -> None:
     help_text = parser().format_help()
     assert "ID-inclusive SHA-256" in help_text
