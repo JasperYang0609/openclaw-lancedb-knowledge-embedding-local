@@ -76,6 +76,10 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
   before post-state capture; a missing parent is installed through an atomically
   published, durably checkpointed identity. Rollback accepts no unreceipted parent
   transition and fails closed on namespace replacement.
+  Legacy source-installed Skills may preserve one exact npm-bin link only:
+  `assets/knowledge-lancedb-template/node_modules/.bin/arrow2csv` to the exact
+  contained `../apache-arrow/bin/arrow2csv.js` target. Sibling, absolute, alternate,
+  traversal, cross-asset, and tampered-backup links fail closed.
   Launchd activation and rollback apply bounded retry followed by service
   readback, and cron restoration begins only after runtime restoration.
 - A07 Authentication Failures — `NOT_APPLICABLE_WITH_EVIDENCE`. This change adds no
@@ -113,9 +117,9 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
 
 ## Verification evidence
 
-- Python suite: `371 passed` on macOS and `371 passed` in a non-root Python 3.12
+- Python suite: `377 passed` on macOS and `377 passed` in a non-root Python 3.12
   Linux container.
-- Final safety-focused release suite: `42 passed`.
+- Parent-identity safety suite: `42 passed`; legacy Skill-link suite: `6 passed`.
 - Qwen template Node suite: `28 passed`.
 - OpenClaw Plugin Node suite: `5 passed`; syntax check and official Plugin validation
   passed.

@@ -1075,26 +1075,56 @@ class IntegrationManager:
                 or target_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise RuntimeError("Rollback asset symbolic link destination is unsafe")
 
-    def _safe_tree_sha256(self, root: Path, *, label: str) -> str:
+    @staticmethod
+    def _skill_asset_symlink_policy(relative: str, target: str) -> None:
+        expected_relative = (
+            "assets/knowledge-lancedb-template/node_modules/.bin/arrow2csv"
+        )
+        expected_target = "../apache-arrow/bin/arrow2csv.js"
+        if relative != expected_relative:
+            raise RuntimeError("Rollback asset contains an unsupported symbolic link")
+        if target != expected_target:
+            raise RuntimeError("Rollback asset contains an unsafe symbolic link target")
+
+    def _safe_tree_sha256(
+        self,
+        root: Path,
+        *,
+        label: str,
+        symlink_policy: Callable[[str, str], None] | None = None,
+    ) -> str:
         try:
             with self._open_private_directory(root.parent) as parent_fd:
                 return inspect_asset_at(
                     parent_fd,
                     root.name,
                     kind="directory",
-                    symlink_policy=self._asset_symlink_policy,
+                    symlink_policy=symlink_policy,
                 ).sha256
         except RuntimeError:
             raise
         except (OSError, ValueError) as error:
             raise RuntimeError(f"{label} is missing or unsafe") from error
 
-    def _copy_safe_tree(self, source: Path, target: Path, *, label: str) -> str:
-        expected = self._safe_tree_sha256(source, label=label)
+    def _copy_safe_tree(
+        self,
+        source: Path,
+        target: Path,
+        *,
+        label: str,
+        symlink_policy: Callable[[str, str], None] | None = None,
+    ) -> str:
+        expected = self._safe_tree_sha256(
+            source, label=label, symlink_policy=symlink_policy,
+        )
         if target.exists() or target.is_symlink():
             raise RuntimeError(f"{label} backup target already exists")
         shutil.copytree(source, target, symlinks=True)
-        if self._safe_tree_sha256(target, label=f"{label} backup") != expected:
+        if self._safe_tree_sha256(
+            target,
+            label=f"{label} backup",
+            symlink_policy=symlink_policy,
+        ) != expected:
             raise RuntimeError(f"{label} backup verification failed")
         return expected
 
@@ -1136,14 +1166,20 @@ class IntegrationManager:
         except (OSError, ValueError) as error:
             raise RuntimeError(f"{label} is missing or unsafe") from error
 
-    def _safe_directory_identity(self, path: Path, *, label: str) -> dict[str, Any]:
+    def _safe_directory_identity(
+        self,
+        path: Path,
+        *,
+        label: str,
+        symlink_policy: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
         try:
             with self._open_private_directory(path.parent) as parent_fd:
                 return inspect_asset_at(
                     parent_fd,
                     path.name,
                     kind="directory",
-                    symlink_policy=self._asset_symlink_policy,
+                    symlink_policy=symlink_policy,
                 ).as_dict()
         except RuntimeError:
             raise
@@ -1151,10 +1187,17 @@ class IntegrationManager:
             raise RuntimeError(f"{label} is missing or unsafe") from error
 
     def _safe_asset_identity(
-        self, path: Path, *, kind: str, label: str,
+        self,
+        path: Path,
+        *,
+        kind: str,
+        label: str,
+        symlink_policy: Callable[[str, str], None] | None = None,
     ) -> dict[str, Any]:
         if kind == "directory":
-            return self._safe_directory_identity(path, label=label)
+            return self._safe_directory_identity(
+                path, label=label, symlink_policy=symlink_policy,
+            )
         if kind == "file":
             return self._safe_file_identity(path, label=label)
         raise RuntimeError("Rollback asset kind is unsupported")
@@ -1234,6 +1277,7 @@ class IntegrationManager:
         for spec in self._rollback_asset_specs():
             target = spec.target
             backup = snapshot_dir / spec.backup_relative
+            symlink_policy = self._asset_symlink_policy_for(spec)
             if target.is_symlink():
                 raise RuntimeError(f"Existing rollback asset {spec.asset_id} is a symbolic link")
             existed = target.exists()
@@ -1280,24 +1324,36 @@ class IntegrationManager:
             }
             if existed:
                 before = self._safe_asset_identity(
-                    target, kind=spec.kind, label=f"Existing rollback asset {spec.asset_id}",
+                    target,
+                    kind=spec.kind,
+                    label=f"Existing rollback asset {spec.asset_id}",
+                    symlink_policy=symlink_policy,
                 )
                 backup.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 if spec.kind == "directory":
                     copied_sha256 = self._copy_safe_tree(
-                        target, backup, label=f"Existing rollback asset {spec.asset_id}",
+                        target,
+                        backup,
+                        label=f"Existing rollback asset {spec.asset_id}",
+                        symlink_policy=symlink_policy,
                     )
                 else:
                     copied_sha256 = self._copy_safe_file(
                         target, backup, label=f"Existing rollback asset {spec.asset_id}",
                     )
                 after = self._safe_asset_identity(
-                    target, kind=spec.kind, label=f"Existing rollback asset {spec.asset_id}",
+                    target,
+                    kind=spec.kind,
+                    label=f"Existing rollback asset {spec.asset_id}",
+                    symlink_policy=symlink_policy,
                 )
                 if before != after or copied_sha256 != before["sha256"]:
                     raise RuntimeError(f"Rollback asset {spec.asset_id} changed during snapshot")
                 backup_identity = self._safe_asset_identity(
-                    backup, kind=spec.kind, label=f"Rollback backup {spec.asset_id}",
+                    backup,
+                    kind=spec.kind,
+                    label=f"Rollback backup {spec.asset_id}",
+                    symlink_policy=symlink_policy,
                 )
                 if backup_identity["sha256"] != before["sha256"]:
                     raise RuntimeError(f"Rollback backup {spec.asset_id} failed verification")
@@ -1384,7 +1440,11 @@ class IntegrationManager:
     def _asset_symlink_policy_for(
         self, spec: RollbackAssetSpec,
     ) -> Callable[[str, str], None] | None:
-        return self._asset_symlink_policy if spec.asset_id == "plugin" else None
+        if spec.asset_id == "plugin":
+            return self._asset_symlink_policy
+        if spec.asset_id == "skill":
+            return self._skill_asset_symlink_policy
+        return None
 
     def _inspect_optional_asset(
         self, spec: RollbackAssetSpec, *, name: str | None = None,

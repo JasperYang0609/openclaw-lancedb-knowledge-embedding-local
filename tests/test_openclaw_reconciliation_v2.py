@@ -2965,7 +2965,10 @@ def test_plugin_snapshot_restores_exact_tree_after_forced_upgrade(
     asset["mutationStarted"] = True
     receipt["pluginMutationStarted"] = True
     post = item._safe_asset_identity(
-        item.plugin_target, kind="directory", label="installed plugin",
+        item.plugin_target,
+        kind="directory",
+        label="installed plugin",
+        symlink_policy=item._asset_symlink_policy,
     )
     asset.update({
         "postParentDev": item.plugin_target.parent.stat().st_dev,
@@ -2987,7 +2990,11 @@ def test_plugin_snapshot_restores_exact_tree_after_forced_upgrade(
     assert restored_link.is_symlink()
     assert os.readlink(restored_link) == str(openclaw_package)
     assert not (item.plugin_target / "added.js").exists()
-    assert item._safe_tree_sha256(item.plugin_target, label="restored plugin") == receipt[
+    assert item._safe_tree_sha256(
+        item.plugin_target,
+        label="restored plugin",
+        symlink_policy=item._asset_symlink_policy,
+    ) == receipt[
         "pluginBackupSha256"
     ]
     assert not any(call[:2] == ["plugins", "uninstall"] for call in cli.calls)
