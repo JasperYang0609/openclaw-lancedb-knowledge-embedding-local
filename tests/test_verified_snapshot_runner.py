@@ -29,10 +29,19 @@ health = load_module("qwen_backup_health_component", SCRIPTS / "backup_health_co
 runner = load_module("qwen_verified_snapshot_runner", SCRIPTS / "run_verified_snapshot.py")
 
 
+@pytest.fixture(autouse=True)
+def private_test_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_home = tmp_path / "home"
+    fake_home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+
 def ownership_fixture(tmp_path: Path, *, phase: str = "committed") -> tuple[Path, dict[str, str]]:
-    project = tmp_path / "knowledge-lancedb-qwen-local"
-    snapshot_root = tmp_path / "private-snapshots"
-    state_root = tmp_path / "integration-state"
+    fixture_root = Path.home() / "snapshot-fixtures" / tmp_path.name
+    fixture_root.mkdir(parents=True, mode=0o700)
+    project = fixture_root / "knowledge-lancedb-qwen-local"
+    snapshot_root = fixture_root / "private-snapshots"
+    state_root = fixture_root / "integration-state"
     project.mkdir(mode=0o755)
     (project / "data").mkdir(mode=0o755)
     snapshot_root.mkdir(mode=0o700)

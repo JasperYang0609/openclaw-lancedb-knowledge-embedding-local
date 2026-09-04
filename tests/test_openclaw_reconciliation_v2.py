@@ -449,6 +449,22 @@ def test_runtime_quiescence_guard_refuses_held_snapshot_lock_and_releases_index_
     assert not (item.paths.project_root / "data/index.lock").exists()
 
 
+def test_runtime_quiescence_guard_receipts_created_index_lock_identity(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    data = item.paths.project_root / "data"
+    data.mkdir(mode=0o700)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+
+    with item._runtime_quiescence_guard() as receipt:
+        index_lock = data / "index.lock"
+        metadata = index_lock.stat()
+        assert receipt["indexLockCreated"] is True
+        assert receipt["indexLockDev"] == metadata.st_dev
+        assert receipt["indexLockIno"] == metadata.st_ino
+
+    assert not (data / "index.lock").exists()
+
+
 def test_managed_contract_requires_exact_alert_delivery_env_and_tools(tmp_path: Path) -> None:
     item = manager(tmp_path)
     spec = item._incremental_spec()
@@ -1270,6 +1286,11 @@ def test_rollback_cron_mutation_failure_never_marks_transaction_rolled_back(
 
 def test_failed_fresh_install_removes_only_recorded_empty_snapshot_root_and_lock(tmp_path: Path) -> None:
     item = manager(tmp_path)
+    data = item.paths.project_root / "data"
+    data.mkdir(mode=0o700)
+    index_lock = data / "index.lock"
+    index_lock.mkdir(mode=0o700)
+    index_metadata = index_lock.stat()
     item.snapshot_root.mkdir(parents=True, mode=0o700)
     lock = item.snapshot_root / ".snapshot-run.lock"
     lock.touch(mode=0o600)
@@ -1277,13 +1298,35 @@ def test_failed_fresh_install_removes_only_recorded_empty_snapshot_root_and_lock
     metadata = lock.stat()
 
     item._remove_created_snapshot_artifacts({
+        "indexLockCreated": True,
+        "indexLockDev": index_metadata.st_dev,
+        "indexLockIno": index_metadata.st_ino,
         "snapshotLockCreated": True,
         "snapshotLockDev": metadata.st_dev,
         "snapshotLockIno": metadata.st_ino,
         "snapshotRootCreated": True,
     })
 
+    assert not index_lock.exists()
     assert not item.snapshot_root.exists()
+
+
+def test_created_lock_cleanup_is_idempotent_when_locks_are_already_absent(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    (item.paths.project_root / "data").mkdir(mode=0o700)
+    item.snapshot_root.mkdir(parents=True, mode=0o700)
+
+    item._remove_created_snapshot_artifacts({
+        "indexLockCreated": True,
+        "indexLockDev": 1,
+        "indexLockIno": 2,
+        "snapshotLockCreated": True,
+        "snapshotLockDev": 3,
+        "snapshotLockIno": 4,
+        "snapshotRootCreated": False,
+    })
+
+    assert item.snapshot_root.is_dir()
 
 
 def initial_job(item: core.IntegrationManager, *, enabled: bool = True) -> dict[str, Any]:
@@ -1354,6 +1397,7 @@ def test_initial_job_and_health_receipt_are_verified_as_exact_contracts(tmp_path
         "pending": [],
     }
     item.health_receipt_path.parent.mkdir(parents=True)
+    item.health_receipt_path.parent.chmod(0o700)
     item.health_receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     item.health_receipt_path.chmod(0o600)
     assert item._health_receipt_status() == "ok"

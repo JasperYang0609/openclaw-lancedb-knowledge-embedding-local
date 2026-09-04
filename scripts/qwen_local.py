@@ -174,6 +174,23 @@ def resolve_report_target(args: argparse.Namespace, state_root: Path) -> tuple[s
     )
 
 
+def resolve_snapshot_root(args: argparse.Namespace, state_root: Path) -> Path | None:
+    explicit = str(getattr(args, "snapshot_root", "") or "")
+    if explicit:
+        return Path(os.path.abspath(Path(explicit).expanduser()))
+
+    ownership = load_stored_ownership(state_root)
+    if ownership is None or "snapshotRoot" not in ownership:
+        return None
+    stored = ownership["snapshotRoot"]
+    if not isinstance(stored, str) or not stored:
+        raise RuntimeError("Stored snapshot root is malformed")
+    candidate = Path(stored).expanduser()
+    if not candidate.is_absolute():
+        raise RuntimeError("Stored snapshot root must be absolute")
+    return Path(os.path.abspath(candidate))
+
+
 def resolve_disabled_collision_approval(
     args: argparse.Namespace, state_root: Path,
 ) -> ApprovedDisabledCronCollision | None:
@@ -229,11 +246,11 @@ def integration_manager(args: argparse.Namespace) -> IntegrationManager:
         raise RuntimeError("OpenClaw and Node.js executables are required for integration")
     report_channel, report_to, report_account_id = resolve_report_target(args, state_root)
     approved_collision = resolve_disabled_collision_approval(args, state_root)
+    snapshot_root = resolve_snapshot_root(args, state_root)
     return IntegrationManager(
         paths=paths, repo_root=ROOT, cli=OpenClawCli(openclaw, profile=args.profile or None),
         node_path=Path(node), agent=args.agent,
-        snapshot_root=(Path(os.path.abspath(Path(getattr(args, "snapshot_root", "")).expanduser()))
-                       if getattr(args, "snapshot_root", "") else None),
+        snapshot_root=snapshot_root,
         report_channel=report_channel,
         report_to=report_to,
         report_account_id=report_account_id,

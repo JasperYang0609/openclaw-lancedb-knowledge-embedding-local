@@ -19,6 +19,7 @@ from scripts.qwen_local import (
     resolve_disabled_collision_approval,
     resolve_port,
     resolve_report_target,
+    resolve_snapshot_root,
 )
 
 
@@ -31,20 +32,24 @@ def write_stored_ownership(
     *,
     schema_version: object = 1,
     phase: object = "committed",
+    snapshot_root: object | None = None,
 ) -> None:
     state.mkdir(parents=True, mode=0o700)
     state.chmod(0o700)
     manifest = state / "transaction.json"
+    ownership = {
+        "schema": "qwen-local-openclaw.v2",
+        "reportChannel": "discord",
+        "reportTo": "channel:stored",
+        "reportAccountId": "default",
+        "approvedDisabledCollision": approval,
+    }
+    if snapshot_root is not None:
+        ownership["snapshotRoot"] = snapshot_root
     manifest.write_text(json.dumps({
         "schemaVersion": schema_version,
         "phase": phase,
-        "ownership": {
-            "schema": "qwen-local-openclaw.v2",
-            "reportChannel": "discord",
-            "reportTo": "channel:stored",
-            "reportAccountId": "default",
-            "approvedDisabledCollision": approval,
-        },
+        "ownership": ownership,
     }), encoding="utf-8")
     manifest.chmod(0o600)
 
@@ -111,6 +116,40 @@ def test_integration_manager_factory_returns_configured_manager(tmp_path: Path) 
     assert manager.report_channel == "discord"
     assert manager.report_to == "channel:1493072746702311474"
     assert manager.report_account_id == "default"
+
+
+def test_snapshot_root_reuses_stored_staging_transaction_for_rollback(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    snapshot_root = tmp_path / "snapshots"
+    write_stored_ownership(
+        state,
+        None,
+        phase="staging",
+        snapshot_root=str(snapshot_root.resolve()),
+    )
+    args = SimpleNamespace(snapshot_root="")
+
+    assert resolve_snapshot_root(args, state) == snapshot_root.resolve()
+
+
+@pytest.mark.parametrize("stored", ["", "relative/snapshots", 42])
+def test_snapshot_root_rejects_malformed_stored_value(tmp_path: Path, stored: object) -> None:
+    state = tmp_path / "state"
+    write_stored_ownership(state, None, phase="staging", snapshot_root=stored)
+
+    with pytest.raises(RuntimeError, match="Stored snapshot root"):
+        resolve_snapshot_root(SimpleNamespace(snapshot_root=""), state)
+
+
+def test_snapshot_root_explicit_value_takes_precedence(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    stored = tmp_path / "stored"
+    explicit = tmp_path / "explicit"
+    write_stored_ownership(state, None, snapshot_root=str(stored.resolve()))
+
+    assert resolve_snapshot_root(
+        SimpleNamespace(snapshot_root=str(explicit)), state,
+    ) == explicit.resolve()
 
 
 def test_parser_accepts_only_the_complete_incremental_disabled_collision_approval() -> None:

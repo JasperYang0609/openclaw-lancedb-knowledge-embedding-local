@@ -60,8 +60,11 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
   failure types. The sole disabled-collision exception is a closed incremental-only
   contract and remains unknown inventory throughout install and rollback. Plugin,
   configuration, Skill, plist, and launchd mutations use distinct durable
-  checkpoints. Launchd activation and rollback apply bounded retry followed by
-  service readback, and cron restoration begins only after runtime restoration.
+  checkpoints. Both runtime lock identities are persisted before staging; recovery
+  removes only an exact installer-created stale lock. Rollback and verification
+  reuse the private transaction's custom snapshot root when no CLI override is
+  supplied. Launchd activation and rollback apply bounded retry followed by service
+  readback, and cron restoration begins only after runtime restoration.
 - A07 Authentication Failures — `NOT_APPLICABLE_WITH_EVIDENCE`. This change adds no
   public endpoint, login, session, or credential store. Existing authenticated
   OpenClaw control-plane access is unchanged; local ownership is covered by A01/A02.
@@ -85,12 +88,15 @@ immutable Qwen-local recovery snapshots, and the bounded backup-health receipt.
   declaration appearance, duplicate IDs, contract tamper, non-committed approval
   receipts, fresh/upgrade idempotence, pre-Plugin-install failure preservation,
   exact Plugin restoration and tamper rejection, launchd error-37 retry/exhaustion,
-  cron-before-runtime rollback ordering, and exact cron definition round trips.
+  cron-before-runtime rollback ordering, exact cron definition round trips,
+  interrupted index-lock recovery, idempotent created-lock cleanup, stored custom
+  snapshot-root recovery, and Linux home-boundary fixtures.
 
 ## Verification evidence
 
-- Python suite: final hotfix closeout rerun `268 passed`.
-- Focused reconciliation rollback suite: `65 passed`.
+- Python suite: recovery closeout rerun `275 passed` locally; Linux CI remains a
+  mandatory release gate.
+- Focused CLI and reconciliation rollback suites: `105 passed`.
 - Qwen template Node suite: `28 passed`.
 - OpenClaw Plugin Node suite: `5 passed`; syntax check and official Plugin validation
   passed.

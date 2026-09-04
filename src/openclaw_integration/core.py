@@ -1440,13 +1440,22 @@ class IntegrationManager:
         snapshot_locked = False
         snapshot_lock_created = False
         snapshot_identity: tuple[int, int] | None = None
-        lock_receipt: dict[str, Any] = {"snapshotLockCreated": False, "persisted": False}
+        lock_receipt: dict[str, Any] = {
+            "indexLockCreated": False,
+            "snapshotLockCreated": False,
+            "persisted": False,
+        }
         try:
             while index_identity is None:
                 try:
                     os.mkdir(index_lock, 0o700)
                     metadata = index_lock.lstat()
                     index_identity = (metadata.st_dev, metadata.st_ino)
+                    lock_receipt.update({
+                        "indexLockCreated": True,
+                        "indexLockDev": metadata.st_dev,
+                        "indexLockIno": metadata.st_ino,
+                    })
                 except FileExistsError:
                     if index_lock.is_symlink() or not index_lock.is_dir():
                         raise RuntimeError("Qwen index lock path is unsafe")
@@ -2629,6 +2638,42 @@ class IntegrationManager:
             return self._rollback_locked(require_exact_post_config=require_exact_post_config)
 
     def _remove_created_snapshot_artifacts(self, transaction: dict[str, Any]) -> None:
+        if transaction.get("indexLockCreated") is True:
+            expected_dev = transaction.get("indexLockDev")
+            expected_ino = transaction.get("indexLockIno")
+            if type(expected_dev) is not int or type(expected_ino) is not int:
+                raise RuntimeError("Created index lock identity is missing")
+            data = self.paths.project_root / "data"
+            data_fd: int | None = None
+            try:
+                data_fd = os.open(data, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                data_meta = os.fstat(data_fd)
+                if not stat.S_ISDIR(data_meta.st_mode) or data_meta.st_uid != os.getuid() \
+                        or data_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    raise RuntimeError("Qwen data directory is unsafe during rollback")
+                try:
+                    lock_meta = os.stat("index.lock", dir_fd=data_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    lock_meta = None
+                if lock_meta is not None:
+                    if (lock_meta.st_dev, lock_meta.st_ino) != (expected_dev, expected_ino) \
+                            or not stat.S_ISDIR(lock_meta.st_mode) or lock_meta.st_uid != os.getuid() \
+                            or lock_meta.st_mode & 0o077:
+                        raise RuntimeError("Created index lock changed before rollback")
+                    os.rmdir("index.lock", dir_fd=data_fd)
+                    os.fsync(data_fd)
+                    try:
+                        os.stat("index.lock", dir_fd=data_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise RuntimeError("Created index lock remained after rollback")
+            except OSError as error:
+                raise RuntimeError("Created index lock could not be safely removed") from error
+            finally:
+                if data_fd is not None:
+                    os.close(data_fd)
+
         root = Path(os.path.abspath(self.snapshot_root))
         if transaction.get("snapshotLockCreated") is True:
             expected_dev = transaction.get("snapshotLockDev")
@@ -2642,20 +2687,26 @@ class IntegrationManager:
                 if not stat.S_ISDIR(root_meta.st_mode) or root_meta.st_uid != os.getuid() \
                         or root_meta.st_mode & 0o077:
                     raise RuntimeError("Created snapshot root is unsafe during rollback")
-                lock_meta = os.stat(".snapshot-run.lock", dir_fd=root_fd, follow_symlinks=False)
-                if (lock_meta.st_dev, lock_meta.st_ino) != (expected_dev, expected_ino) \
-                        or not stat.S_ISREG(lock_meta.st_mode) or lock_meta.st_nlink != 1 \
-                        or lock_meta.st_uid != os.getuid() or lock_meta.st_mode & 0o077 \
-                        or lock_meta.st_size != 0:
-                    raise RuntimeError("Created snapshot lock changed before rollback")
-                os.unlink(".snapshot-run.lock", dir_fd=root_fd)
-                os.fsync(root_fd)
                 try:
-                    os.stat(".snapshot-run.lock", dir_fd=root_fd, follow_symlinks=False)
+                    lock_meta = os.stat(
+                        ".snapshot-run.lock", dir_fd=root_fd, follow_symlinks=False,
+                    )
                 except FileNotFoundError:
-                    pass
-                else:
-                    raise RuntimeError("Created snapshot lock remained after rollback")
+                    lock_meta = None
+                if lock_meta is not None:
+                    if (lock_meta.st_dev, lock_meta.st_ino) != (expected_dev, expected_ino) \
+                            or not stat.S_ISREG(lock_meta.st_mode) or lock_meta.st_nlink != 1 \
+                            or lock_meta.st_uid != os.getuid() or lock_meta.st_mode & 0o077 \
+                            or lock_meta.st_size != 0:
+                        raise RuntimeError("Created snapshot lock changed before rollback")
+                    os.unlink(".snapshot-run.lock", dir_fd=root_fd)
+                    os.fsync(root_fd)
+                    try:
+                        os.stat(".snapshot-run.lock", dir_fd=root_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise RuntimeError("Created snapshot lock remained after rollback")
             except OSError as error:
                 raise RuntimeError("Created snapshot lock could not be safely removed") from error
             finally:
