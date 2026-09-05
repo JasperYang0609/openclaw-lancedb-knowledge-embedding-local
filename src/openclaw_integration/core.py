@@ -522,6 +522,14 @@ def _job_env(job: dict[str, Any]) -> dict[str, str]:
     return value if isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()) else {}
 
 
+def _no_delivery_contract(value: Any) -> bool:
+    """Accept only the two no-delivery shapes emitted by supported OpenClaw CLIs."""
+    return value in (
+        {"mode": "none"},
+        {"mode": "none", "channel": "last"},
+    )
+
+
 def _job_matches_spec(job: dict[str, Any], spec: ManagedCronSpec, *, require_enabled: bool) -> bool:
     schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
@@ -566,7 +574,7 @@ def _job_matches_spec(job: dict[str, Any], spec: ManagedCronSpec, *, require_ena
         and payload.get("outputMaxBytes") == spec.output_max_bytes
         and "toolsAllow" not in payload
         and _job_env(job) == expected_env
-        and delivery == {"mode": "none"}
+        and _no_delivery_contract(delivery)
         and alert == expected_alert
     )
 
@@ -3676,7 +3684,7 @@ class IntegrationManager:
         repository_variant = (
             payload.get("timeoutSeconds") == 7200
             and payload.get("noOutputTimeoutSeconds") == 900
-            and job.get("delivery") == {"mode": "none"}
+            and _no_delivery_contract(job.get("delivery"))
             and job.get("failureAlert") in (None, {})
         )
         return production_variant or repository_variant
@@ -4095,7 +4103,7 @@ class IntegrationManager:
             and payload.get("outputMaxBytes") == 65536
             and _job_env(job) == expected_env
             and "toolsAllow" not in payload
-            and delivery == {"mode": "none"}
+            and _no_delivery_contract(delivery)
             and job.get("deleteAfterRun") is True
             and alert == {
                 "after": 1,

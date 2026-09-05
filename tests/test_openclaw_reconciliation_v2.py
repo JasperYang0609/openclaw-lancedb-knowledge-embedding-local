@@ -927,6 +927,10 @@ def test_managed_contract_requires_exact_alert_delivery_env_and_tools(tmp_path: 
     expected = job_for_spec(spec, job_id="inc", enabled=True)
     assert core._job_matches_spec(expected, spec, require_enabled=True)
 
+    cli_normalized = json.loads(json.dumps(expected))
+    cli_normalized["delivery"] = {"mode": "none", "channel": "last"}
+    assert core._job_matches_spec(cli_normalized, spec, require_enabled=True)
+
     for mutation in (
         lambda value: value["failureAlert"].pop("mode"),
         lambda value: value.update(description="drifted description"),
@@ -945,6 +949,48 @@ def test_managed_contract_requires_exact_alert_delivery_env_and_tools(tmp_path: 
     unexpected_target = job_for_spec(no_target_spec, job_id="extra-target", enabled=True)
     unexpected_target["failureAlert"]["to"] = "channel:unexpected"
     assert not core._job_matches_spec(unexpected_target, no_target_spec, require_enabled=True)
+
+
+@pytest.mark.parametrize(
+    ("delivery", "accepted"),
+    [
+        ({"mode": "none"}, True),
+        ({"mode": "none", "channel": "last"}, True),
+        ({}, False),
+        ({"mode": "none", "channel": "discord"}, False),
+        ({"mode": "none", "to": "channel:unexpected"}, False),
+        ({"mode": "none", "accountId": "default"}, False),
+        ({"mode": "none", "channel": "last", "to": "channel:unexpected"}, False),
+        ({"mode": "none", "channel": "last", "unexpected": "field"}, False),
+    ],
+)
+def test_no_delivery_contract_accepts_only_supported_cli_readback_shapes(
+    delivery: dict[str, str], accepted: bool,
+) -> None:
+    assert core._no_delivery_contract(delivery) is accepted
+
+
+def test_legacy_incremental_accepts_only_supported_no_delivery_normalization(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    job = job_for_spec(item._incremental_spec(), job_id="legacy-incremental", enabled=True)
+    job["description"] = None
+    job["payload"] = {
+        "kind": "command",
+        "argv": [str(item.paths.project_root / "scripts/knowledge_index_incremental.sh")],
+        "cwd": str(item.paths.project_root),
+        "timeoutSeconds": 7200,
+        "noOutputTimeoutSeconds": 900,
+        "outputMaxBytes": 65536,
+    }
+    job["delivery"] = {"mode": "none", "channel": "last"}
+    job["failureAlert"] = None
+
+    assert item._legacy_incremental_job(job)
+
+    job["delivery"]["to"] = "channel:unexpected"
+    assert not item._legacy_incremental_job(job)
 
 
 def test_legacy_owned_command_tools_policy_fails_before_mutation(tmp_path: Path) -> None:
@@ -1055,6 +1101,27 @@ def test_both_recurring_jobs_are_verified_disabled_before_global_enable(tmp_path
     item._enable_recurring_jobs([incremental_id, snapshot_id])
     assert all(job["enabled"] is True for job in cli.jobs)
     assert cli.calls[0] and ["cron", "list", "--all", "--json"] in cli.calls
+
+
+def test_cli_no_delivery_normalization_passes_disabled_and_enabled_readback(
+    tmp_path: Path,
+) -> None:
+    class NormalizingCronCli(StatefulCronCli):
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            if args[:4] == ["cron", "list", "--all", "--json"]:
+                for job in self.jobs:
+                    if job.get("delivery") == {"mode": "none"}:
+                        job["delivery"] = {"mode": "none", "channel": "last"}
+            return super().json(args, timeout=timeout)
+
+    cli = NormalizingCronCli()
+    item = manager(tmp_path, cli)
+
+    job_id = item._apply_managed_spec(item._incremental_spec(), enable=True)
+
+    installed = next(job for job in cli.jobs if job["id"] == job_id)
+    assert installed["enabled"] is True
+    assert installed["delivery"] == {"mode": "none", "channel": "last"}
 
 
 def test_preflight_adopts_only_exact_known_legacy_or_operator_id(tmp_path: Path) -> None:
@@ -2526,6 +2593,10 @@ def test_initial_job_and_health_receipt_are_verified_as_exact_contracts(tmp_path
     item = manager(tmp_path)
     expected = initial_job(item)
     assert item._initial_job_matches(expected, enabled=True)
+
+    cli_normalized = json.loads(json.dumps(expected))
+    cli_normalized["delivery"] = {"mode": "none", "channel": "last"}
+    assert item._initial_job_matches(cli_normalized, enabled=True)
 
     drifted = json.loads(json.dumps(expected))
     drifted["payload"]["env"]["EXTRA"] = "drift"

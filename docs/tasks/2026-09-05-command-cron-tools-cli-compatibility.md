@@ -12,6 +12,9 @@ Keep the approved 06:30 incremental and 06:50 verified-snapshot contracts unchan
 Fresh command jobs already omit `payload.toolsAllow`, so their alert edit must not
 send a tool-list patch. The live CLI also ignores command tool lists during create,
 so a legacy command definition containing that field must fail closed pre-mutation.
+The same CLI serializes `--no-deliver` readback as
+`{"mode":"none","channel":"last"}` even though no message is delivered. Older
+supported builds return `{"mode":"none"}`.
 
 ## Scope
 
@@ -20,6 +23,8 @@ so a legacy command definition containing that field must fail closed pre-mutati
   any cron mutation; rollback must never emit `--tools`.
 - Correct the packaged cron-tooling auditor so only agentTurn jobs recommend
   `--clear-tools`; command jobs require reviewed recreation.
+- Treat only the two verified no-delivery readback shapes as equivalent; continue to
+  reject every announce target, explicit destination, account, or extra field.
 - Add a regression test that asserts the compatible edit contract.
 - Rebuild the deterministic Skill artifact.
 - Do not change indexes, snapshots, source maps, schedules, customer jobs, or data.
@@ -28,6 +33,8 @@ so a legacy command definition containing that field must fail closed pre-mutati
 
 - Both owned command jobs stage, configure alerts, enable, and verify exactly.
 - `payload.toolsAllow` is absent on live readback.
+- Both supported no-delivery readback shapes pass semantic verification; any
+  destination-bearing or unknown shape fails closed.
 - Interrupted transaction reconciliation reaches committed or verified rollback.
 - Full Python/Node/package/security checks and a live disabled canary pass.
 
