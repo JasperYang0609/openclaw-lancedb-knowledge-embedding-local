@@ -396,7 +396,7 @@ class ManagedCronSpec:
             "--failure-alert-mode", "announce", "--failure-alert-channel", self.report_channel,
             "--failure-alert-to", self.report_to,
             "--failure-alert-account-id", self.report_account_id,
-            "--clear-tools", "--no-deliver", "--disable",
+            "--no-deliver", "--disable",
         ]
         return args
 
@@ -635,10 +635,14 @@ def _job_definition(job: dict[str, Any]) -> dict[str, Any]:
     alert = raw.get("failureAlert")
     allowed_payload = {
         "kind", "argv", "cwd", "timeoutSeconds", "noOutputTimeoutSeconds", "outputMaxBytes",
-        "env", "toolsAllow",
+        "env",
     }
+    if isinstance(payload, dict) and "toolsAllow" in payload:
+        raise RuntimeError("Owned command cron definition tools policy is not safely restorable")
     if not isinstance(payload, dict) or set(payload) - allowed_payload:
         raise RuntimeError("Owned cron definition payload is outside the safe rollback allowlist")
+    if payload.get("kind") != "command":
+        raise RuntimeError("Owned cron definition payload is not a command")
     if not isinstance(schedule, dict) or set(schedule) - {"kind", "expr", "tz", "staggerMs", "at", "everyMs"}:
         raise RuntimeError("Owned cron definition schedule is outside the safe rollback allowlist")
     if delivery is not None and (
@@ -652,7 +656,6 @@ def _job_definition(job: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("Owned cron definition alert is outside the safe rollback allowlist")
     argv = payload.get("argv")
     env = payload.get("env", {})
-    tools = payload.get("toolsAllow", [])
     if not isinstance(argv, list) or not 1 <= len(argv) <= 16 \
             or any(not isinstance(item, str) or not item or len(item) > 8192 for item in argv):
         raise RuntimeError("Owned cron definition argv is outside the safe rollback allowlist")
@@ -661,10 +664,6 @@ def _job_definition(job: dict[str, Any]) -> dict[str, Any]:
                    or len(value) > 4096 or _sensitive_key(key) or _contains_forbidden_key(value)
                    for key, value in env.items()):
         raise RuntimeError("Owned cron definition environment is outside the safe rollback allowlist")
-    if not isinstance(tools, list) or len(tools) > 32 \
-            or any(not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9_.:*+/-]{1,128}", item)
-                   for item in tools):
-        raise RuntimeError("Owned cron definition tools are outside the safe rollback allowlist")
     if _contains_forbidden_key(raw):
         raise RuntimeError("Owned cron definition contains sensitive material")
     # JSON round-trip produces an owned deep copy without preserving attacker-controlled subclasses.
@@ -3637,16 +3636,11 @@ class IntegrationManager:
 
     def _legacy_incremental_job(self, job: dict[str, Any]) -> bool:
         payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-        tools = payload.get("toolsAllow")
+        if "toolsAllow" in payload:
+            return False
         payload_keys = {
             "kind", "argv", "cwd", "timeoutSeconds", "noOutputTimeoutSeconds", "outputMaxBytes",
         }
-        if tools is not None:
-            payload_keys.add("toolsAllow")
-            if not isinstance(tools, list) or len(tools) > 32 \
-                    or any(not isinstance(item, str)
-                           or not re.fullmatch(r"[A-Za-z0-9_.:*+/-]{1,128}", item) for item in tools):
-                return False
         if set(payload) != payload_keys or payload.get("kind") != "command" \
                 or _job_argv(job) != [str(self.paths.project_root / "scripts/knowledge_index_incremental.sh")] \
                 or payload.get("cwd") != str(self.paths.project_root) \
@@ -4139,6 +4133,10 @@ class IntegrationManager:
         argv = _job_argv(definition)
         if not isinstance(name, str) or not name or not argv:
             raise RuntimeError("Owned cron rollback definition is incomplete")
+        if payload.get("kind") != "command":
+            raise RuntimeError("Owned cron rollback definition is not a command")
+        if "toolsAllow" in payload:
+            raise RuntimeError("Owned command cron rollback tools policy is not safely restorable")
         args = ["cron", "add", "--name", name]
         description = definition.get("description")
         if isinstance(description, str):
@@ -4177,9 +4175,6 @@ class IntegrationManager:
                 args.extend([option, str(payload[key])])
         for key, value in sorted(_job_env(definition).items()):
             args.extend(["--command-env", f"{key}={value}"])
-        tools_allow = payload.get("toolsAllow")
-        if isinstance(tools_allow, list) and all(isinstance(item, str) for item in tools_allow):
-            args.extend(["--tools", ",".join(tools_allow)])
         declaration = definition.get("declarationKey")
         if isinstance(declaration, str) and declaration:
             args.extend(["--declaration-key", declaration])
@@ -5220,7 +5215,7 @@ class IntegrationManager:
             raw_definitions = transaction.get("cronDefinitionsBefore", [])
             if not isinstance(raw_definitions, list) or any(not isinstance(item, dict) for item in raw_definitions):
                 raise RuntimeError("Rollback cron receipt is malformed")
-            prior_cron_definitions = raw_definitions
+            prior_cron_definitions = [_job_definition(item) for item in raw_definitions]
         if runtime_mutation_started:
             precise_markers = any(
                 field in transaction for field in (

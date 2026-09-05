@@ -34,8 +34,10 @@ tools field, a valid local-only runtime, and a tested rollback receipt.
   report destination.
 - The initial full-index one-shot also receives an alert while pending. It is tracked
   in the transaction receipt and is not considered a recurring declaration.
-- Owned jobs may have legacy `payload.toolsAllow` removed with `--clear-tools`.
-  Unknown or look-alike jobs are never deleted or disabled automatically.
+- Fresh owned command jobs must omit `payload.toolsAllow`; command-job tool patches are
+  unsupported by the pinned OpenClaw CLI. An owned legacy command carrying that field
+  fails closed before mutation and requires reviewed recreation. Unknown or look-alike
+  jobs are never deleted or disabled automatically.
 
 ## Deterministic snapshot job
 
@@ -77,8 +79,9 @@ early.
    owned wrapper. Preserve unknown jobs and block activation for operator review.
 4. Stage and verify the current runtime, Skill, Plugin, snapshot wrapper, and manifest.
 5. Create missing owned declarations or update drifted owned declarations in place.
-6. Attach alerts, remove legacy tools fields, validate exact schemas, and run the
-   existing loopback/readiness checks plus snapshot-wrapper dry-run.
+6. Attach alerts without command-job tools flags, reject legacy command tools fields,
+   validate exact schemas, and run the existing loopback/readiness checks plus
+   snapshot-wrapper dry-run.
 7. Commit the new receipt only after full verification.
 
 On failure, remove only declarations created by the current transaction and recreate

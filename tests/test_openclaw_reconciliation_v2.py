@@ -81,6 +81,36 @@ def job_for_spec(spec: core.ManagedCronSpec, *, job_id: str, enabled: bool) -> d
     }
 
 
+def test_command_cron_alert_edit_never_sends_tools_patch(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+
+    args = item._incremental_spec().alert_args("command-job")
+
+    assert "--clear-tools" not in args
+    assert "--tools" not in args
+
+
+def test_command_cron_definition_rejects_unrestorable_tools_policy(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    job = job_for_spec(item._incremental_spec(), job_id="command-job", enabled=True)
+    job["payload"]["toolsAllow"] = ["exec"]
+
+    with pytest.raises(RuntimeError, match="tools"):
+        core._job_definition(job)
+
+
+def test_command_cron_restore_rejects_tools_before_cli_mutation(tmp_path: Path) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    definition = job_for_spec(item._incremental_spec(), job_id="command-job", enabled=True)
+    definition["payload"]["toolsAllow"] = ["exec"]
+
+    with pytest.raises(RuntimeError, match="tools"):
+        item._restore_cron_definition(definition)
+
+    assert cli.calls == []
+
+
 class StatefulCronCli:
     def __init__(self) -> None:
         self.executable = str(Path(sys.executable).resolve())
@@ -165,6 +195,10 @@ class StatefulCronCli:
             return subprocess.CompletedProcess(args, 0, "", "")
         if args[:2] == ["cron", "edit"]:
             job = next(item for item in self.jobs if item["id"] == args[2])
+            if job.get("payload", {}).get("kind") == "command" and (
+                "--clear-tools" in args or "--tools" in args
+            ):
+                raise AssertionError("command cron edit must not patch tools")
             if "--failure-alert" in args:
                 job["failureAlert"] = {
                     "after": 1,
@@ -911,6 +945,29 @@ def test_managed_contract_requires_exact_alert_delivery_env_and_tools(tmp_path: 
     unexpected_target = job_for_spec(no_target_spec, job_id="extra-target", enabled=True)
     unexpected_target["failureAlert"]["to"] = "channel:unexpected"
     assert not core._job_matches_spec(unexpected_target, no_target_spec, require_enabled=True)
+
+
+def test_legacy_owned_command_tools_policy_fails_before_mutation(tmp_path: Path) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    legacy = job_for_spec(item._incremental_spec(), job_id="legacy-incremental", enabled=True)
+    legacy["description"] = None
+    legacy["payload"] = {
+        "kind": "command",
+        "argv": [str(item.paths.project_root / "scripts/knowledge_index_incremental.sh")],
+        "cwd": str(item.paths.project_root),
+        "timeoutSeconds": 7200,
+        "noOutputTimeoutSeconds": 900,
+        "outputMaxBytes": 65536,
+        "toolsAllow": [],
+    }
+    legacy["failureAlert"] = None
+    cli.jobs = [legacy]
+
+    with pytest.raises(RuntimeError, match="safe upgrade allowlist"):
+        item._preflight_cron_inventory()
+
+    assert cli.calls == [["cron", "list", "--all", "--json"]]
 
 
 def test_operator_legacy_migration_requires_exact_id_and_fingerprint(tmp_path: Path) -> None:
@@ -1688,6 +1745,35 @@ def test_rollback_restores_owned_and_gemini_definitions_and_preserves_unknown_ex
     assert sorted(core._job_contract_hash(job) for job in restored) == sorted(
         core._job_contract_hash(definition) for definition in prior
     )
+
+
+def test_rollback_rejects_command_tools_receipt_before_cron_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    prior = job_for_spec(item._incremental_spec(), job_id="incremental", enabled=True)
+    prior["payload"]["toolsAllow"] = ["exec"]
+    unknown = customer_job()
+    cli.jobs = [
+        job_for_spec(item._incremental_spec(), job_id="incremental", enabled=False),
+        unknown,
+    ]
+    jobs_before = json.loads(json.dumps(cli.jobs))
+    write_rollback_transaction(
+        item,
+        prior_definitions=[prior],
+        unknown=unknown,
+        target_ids=["incremental"],
+        managed_after=["incremental"],
+    )
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+
+    with pytest.raises(RuntimeError, match="tools"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    assert cli.calls == []
+    assert cli.jobs == jobs_before
 
 
 @pytest.mark.parametrize("fault", ["rm", "enable"])

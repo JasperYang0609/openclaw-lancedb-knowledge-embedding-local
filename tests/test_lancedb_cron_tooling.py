@@ -9,12 +9,26 @@ assert spec.loader is not None
 spec.loader.exec_module(cron)
 
 
-def test_legacy_tools_allow_requires_clear_tools_and_canary():
+def test_command_tools_allow_requires_recreation_without_unsupported_tools_edit():
     result = cron.audit_jobs({"jobs": [{
         "id": "snapshot-job",
         "enabled": True,
-        "payload": {"model": "openai/gpt-5.5", "toolsAllow": []},
+        "payload": {"kind": "command", "argv": ["/managed/wrapper"], "toolsAllow": []},
     }]})
     assert result["ok"] is False
-    assert result["findings"][0]["remediation"].endswith("snapshot-job --clear-tools")
+    remediation = result["findings"][0]["remediation"]
+    assert "recreate" in remediation
+    assert "--clear-tools" not in remediation
+    assert "--tools" not in remediation
     assert result["canary"]["successMarker"] == "TOOL_OK"
+
+
+def test_agent_turn_tools_allow_can_use_clear_tools_remediation():
+    result = cron.audit_jobs({"jobs": [{
+        "id": "agent-job",
+        "enabled": True,
+        "payload": {"kind": "agentTurn", "model": "openai/gpt-5.5", "toolsAllow": []},
+    }]})
+
+    assert result["ok"] is False
+    assert result["findings"][0]["remediation"].endswith("agent-job --clear-tools")

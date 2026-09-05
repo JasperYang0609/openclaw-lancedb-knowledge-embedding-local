@@ -20,11 +20,19 @@ def audit_jobs(data: Any) -> dict[str, Any]:
         payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
         if "toolsAllow" not in payload:
             continue
+        job_id = str(job.get("id") or "")
+        if payload.get("kind") == "agentTurn":
+            remediation = f"openclaw cron edit {job_id} --clear-tools"
+        else:
+            remediation = (
+                "review, disable, and recreate this command cron without payload.toolsAllow; "
+                "command cron edit must not use tools flags"
+            )
         findings.append({
-            "jobId": str(job.get("id") or ""),
+            "jobId": job_id,
             "name": str(job.get("name") or job.get("id") or "unnamed"),
             "code": "LEGACY_PAYLOAD_TOOLS_ALLOW",
-            "remediation": f"openclaw cron edit {job.get('id')} --clear-tools",
+            "remediation": remediation,
         })
     return {
         "schema": "openclaw-lancedb-cron-tooling-audit-v1",
@@ -38,7 +46,10 @@ def audit_jobs(data: Any) -> dict[str, Any]:
             "successMarker": "TOOL_OK",
             "removeAfterSuccess": True,
         },
-        "rule": "toolsAllow: [] is not cleared; use --clear-tools to remove the field.",
+        "rule": (
+            "toolsAllow must be absent. agentTurn jobs may use --clear-tools; command jobs "
+            "must be reviewed and recreated without any tools edit flag."
+        ),
     }
 
 
