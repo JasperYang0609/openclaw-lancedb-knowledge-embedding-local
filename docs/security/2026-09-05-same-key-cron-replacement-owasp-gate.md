@@ -193,3 +193,33 @@ but do not replace independent review or authorize live mutation.
 - `RELEASE_DECISION`: `LOCAL_COMMIT_PASS`; live integration remains
   `HUMAN_GATE`. No live cron mutation, deployment, or customer-data mutation is
   authorized by this closeout.
+
+## Post-cutover compatibility security addendum (2026-09-08)
+
+- A01 / A04 / A08 — `PASS`: the larger input allowance is not a new generic
+  default.  The 4 MiB default remains in force and only the known
+  `index-state.json` call sites opt into a hard 32 MiB maximum.  Stable file
+  identity, owner, link-count, symlink, permissions and JSON-object validation
+  remain unchanged.  Tests prove default rejection, explicit acceptance and
+  rejection above the absolute ceiling.
+- A05 / A08 / A10 — `PASS`: writable legacy snapshots are classified as
+  untrusted and preserved without reuse or mutation.  The runner creates a new
+  immutable repair snapshot and verifies checksum, restore canary, database open
+  and exact row count.  Symlinks, hard links, special files, immutable checksum
+  drift and unsafe paths still stop the run before pruning or receipt success.
+- A06 — `PASS`: both shipped production dependency trees
+  audit at zero vulnerabilities.  The pinned OpenClaw development-only tree has
+  newly published advisories; it is excluded from runtime packages and is not
+  invoked by the Qwen cron jobs.  Upgrading the host OpenClaw release is a
+  separate compatibility-controlled change, not silently bundled into this
+  repair.
+- A09 — `PASS`: the failed snapshot wrote the existing bounded redacted error
+  receipt and created no recovery artifact.  Successful remediation must replace
+  that state only after full verification.
+- Regression evidence: focused snapshot/security `57 passed`, full Python
+  `538 passed`, Template Node `28 passed`, Plugin Node `5 passed`, production
+  audits `0 vulnerabilities`, and all package/static/local-only/secret gates
+  `PASS`.
+- `OPEN_P0_P1_P2_P3`: `0/0/0/0` for this compatibility remediation.  The
+  development-only OpenClaw advisory set is tracked as a scoped dependency
+  residual and does not change the runtime repair decision.

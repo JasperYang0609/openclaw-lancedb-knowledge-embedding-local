@@ -180,6 +180,43 @@ def test_ownership_manifest_reader_rejects_oversize_hardlink_and_leaf_swap(
     assert swapped is True
 
 
+def test_large_index_state_requires_explicit_bounded_opt_in(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    data = project / "data"
+    data.mkdir(parents=True)
+    state = data / "index-state.json"
+    padding = "x" * (health.MAX_INPUT_BYTES + 1)
+    state.write_text(json.dumps({
+        "padding": padding,
+        "chunks": 7,
+        "tableName": runner.TABLE_NAME,
+        "buildFingerprint": "a" * 64,
+        "updatedAt": "2026-09-04T01:00:00+00:00",
+    }), encoding="utf-8")
+    (data / "openclaw-ready.json").write_text(json.dumps({
+        "ready": True,
+        "provider": "qwen-local",
+        "chunks": 7,
+        "tableName": runner.TABLE_NAME,
+        "buildFingerprint": "a" * 64,
+        "markedAt": "2026-09-04T01:01:00+00:00",
+    }), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="size"):
+        health.load_json(state)
+
+    assert health.load_json(
+        state, max_bytes=health.INDEX_STATE_MAX_BYTES,
+    )["padding"] == padding
+    assert health.read_verified_rows(project) == 7
+    assert runner.trusted_closeout(project, runner.TABLE_NAME) == (
+        "2026-09-04T01:01:00+00:00", 7,
+    )
+
+    with pytest.raises(ValueError, match="limit"):
+        health.load_json(state, max_bytes=health.MAX_ALLOWED_INPUT_BYTES + 1)
+
+
 def test_snapshot_run_lock_serializes_parallel_cli_invocations(tmp_path: Path) -> None:
     manifest, ownership = ownership_fixture(tmp_path)
     root = Path(ownership["snapshotRoot"])
@@ -378,6 +415,8 @@ def test_tampered_existing_repair_fails_closed_instead_of_replacing(
     repair = snapshots / "repair-2026-09-04-070000-post-index"
     daily.mkdir(parents=True)
     repair.mkdir()
+    daily.chmod(0o500)
+    repair.chmod(0o500)
     mutations: list[str] = []
     monkeypatch.setattr(runner, "trusted_closeout", lambda *_: ("2026-09-04T02:00:00+00:00", 9))
 
@@ -404,6 +443,8 @@ def test_invalid_existing_daily_blocks_without_retention_or_overwrite(
     daily.mkdir(parents=True)
     marker = daily / "keep.txt"
     marker.write_text("immutable", encoding="utf-8")
+    marker.chmod(0o400)
+    daily.chmod(0o500)
     mutations: list[str] = []
 
     monkeypatch.setattr(runner, "trusted_closeout", lambda *_: ("2026-09-04T01:00:00+00:00", 7))
@@ -417,6 +458,40 @@ def test_invalid_existing_daily_blocks_without_retention_or_overwrite(
 
     assert marker.read_text(encoding="utf-8") == "immutable"
     assert mutations == []
+
+
+def test_writable_legacy_daily_is_preserved_and_replaced_by_immutable_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, ownership = ownership_fixture(tmp_path)
+    snapshots = Path(ownership["snapshotRoot"]) / "snapshots"
+    daily = snapshots / "daily-2026-09-04"
+    daily.mkdir(parents=True)
+    marker = daily / "legacy.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    created: list[str] = []
+
+    monkeypatch.setattr(runner, "trusted_closeout", lambda *_: ("2026-09-04T01:00:00+00:00", 7))
+
+    def create(_project: Path, root: Path, name: str, _required: list[str]):
+        created.append(name)
+        target = root / "snapshots" / name
+        target.mkdir()
+        target.chmod(0o500)
+
+    monkeypatch.setattr(runner, "create_snapshot", create)
+    monkeypatch.setattr(runner, "verify_complete", lambda *_: None)
+    monkeypatch.setattr(runner, "prune_daily_snapshots", lambda *_: None)
+    monkeypatch.setattr(runner, "prune_transient_snapshots", lambda *_: None)
+    monkeypatch.setattr(runner, "write_receipt", lambda *_: None)
+
+    result = runner.run_snapshot(
+        manifest, now=datetime(2026, 9, 4, 8, 0, tzinfo=timezone.utc)
+    )
+
+    assert result["kind"] == "repair"
+    assert marker.read_text(encoding="utf-8") == "preserve"
+    assert created == ["repair-2026-09-04-080000-post-index"]
 
 
 @pytest.mark.parametrize("broken", [False, True])

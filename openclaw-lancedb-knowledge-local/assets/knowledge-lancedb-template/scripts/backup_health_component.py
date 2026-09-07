@@ -25,6 +25,11 @@ FRESHNESS_MAX_AGE_SECONDS = 36 * 60 * 60
 MAX_RECEIPT_BYTES = 16 * 1024
 MAX_ITEMS = 20
 MAX_INPUT_BYTES = 4 * 1024 * 1024
+# The index state contains one bounded record per indexed source plus chunk ids.
+# It legitimately grows past the generic receipt/config limit on larger corpora,
+# so only callers that explicitly opt in may use this larger ceiling.
+INDEX_STATE_MAX_BYTES = 32 * 1024 * 1024
+MAX_ALLOWED_INPUT_BYTES = INDEX_STATE_MAX_BYTES
 FORBIDDEN_TEXT = ("source_path", "query", "vector", "corpus", "token", "secret", "api_key")
 
 
@@ -84,7 +89,7 @@ def _open_parent(path: Path, *, private: bool = False, create: bool = False):
 
 def load_json(path: Path, *, max_bytes: int = MAX_INPUT_BYTES,
               private: bool = False, private_parent: bool = False) -> dict[str, Any]:
-    if max_bytes < 1 or max_bytes > MAX_INPUT_BYTES:
+    if max_bytes < 1 or max_bytes > MAX_ALLOWED_INPUT_BYTES:
         raise ValueError("Health receipt input size limit is invalid")
     descriptor: int | None = None
     with _open_parent(path, private=private_parent) as parent_fd:
@@ -321,7 +326,9 @@ def build_receipt(
 
 def read_verified_rows(project: Path) -> int | None:
     try:
-        state = load_json(project / "data/index-state.json")
+        state = load_json(
+            project / "data/index-state.json", max_bytes=INDEX_STATE_MAX_BYTES,
+        )
         ready = load_json(project / "data/openclaw-ready.json")
     except (OSError, RuntimeError, json.JSONDecodeError):
         return None

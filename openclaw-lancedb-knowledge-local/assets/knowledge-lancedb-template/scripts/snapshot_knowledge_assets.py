@@ -155,6 +155,17 @@ def _assert_immutable(root: Path, directories: list[Path], files: list[Path]) ->
             raise SystemExit(f"Finalized snapshot entry is writable: {path.relative_to(root)}")
 
 
+def snapshot_is_immutable(root: Path) -> bool:
+    """Return whether every real entry is sealed read-only.
+
+    ``_tree_entries`` retains the fail-closed handling for symlinks, hard links,
+    special files and missing paths.  A plain writable legacy tree is not trusted,
+    but callers may preserve it and create a new immutable repair snapshot.
+    """
+    directories, files = _tree_entries(root)
+    return not any(path.lstat().st_mode & 0o222 for path in [*directories, *files])
+
+
 def _source_identity(path: Path) -> dict[str, tuple[int, int, int, int, int, int, int]]:
     reject_symlinks(path)
     entries = [path, *sorted(path.rglob("*"))] if path.is_dir() else [path]

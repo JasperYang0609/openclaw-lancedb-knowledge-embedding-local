@@ -15,7 +15,12 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from backup_health_component import build_receipt, load_json, write_receipt
+from backup_health_component import (
+    INDEX_STATE_MAX_BYTES,
+    build_receipt,
+    load_json,
+    write_receipt,
+)
 from index_lock import acquire as acquire_index_lock
 from index_lock import release as release_index_lock
 from snapshot_knowledge_assets import (
@@ -23,6 +28,7 @@ from snapshot_knowledge_assets import (
     prune_daily_snapshots,
     prune_transient_snapshots,
     restore_canary,
+    snapshot_is_immutable,
     verify_database,
     verify_snapshot,
 )
@@ -225,7 +231,9 @@ def snapshot_index_lock(lock: Path, *, wait_seconds: float, poll_seconds: float,
 
 
 def trusted_closeout(project: Path, expected_table: str) -> tuple[str, int]:
-    state = load_json(project / "data/index-state.json")
+    state = load_json(
+        project / "data/index-state.json", max_bytes=INDEX_STATE_MAX_BYTES,
+    )
     ready = load_json(project / "data/openclaw-ready.json")
     rows = state.get("chunks")
     updated = state.get("updatedAt")
@@ -306,13 +314,19 @@ def run_snapshot(manifest_path: Path, *, wait_seconds: float = DEFAULT_LOCK_WAIT
             if daily.exists() or daily.is_symlink():
                 if daily.is_symlink() or not daily.is_dir():
                     raise RuntimeError("Existing daily snapshot is unsafe")
-                daily_verification = verify_snapshot(daily)
-                if _is_fresh(daily_verification.get("createdAt"), required_after):
+                daily_verification = verify_snapshot(daily) if snapshot_is_immutable(daily) else None
+                if daily_verification is not None and _is_fresh(
+                    daily_verification.get("createdAt"), required_after,
+                ):
                     verify_complete(project, daily, snapshot_root, required_after, rows, table_name)
                     created_kind = "reused"
                 else:
                     repair = _latest_repair(snapshot_root, day_text)
-                    repair_verification = verify_snapshot(repair) if repair is not None else None
+                    repair_verification = (
+                        verify_snapshot(repair)
+                        if repair is not None and snapshot_is_immutable(repair)
+                        else None
+                    )
                     if repair is not None and _is_fresh(
                         repair_verification.get("createdAt") if repair_verification else None,
                         required_after,

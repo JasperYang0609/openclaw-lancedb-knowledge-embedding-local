@@ -211,3 +211,35 @@ Stop on any active owned cron, shared lock owner, unknown inventory drift,
 non-loopback endpoint, mismatched receipt, rollback uncertainty, or mutation
 outside the exact installer-owned IDs. Implementer completion does not authorize
 live deployment; PM review of diff and evidence is required first.
+
+## Post-cutover snapshot compatibility remediation (2026-09-08)
+
+The controlled cron replacement committed successfully and the new incremental
+job completed against 104,336 rows.  The first manual run of the new verified
+snapshot job then failed closed before creating or pruning any snapshot.  Two
+legacy-format assumptions were exposed:
+
+1. `data/index-state.json` is now about 11 MiB because it contains bounded
+   records for 4,977 source files and 104,336 chunk ids, while the generic JSON
+   reader limit remained 4 MiB.
+2. Pre-v3 daily snapshots are checksum-bearing but writable; the v3 verifier
+   correctly refuses to reuse them as immutable recovery evidence.
+
+The remediation keeps the 4 MiB default for manifests, receipts and configs,
+adds an explicit 32 MiB ceiling used only for `index-state.json`, and continues
+to enforce owner, regular-file, hard-link, symlink, stable-read and JSON-object
+checks.  Writable legacy snapshots are preserved but never trusted or modified;
+the runner creates a new immutable `repair-*` snapshot from the current verified
+index, then performs checksum, restore-canary, database-open and exact row-count
+verification before writing a healthy receipt.  Immutable but corrupt snapshots
+still fail closed and are never replaced silently.
+
+Local evidence after remediation: verified-snapshot and snapshot-hardening suite
+`57 passed`; complete Python suite `538 passed`; Template Node `28 passed`;
+Plugin Node `5 passed`; production-only dependency audits `0 vulnerabilities`;
+archive parity, package dry-runs, plugin validation, Python compilation,
+dangerous-exec, local-only provider, secret-pattern and diff checks `PASS`.
+The full-development audit also reports advisories in the pinned OpenClaw
+development dependency; that dependency is not shipped in either Qwen runtime
+package, so it is recorded as a separate OpenClaw upgrade item rather than
+expanding this live backup repair.
