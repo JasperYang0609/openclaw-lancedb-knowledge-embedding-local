@@ -79,6 +79,11 @@ Scope: local installer transaction and installer-owned OpenClaw cron replacement
   interrupted compensation restart, and best-effort handling when one target is
   missing, drifted, or cannot be edited. The full suite and two sequential
   independent reviews passed.
+  Live preflight also exposed a macOS reboot boundary where the APFS device
+  number changed while the private rollback snapshot's inode and durable random
+  marker did not. Cleanup now accepts only a device-number-only rebind after the
+  exact marker validates; inode, marker, permission, path, and symlink negatives
+  remain fail-closed. The post-remediation suite passed `536` tests.
 
 ## ASVS v5.0.0 boundary
 
@@ -128,6 +133,10 @@ but do not replace independent review or authorize live mutation.
   `20260907_225111_qwen-gemini-receipt-p2-reconciliation-rerun.log`.
 - Full Python suite: `534 passed` in
   `20260907_225140_qwen-gemini-receipt-p2-full-python.log`.
+- Post-reboot device-rebind remediation: `536 passed` in
+  `20260907_232800_qwen-reboot-device-rebind-full-python.log`; the accepted
+  device-only case and rejected inode-drift case run alongside the existing
+  same-path replacement and marker-tamper negatives.
 - Skill archive test/parity: `PASS`, 56 source files, with rebuild/parity evidence
   in `20260907_225217_qwen-gemini-receipt-p2-check-skill.log` and
   `20260907_225224_qwen-gemini-receipt-p2-archive-test.log`.
@@ -146,7 +155,7 @@ but do not replace independent review or authorize live mutation.
   `20260907_225327_qwen-gemini-receipt-p2-local-only.log`, and
   `20260907_225333_qwen-gemini-receipt-p2-secret.log`.
 - Built artifact SHA-256:
-  `4f19357b54b21609a15092f65d882590a4f5ee370aa1e4273396a39feaa54c63`.
+  `f7ef67cc8c8b6f3a7d175097e7d3c0b7bf089211bc6c52e6cad48afc79c6d5ca`.
 
 ## Security closeout
 

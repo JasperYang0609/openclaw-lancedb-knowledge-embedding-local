@@ -160,7 +160,7 @@ live transaction.
   selection: `36 passed`; complete reconciliation suite: `272 passed`;
   complete Python suite: `534 passed`.
 - Fresh deterministic Skill: `PASS`, 56 source files; artifact SHA-256
-  `4f19357b54b21609a15092f65d882590a4f5ee370aa1e4273396a39feaa54c63`.
+  `f7ef67cc8c8b6f3a7d175097e7d3c0b7bf089211bc6c52e6cad48afc79c6d5ca`.
 - Template Node suite: `28 passed`; Plugin Node suite: `5 passed`; Plugin syntax
   and official validation: `PASS`; both production dependency audits: zero
   vulnerabilities; package dry-runs, post-run checks, dangerous-exec isolation,
@@ -180,6 +180,25 @@ Evidence logs are under the workspace tool-run log root, principally:
 - `20260907_225237_qwen-gemini-receipt-p2-diff-check.log`
 - `20260907_225327_qwen-gemini-receipt-p2-local-only.log`
 - `20260907_225333_qwen-gemini-receipt-p2-secret.log`
+
+## Live preflight reboot-device remediation
+
+The first approved live preflight remained fail-closed on the preserved disabled
+collision.  After exact independent contract/hash confirmation, the second
+preflight stopped before cron mutation because macOS had reassigned the APFS
+device number across the host reboot while the private rollback snapshot's path,
+inode, owner-only permissions, and durable random marker remained unchanged.
+
+The cleanup guard now permits only this device-number-only rebind for a recorded
+snapshot root, and only after the exact durable marker validates.  Inode drift,
+marker drift, unsafe permissions, symlinks, or any unmarked recursive child still
+fail before deletion.  New focused tests prove the accepted device-only case and
+the rejected inode-drift case; the existing same-path replacement and marker-
+tamper negatives remain green.  The post-remediation full Python suite is
+`536 passed` in `20260907_232800_qwen-reboot-device-rebind-full-python.log`.
+Template Node (`28 passed`), Plugin Node (`5 passed`), Plugin validation, and both
+dependency audits passed in `20260907_232910_qwen-reboot-template-gates.log` and
+`20260907_232911_qwen-reboot-plugin-gates.log`.
 
 No live cron, runtime, configuration, or customer data was mutated during this
 candidate update. Commit remains gated on independent review. Live integration

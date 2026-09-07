@@ -1243,10 +1243,19 @@ class IntegrationManager:
         try:
             metadata = os.fstat(directory_fd)
             self._validate_private_directory(metadata)
-            if (metadata.st_dev, metadata.st_ino) != expected_identity:
+            current_identity = (metadata.st_dev, metadata.st_ino)
+            if metadata.st_ino != expected_identity[1] \
+                    or metadata.st_dev != expected_identity[0] \
+                    and expected_root_marker_sha256 is None:
                 raise RuntimeError("Snapshot run changed before cleanup")
             if expected_root_marker_sha256 is not None:
                 self._verify_snapshot_marker(directory_fd, expected_root_marker_sha256)
+                # Darwin device numbers can be reassigned across an OS reboot even
+                # when the private APFS directory and inode are unchanged.  The
+                # durable random marker is therefore the second factor that permits
+                # a device-only rebind for the recorded snapshot root.  Inode drift,
+                # missing markers and marker drift still fail before deletion.
+                expected_identity = current_identity
             for child_name in os.listdir(directory_fd):
                 child = os.stat(child_name, dir_fd=directory_fd, follow_symlinks=False)
                 if stat.S_ISDIR(child.st_mode):

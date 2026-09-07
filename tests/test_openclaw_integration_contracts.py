@@ -543,6 +543,47 @@ def test_recorded_snapshot_cleanup_rejects_changed_marker_on_same_directory(tmp_
     assert marker.read_text() == "replacement-marker"
 
 
+def test_recorded_snapshot_cleanup_allows_device_only_rebind_with_exact_marker(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    recorded = snapshot_run(manager)
+    backup = recorded / "openclaw-config.preinstall"
+    backup.write_text("recorded")
+    backup.chmod(0o600)
+    identity = recorded.stat()
+    marker_sha256 = integration_core.sha256_file(
+        recorded / integration_core.SNAPSHOT_MARKER_NAME
+    )
+
+    assert manager._remove_recorded_snapshot_run(
+        backup, (identity.st_dev + 1, identity.st_ino), marker_sha256,
+    ) is True
+
+    assert not recorded.exists()
+
+
+def test_recorded_snapshot_cleanup_rejects_device_rebind_with_inode_drift(
+    tmp_path: Path,
+) -> None:
+    manager, _, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
+    recorded = snapshot_run(manager)
+    backup = recorded / "openclaw-config.preinstall"
+    backup.write_text("recorded")
+    backup.chmod(0o600)
+    identity = recorded.stat()
+    marker_sha256 = integration_core.sha256_file(
+        recorded / integration_core.SNAPSHOT_MARKER_NAME
+    )
+
+    with pytest.raises(RuntimeError, match="changed before cleanup"):
+        manager._remove_recorded_snapshot_run(
+            backup, (identity.st_dev + 1, identity.st_ino + 1), marker_sha256,
+        )
+
+    assert backup.read_text() == "recorded"
+
+
 def test_restore_config_rejects_symlinked_target_parent(tmp_path: Path) -> None:
     manager, _, _ = manager_with_config_result(tmp_path, {"valid": True, "path": "placeholder"})
     snapshot_dir = snapshot_run(manager)
