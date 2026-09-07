@@ -88,7 +88,8 @@ def _prepare(
         "plistMutationStarted": False,
         "launchdMutationStarted": False,
         "healthReceiptExisted": False,
-        "cronMutationStarted": False,
+        # Production checkpoints cron authority before any runtime mutation.
+        "cronMutationStarted": True,
         "cronDefinitionsBefore": [],
         "cronUnknownHashesBefore": {},
         "cronInventoryHashesBefore": {},

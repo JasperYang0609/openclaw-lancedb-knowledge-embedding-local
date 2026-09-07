@@ -847,7 +847,7 @@ def test_verify_ignores_disabled_managed_incremental_duplicate(tmp_path: Path) -
     assert manager.verify()["incrementalCronUnique"] is True
 
 
-def test_verify_does_not_parse_arbitrary_shell_command_text(tmp_path: Path) -> None:
+def test_verify_fails_closed_when_shell_command_invokes_owned_wrapper(tmp_path: Path) -> None:
     item = paths(tmp_path)
     script = item.project_root / "scripts/knowledge_index_incremental.sh"
     jobs: list[dict[str, object]] = [
@@ -865,7 +865,8 @@ def test_verify_does_not_parse_arbitrary_shell_command_text(tmp_path: Path) -> N
     ]
     manager, _ = verification_manager(tmp_path, jobs)
 
-    assert manager.verify()["incrementalCronUnique"] is True
+    with pytest.raises(RuntimeError, match="missing or duplicated"):
+        manager.verify()
 
 
 def test_allowlists_merge_without_removing_existing_entries() -> None:

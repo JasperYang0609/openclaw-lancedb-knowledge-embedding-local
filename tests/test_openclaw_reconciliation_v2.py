@@ -106,7 +106,7 @@ def test_command_cron_restore_rejects_tools_before_cli_mutation(tmp_path: Path) 
     definition["payload"]["toolsAllow"] = ["exec"]
 
     with pytest.raises(RuntimeError, match="tools"):
-        item._restore_cron_definition(definition)
+        item._restore_cron_definition(definition, {})
 
     assert cli.calls == []
 
@@ -116,15 +116,26 @@ class StatefulCronCli:
         self.executable = str(Path(sys.executable).resolve())
         self.jobs: list[dict[str, Any]] = []
         self.calls: list[list[str]] = []
+        self._next_job_sequence = 1
+        self._used_job_ids: set[str] = set()
+
+    def _allocate_job_id(self) -> str:
+        self._used_job_ids.update(str(job["id"]) for job in self.jobs)
+        while True:
+            job_id = f"job-{self._next_job_sequence}"
+            self._next_job_sequence += 1
+            if job_id not in self._used_job_ids:
+                self._used_job_ids.add(job_id)
+                return job_id
 
     def json(self, args: list[str], *, timeout: int = 120) -> Any:
         self.calls.append(list(args))
         if args[:4] == ["cron", "list", "--all", "--json"]:
-            return cron_payload(self.jobs)
+            return cron_payload(json.loads(json.dumps(self.jobs)))
         if args[:2] == ["cron", "add"]:
             key = args[args.index("--declaration-key") + 1]
             existing = next((job for job in self.jobs if job.get("declarationKey") == key), None)
-            job_id = str(existing["id"]) if existing else f"job-{len(self.jobs) + 1}"
+            job_id = str(existing["id"]) if existing else self._allocate_job_id()
             env: dict[str, str] = {}
             for index, value in enumerate(args):
                 if value == "--command-env":
@@ -170,11 +181,13 @@ class StatefulCronCli:
                 "sessionTarget": args[args.index("--session") + 1] if "--session" in args else None,
                 "sessionKey": args[args.index("--session-key") + 1] if "--session-key" in args else None,
                 "agentId": args[args.index("--agent") + 1] if "--agent" in args else None,
-                "deleteAfterRun": "--delete-after-run" in args,
+                "wakeMode": args[args.index("--wake") + 1] if "--wake" in args else "now",
                 "schedule": schedule,
                 "payload": payload,
                 "delivery": delivery,
             }
+            if "--delete-after-run" in args:
+                job["deleteAfterRun"] = True
             if existing:
                 self.jobs[self.jobs.index(existing)] = job
             else:
@@ -187,6 +200,7 @@ class StatefulCronCli:
         if args == ["--version"]:
             return subprocess.CompletedProcess(args, 0, "OpenClaw 2026.7.1-2\n", "")
         if args[:2] == ["cron", "rm"]:
+            self._used_job_ids.add(args[2])
             self.jobs = [job for job in self.jobs if str(job["id"]) != args[2]]
             return subprocess.CompletedProcess(args, 0, "", "")
         if args[:2] == ["cron", "disable"]:
@@ -213,6 +227,10 @@ class StatefulCronCli:
                 if "--failure-alert-account-id" in args:
                     job["failureAlert"]["accountId"] = args[args.index("--failure-alert-account-id") + 1]
                 job["enabled"] = False
+            if "--description" in args:
+                job["description"] = args[args.index("--description") + 1]
+            if "--name" in args:
+                job["name"] = args[args.index("--name") + 1]
             if "--enable" in args:
                 job["enabled"] = True
             if "--disable" in args:
@@ -377,12 +395,24 @@ def test_complete_cron_inventory_rejects_pagination_count_and_duplicate_identiti
 
     with pytest.raises(RuntimeError, match="incomplete"):
         core._cron_jobs(cron_payload([one], has_more=True))
+    offset_page = cron_payload([one])
+    offset_page["offset"] = 1
+    with pytest.raises(RuntimeError, match="incomplete"):
+        core._cron_jobs(offset_page)
+    next_page = cron_payload([one])
+    next_page["nextOffset"] = 1
+    with pytest.raises(RuntimeError, match="incomplete"):
+        core._cron_jobs(next_page)
     with pytest.raises(RuntimeError, match="count"):
         core._cron_jobs(cron_payload([one], total=2))
     with pytest.raises(RuntimeError, match="duplicate"):
         core._cron_jobs(cron_payload([one, {**two, "id": "one"}]))
     with pytest.raises(RuntimeError, match="duplicate"):
         core._cron_jobs(cron_payload([one, {**two, "declarationKey": "key-one"}]))
+    with pytest.raises(RuntimeError, match="completeness envelope"):
+        core._cron_jobs([one, two])
+    with pytest.raises(RuntimeError, match="invalid job id"):
+        core._cron_jobs(cron_payload([{**one, "id": "--all"}]))
 
     empty_key = {"id": "empty-key", "declarationKey": ""}
     assert core._cron_jobs(cron_payload([empty_key])) == [empty_key]
@@ -423,6 +453,637 @@ def test_quiescence_disables_and_waits_for_managed_and_exact_gemini_jobs(
     assert ["cron", "edit", "incremental", "--disable"] in cli.calls
 
 
+def test_same_key_upgrade_removes_exact_owned_ids_before_strict_add(
+    tmp_path: Path,
+) -> None:
+    class StrictDuplicateKeyCli(StatefulCronCli):
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            if args[:2] == ["cron", "add"]:
+                key = args[args.index("--declaration-key") + 1]
+                if any(job.get("declarationKey") == key for job in self.jobs):
+                    raise RuntimeError("duplicate declaration key")
+            return super().json(args, timeout=timeout)
+
+    cli = StrictDuplicateKeyCli()
+    item = manager(tmp_path, cli)
+    prior_incremental = job_for_spec(
+        item._incremental_spec(), job_id="prior-incremental", enabled=True,
+    )
+    unknown = customer_job()
+    jobs_before = [prior_incremental, unknown]
+    cli.jobs = json.loads(json.dumps(jobs_before))
+    hashes = item._inventory_hashes(jobs_before)
+    targets = {"prior-incremental"}
+    transaction = write_staging_transaction(item, jobs_before, targets)
+
+    item._quiesce_prior_jobs(jobs_before, targets, hashes)
+    with pytest.raises(RuntimeError, match="appeared before authorized add"):
+        item._apply_managed_spec(item._incremental_spec(), transaction)
+
+    removed = item._remove_prior_managed_jobs_for_replacement(
+        jobs_before, targets, hashes,
+    )
+    replacement_id = item._apply_managed_spec(item._incremental_spec(), transaction)
+
+    assert removed == ["prior-incremental"]
+    assert replacement_id != "prior-incremental"
+    assert any(job["id"] == replacement_id for job in cli.jobs)
+    after_unknown = next(job for job in cli.jobs if job["id"] == "customer")
+    assert core._job_contract_hash(after_unknown, include_id=True) == core._job_contract_hash(
+        unknown, include_id=True,
+    )
+    assert ["cron", "rm", "prior-incremental"] in cli.calls
+
+
+def test_integrate_replaces_same_key_jobs_from_write_ahead_receipt_before_strict_add(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StrictDuplicateKeyCli(StatefulCronCli):
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            if args[:2] == ["cron", "add"]:
+                key = args[args.index("--declaration-key") + 1]
+                if any(job.get("declarationKey") == key for job in self.jobs):
+                    raise RuntimeError("duplicate declaration key")
+            return super().json(args, timeout=timeout)
+
+    cli = StrictDuplicateKeyCli()
+    item = manager(tmp_path, cli)
+    prior_incremental = job_for_spec(
+        item._incremental_spec(), job_id="prior-incremental", enabled=True,
+    )
+    prior_snapshot = job_for_spec(
+        item._snapshot_spec(), job_id="prior-snapshot", enabled=True,
+    )
+    unknown = customer_job()
+    cli.jobs = json.loads(json.dumps([prior_incremental, prior_snapshot, unknown]))
+    item.store.write({
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "runId": "prior-install",
+        "phase": "committed",
+        "ownership": item._ownership_payload(),
+        "indexState": "READY",
+        "cronId": "prior-incremental",
+        "snapshotCronId": "prior-snapshot",
+        "initialIndexJobId": None,
+        "cronDefinitionsBefore": [],
+        "cronTargetIdsBefore": [],
+        "cronInventoryHashesBefore": {
+            "customer": core._legacy_v3_job_contract_hash(unknown, include_id=True),
+        },
+        "cronUnknownHashesBefore": {
+            "customer": core._legacy_v3_job_contract_hash(unknown, include_id=True),
+        },
+        "disabledGeminiJobs": [],
+    })
+    prepare_collision_integration_runtime(item, monkeypatch, run_id="same-key-upgrade")
+
+    result = item._integrate_locked({"runtimePort": 18888})
+
+    assert result["transaction"] == "upgraded"
+    transaction = item.store.read()
+    expected_ids = ["prior-incremental", "prior-snapshot"]
+    assert transaction["phase"] == "committed"
+    assert transaction["previousContractVersion"] == core.INTEGRATION_CONTRACT_VERSION
+    assert transaction["cronCommitTopologyVerified"] is True
+    assert transaction["cronCommitInventoryHashes"] == item._inventory_hashes(cli.jobs)
+    assert transaction["cronCommitUnknownHashes"] == transaction["cronUnknownHashesBefore"]
+    assert transaction["cronReplaceIdsBefore"] == expected_ids
+    assert transaction["removedManagedCronIdsBeforeAdd"] == expected_ids
+    definitions = {
+        str(definition["id"]): definition
+        for definition in transaction["cronDefinitionsBefore"]
+    }
+    assert set(definitions) == set(expected_ids)
+    assert transaction["cronInventoryHashesBefore"]["prior-incremental"] == (
+        core._job_contract_hash(prior_incremental, include_id=True)
+    )
+    assert transaction["cronInventoryHashesBefore"]["prior-snapshot"] == (
+        core._job_contract_hash(prior_snapshot, include_id=True)
+    )
+    first_add = next(
+        index for index, call in enumerate(cli.calls) if call[:2] == ["cron", "add"]
+    )
+    removal_indexes = [
+        index for index, call in enumerate(cli.calls)
+        if call[:2] == ["cron", "rm"] and call[2] in expected_ids
+    ]
+    assert len(removal_indexes) == 2 and max(removal_indexes) < first_add
+    assert not any(call[:3] == ["cron", "rm", "customer"] for call in cli.calls)
+    after_unknown = next(job for job in cli.jobs if job["id"] == "customer")
+    assert core._job_contract_hash(after_unknown, include_id=True) == core._job_contract_hash(
+        unknown, include_id=True,
+    )
+    assert item._job_by_key(cli.jobs, core.CRON_DECLARATION_KEY)["enabled"] is True
+    assert item._job_by_key(cli.jobs, core.SNAPSHOT_CRON_DECLARATION_KEY)["enabled"] is True
+    cli.jobs = [job for job in cli.jobs if job["id"] != "customer"]
+    later_unrelated = customer_job(job_id="later-unrelated")
+    later_unrelated["declarationKey"] = "later-unrelated-v1"
+    cli.jobs.append(later_unrelated)
+    assert item.verify()["ok"] is True
+
+    incremental_after = item._job_by_key(cli.jobs, core.CRON_DECLARATION_KEY)
+    assert incremental_after is not None
+    committed_incremental_id = str(incremental_after["id"])
+    incremental_after["id"] = "replacement-same-contract"
+    with pytest.raises(RuntimeError, match="id does not match the committed receipt"):
+        item.verify()
+    incremental_after["id"] = committed_incremental_id
+
+    cli.jobs.append(initial_job(item))
+    with pytest.raises(RuntimeError, match="Unexpected initial cron exists"):
+        item.verify()
+    cli.jobs = [job for job in cli.jobs if job["id"] != "initial"]
+
+    invalid = item.store.read()
+    invalid["indexState"] = "UNKNOWN"
+    item.store.write(invalid)
+    with pytest.raises(RuntimeError, match="index state is invalid"):
+        item.verify()
+
+    invalid["indexState"] = "READY"
+    invalid["initialIndexJobId"] = "stale-initial-id"
+    item.store.write(invalid)
+    with pytest.raises(RuntimeError, match="Unexpected initial cron exists"):
+        item.verify()
+
+
+def test_managed_replacement_preserves_nonmanaged_targets_and_unknown_jobs(
+    tmp_path: Path,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    incremental = job_for_spec(
+        item._incremental_spec(), job_id="managed-incremental", enabled=True,
+    )
+    snapshot = job_for_spec(
+        item._snapshot_spec(), job_id="managed-snapshot", enabled=True,
+    )
+    legacy = legacy_snapshot_job(item, job_id="legacy-snapshot", enabled=True)
+    gemini = gemini_job(item, job_id="gemini", enabled=True)
+    unknown = customer_job()
+    jobs_before = [incremental, snapshot, legacy, gemini, unknown]
+    cli.jobs = json.loads(json.dumps(jobs_before))
+    hashes = item._inventory_hashes(jobs_before)
+    targets = {"managed-incremental", "managed-snapshot", "legacy-snapshot", "gemini"}
+    write_staging_transaction(item, jobs_before, targets)
+
+    item._quiesce_prior_jobs(jobs_before, targets, hashes)
+    removed = item._remove_prior_managed_jobs_for_replacement(
+        jobs_before, targets, hashes,
+    )
+
+    assert removed == ["managed-incremental", "managed-snapshot"]
+    by_id = {str(job["id"]): job for job in cli.jobs}
+    assert set(by_id) == {"legacy-snapshot", "gemini", "customer"}
+    assert by_id["legacy-snapshot"]["enabled"] is False
+    assert by_id["gemini"]["enabled"] is False
+    assert core._job_contract_hash(by_id["customer"], include_id=True) == core._job_contract_hash(
+        unknown, include_id=True,
+    )
+    removed_by_cli = [call[2] for call in cli.calls if call[:2] == ["cron", "rm"]]
+    assert removed_by_cli == ["managed-incremental", "managed-snapshot"]
+
+
+def test_managed_replacement_blocks_inventory_drift_before_remove(
+    tmp_path: Path,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    incremental = job_for_spec(
+        item._incremental_spec(), job_id="managed-incremental", enabled=True,
+    )
+    unknown = customer_job()
+    jobs_before = [incremental, unknown]
+    cli.jobs = json.loads(json.dumps(jobs_before))
+    hashes = item._inventory_hashes(jobs_before)
+    targets = {"managed-incremental"}
+    write_staging_transaction(item, jobs_before, targets)
+    item._quiesce_prior_jobs(jobs_before, targets, hashes)
+    cli.jobs[1]["description"] = "drifted after quiescence"
+
+    with pytest.raises(RuntimeError, match="changed before managed replacement"):
+        item._remove_prior_managed_jobs_for_replacement(jobs_before, targets, hashes)
+
+    assert not any(call[:2] == ["cron", "rm"] for call in cli.calls)
+    assert any(job["id"] == "managed-incremental" for job in cli.jobs)
+
+
+def test_crash_after_first_managed_remove_recovers_from_write_ahead_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    class CrashOnceAfterRemoveCli(StatefulCronCli):
+        crashed = False
+
+        def run(self, args: list[str], *, timeout: int = 120, check: bool = True):
+            result = super().run(args, timeout=timeout, check=check)
+            if args[:2] == ["cron", "rm"] and not self.crashed:
+                self.crashed = True
+                raise SimulatedCrash("process stopped after cron removal")
+            return result
+
+    cli = CrashOnceAfterRemoveCli()
+    item = manager(tmp_path, cli)
+    incremental = job_for_spec(
+        item._incremental_spec(), job_id="managed-incremental", enabled=True,
+    )
+    snapshot = job_for_spec(
+        item._snapshot_spec(), job_id="managed-snapshot", enabled=True,
+    )
+    unknown = customer_job()
+    jobs_before = [incremental, snapshot, unknown]
+    hashes = item._inventory_hashes(jobs_before)
+    targets = {"managed-incremental", "managed-snapshot"}
+    cli.jobs = json.loads(json.dumps(jobs_before))
+    item._quiesce_prior_jobs(jobs_before, targets, hashes)
+    write_rollback_transaction(
+        item,
+        prior_definitions=[core._job_definition(incremental), core._job_definition(snapshot)],
+        unknown=unknown,
+        target_ids=sorted(targets),
+        managed_after=[],
+    )
+    transaction = item.store.read()
+    transaction["phase"] = "replacing_managed_cron"
+    transaction["cronInventoryTotalBefore"] = len(jobs_before)
+    transaction["disabledGeminiJobs"] = []
+    transaction["cronReplaceIdsBefore"] = sorted(targets)
+    item.store.write(transaction)
+
+    with pytest.raises(SimulatedCrash):
+        item._remove_prior_managed_jobs_for_replacement(jobs_before, targets, hashes)
+
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
+    result = item._rollback_locked(require_exact_post_config=False)
+
+    assert result["status"] == "ROLLED_BACK"
+    rolled_back = item.store.read()
+    assert rolled_back["phase"] == "rolled_back"
+    assert rolled_back["rollbackOriginPhase"] == "replacing_managed_cron"
+    assert item._validate_replacement_receipt_graph(rolled_back) is True
+    restored = [job for job in cli.jobs if job["id"] != "customer"]
+    assert sorted(core._job_contract_hash(job) for job in restored) == sorted([
+        core._job_contract_hash(incremental), core._job_contract_hash(snapshot),
+    ])
+    after_unknown = next(job for job in cli.jobs if job["id"] == "customer")
+    assert core._job_contract_hash(after_unknown, include_id=True) == core._job_contract_hash(
+        unknown, include_id=True,
+    )
+
+
+def test_crash_after_first_replacement_add_recovers_without_created_id_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    class CrashAfterCreatedAddCli(StatefulCronCli):
+        crashed = False
+
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            result = super().json(args, timeout=timeout)
+            if args[:2] == ["cron", "add"] and not self.crashed:
+                self.crashed = True
+                raise SimulatedCrash("process stopped after cron add")
+            return result
+
+    cli = CrashAfterCreatedAddCli()
+    item = manager(tmp_path, cli)
+    incremental = job_for_spec(
+        item._incremental_spec(), job_id="managed-incremental", enabled=True,
+    )
+    snapshot = job_for_spec(
+        item._snapshot_spec(), job_id="managed-snapshot", enabled=True,
+    )
+    unknown = customer_job()
+    jobs_before = [incremental, snapshot, unknown]
+    hashes = item._inventory_hashes(jobs_before)
+    targets = {"managed-incremental", "managed-snapshot"}
+    cli.jobs = json.loads(json.dumps(jobs_before))
+    item._quiesce_prior_jobs(jobs_before, targets, hashes)
+    write_rollback_transaction(
+        item,
+        prior_definitions=[core._job_definition(incremental), core._job_definition(snapshot)],
+        unknown=unknown,
+        target_ids=sorted(targets),
+        managed_after=[],
+    )
+    transaction = item.store.read()
+    transaction["phase"] = "replacing_managed_cron"
+    transaction["cronInventoryTotalBefore"] = len(jobs_before)
+    transaction["disabledGeminiJobs"] = []
+    transaction["cronReplaceIdsBefore"] = sorted(targets)
+    item.store.write(transaction)
+    item._remove_prior_managed_jobs_for_replacement(jobs_before, targets, hashes)
+    with pytest.raises(SimulatedCrash):
+        item._apply_managed_spec(item._incremental_spec(), transaction)
+    transaction = item.store.read()
+    intent = transaction["cronStagingIntents"][core.CRON_DECLARATION_KEY]
+    assert "jobId" not in intent
+    assert transaction.get("managedCronIdsAfter", []) == []
+    staged = next(job for job in cli.jobs if job["id"] != "customer")
+    replacement_id = str(staged["id"])
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
+    result = item._rollback_locked(require_exact_post_config=False)
+
+    assert result["status"] == "ROLLED_BACK"
+    restored = [job for job in cli.jobs if job["id"] != "customer"]
+    assert sorted(core._job_contract_hash(job) for job in restored) == sorted([
+        core._job_contract_hash(incremental), core._job_contract_hash(snapshot),
+    ])
+    assert all(job["id"] != replacement_id for job in cli.jobs)
+    after_unknown = next(job for job in cli.jobs if job["id"] == "customer")
+    assert core._job_contract_hash(after_unknown, include_id=True) == core._job_contract_hash(
+        unknown, include_id=True,
+    )
+
+
+@pytest.mark.parametrize("fault", ["changed-customer", "extra-unrelated"])
+def test_success_inventory_drift_fails_without_deleting_unreceipted_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    class DriftAfterRecurringAddsCli(StatefulCronCli):
+        add_count = 0
+
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            result = super().json(args, timeout=timeout)
+            if args[:2] == ["cron", "add"]:
+                self.add_count += 1
+                if self.add_count == 2:
+                    if fault == "changed-customer":
+                        customer = next(job for job in self.jobs if job["id"] == "customer")
+                        customer["description"] = "concurrent customer change"
+                    else:
+                        self.jobs.append(customer_job(job_id="concurrent-extra"))
+            return result
+
+    case_root = tmp_path / fault
+    cli = DriftAfterRecurringAddsCli()
+    item = manager(case_root, cli)
+    incremental = job_for_spec(
+        item._incremental_spec(), job_id="prior-incremental", enabled=True,
+    )
+    snapshot = job_for_spec(
+        item._snapshot_spec(), job_id="prior-snapshot", enabled=True,
+    )
+    unknown = customer_job()
+    cli.jobs = json.loads(json.dumps([incremental, snapshot, unknown]))
+    item.store.write({
+        "schemaVersion": 1,
+        "contractVersion": 1,
+        "runId": "prior-install",
+        "phase": "committed",
+        "ownership": {"schema": "qwen-local-openclaw.v1"},
+    })
+    prepare_collision_integration_runtime(item, monkeypatch, run_id=fault)
+
+    with pytest.raises(core.IntegrationRollbackIncomplete) as caught:
+        item._integrate_locked({"runtimePort": 18888})
+
+    assert "cron" in str(caught.value.original_error).lower()
+    protected_id = "customer" if fault == "changed-customer" else "concurrent-extra"
+    assert any(job["id"] == protected_id for job in cli.jobs)
+    assert not any(call[:3] == ["cron", "rm", protected_id] for call in cli.calls)
+    assert item.store.read()["phase"] == "rollback_failed"
+
+
+def test_hostile_concurrent_same_key_job_is_never_deleted_by_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HostileAfterRemovalCli(StatefulCronCli):
+        hostile: dict[str, Any] | None = None
+
+        def run(self, args: list[str], *, timeout: int = 120, check: bool = True):
+            result = super().run(args, timeout=timeout, check=check)
+            if args[:3] == ["cron", "rm", "prior-snapshot"]:
+                assert self.hostile is not None
+                self.jobs.append(json.loads(json.dumps(self.hostile)))
+            return result
+
+    cli = HostileAfterRemovalCli()
+    item = manager(tmp_path, cli)
+    incremental = job_for_spec(
+        item._incremental_spec(), job_id="prior-incremental", enabled=True,
+    )
+    snapshot = job_for_spec(
+        item._snapshot_spec(), job_id="prior-snapshot", enabled=True,
+    )
+    unknown = customer_job()
+    cli.hostile = job_for_spec(
+        item._incremental_spec(), job_id="hostile-same-key", enabled=False,
+    )
+    cli.jobs = json.loads(json.dumps([incremental, snapshot, unknown]))
+    item.store.write({
+        "schemaVersion": 1,
+        "contractVersion": 1,
+        "runId": "prior-install",
+        "phase": "committed",
+        "ownership": {"schema": "qwen-local-openclaw.v1"},
+    })
+    prepare_collision_integration_runtime(item, monkeypatch, run_id="hostile-same-key")
+
+    with pytest.raises(core.IntegrationRollbackIncomplete):
+        item._integrate_locked({"runtimePort": 18888})
+
+    assert any(job["id"] == "hostile-same-key" for job in cli.jobs)
+    assert not any(
+        call[:3] == ["cron", "rm", "hostile-same-key"] for call in cli.calls
+    )
+
+
+def test_uncheckpointed_staging_intent_requires_zero_or_one_exact_match(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    spec = item._incremental_spec()
+    transaction = write_staging_transaction(item, [], set())
+    intent = item._ensure_cron_intent(
+        transaction,
+        bucket_name="cronStagingIntents",
+        declaration_key=spec.key,
+        canonical_description=spec.description,
+        role="managed",
+        expected_factory=lambda description: item._managed_pre_alert_definition(
+            spec, description,
+        ),
+    )
+
+    assert item._uncheckpointed_intent_candidate(intent, []) is None
+    exact = item._managed_pre_alert_definition(spec, intent["stagingDescription"])
+    exact["id"] = "candidate-one"
+    duplicate = json.loads(json.dumps(exact))
+    duplicate["id"] = "candidate-two"
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        item._uncheckpointed_intent_candidate(intent, [exact, duplicate])
+    drifted = json.loads(json.dumps(exact))
+    drifted["payload"]["timeoutSeconds"] += 1
+    with pytest.raises(RuntimeError, match="contract drifted"):
+        item._uncheckpointed_intent_candidate(intent, [drifted])
+
+
+def test_initial_add_crash_before_id_checkpoint_adopts_unique_staged_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    class CrashOnceInitialCli(StatefulCronCli):
+        crashed = False
+
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            result = super().json(args, timeout=timeout)
+            if args[:2] == ["cron", "add"] and not self.crashed:
+                self.crashed = True
+                raise SimulatedCrash("initial add response lost")
+            return result
+
+    cli = CrashOnceInitialCli()
+    item = manager(tmp_path, cli)
+    full_script = item.paths.project_root / "scripts/knowledge_index_full.sh"
+    full_script.parent.mkdir(parents=True, exist_ok=True)
+    full_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    full_script.chmod(0o700)
+    monkeypatch.setattr(
+        core.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 1, "", ""),
+    )
+    transaction = write_staging_transaction(item, [], set())
+
+    with pytest.raises(SimulatedCrash):
+        item.mark_ready_or_schedule_build(transaction)
+
+    persisted = item.store.read()
+    intent = persisted["cronStagingIntents"][core.INITIAL_CRON_DECLARATION_KEY]
+    assert "jobId" not in intent
+    staged_id = str(cli.jobs[0]["id"])
+    state, recovered_id = item.mark_ready_or_schedule_build(persisted)
+
+    assert (state, recovered_id) == ("INDEX_BUILDING", staged_id)
+    assert item.store.read()["cronStagingIntents"][
+        core.INITIAL_CRON_DECLARATION_KEY
+    ]["jobId"] == staged_id
+    assert sum(call[:2] == ["cron", "add"] for call in cli.calls) == 1
+    assert cli.jobs[0]["enabled"] is False
+    assert cli.jobs[0]["description"] == core.INITIAL_CRON_DESCRIPTION
+
+
+def test_rollback_restore_add_crash_resumes_exact_staging_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    class CrashOnceRestoreCli(StatefulCronCli):
+        crashed = False
+
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            result = super().json(args, timeout=timeout)
+            if args[:2] == ["cron", "add"] and not self.crashed:
+                self.crashed = True
+                raise SimulatedCrash("restore add response lost")
+            return result
+
+    cli = CrashOnceRestoreCli()
+    item = manager(tmp_path, cli)
+    prior = job_for_spec(item._incremental_spec(), job_id="prior", enabled=True)
+    unknown = customer_job()
+    cli.jobs = [json.loads(json.dumps(unknown))]
+    write_rollback_transaction(
+        item,
+        prior_definitions=[core._job_definition(prior)],
+        unknown=unknown,
+        target_ids=["prior"],
+        managed_after=[],
+    )
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
+
+    with pytest.raises(SimulatedCrash):
+        item._rollback_locked(require_exact_post_config=False)
+
+    transaction = item.store.read()
+    intent = transaction["cronRestoreIntents"][core.CRON_DECLARATION_KEY]
+    assert "jobId" not in intent
+    staged_id = next(job["id"] for job in cli.jobs if job["id"] != "customer")
+    result = item._rollback_locked(require_exact_post_config=False)
+
+    assert result["status"] == "ROLLED_BACK"
+    assert item.store.read()["restoredCronIdsByDeclaration"][
+        core.CRON_DECLARATION_KEY
+    ] == staged_id
+    assert sum(call[:2] == ["cron", "add"] for call in cli.calls) == 1
+    after_unknown = next(job for job in cli.jobs if job["id"] == "customer")
+    assert core._job_contract_hash(after_unknown, include_id=True) == (
+        core._job_contract_hash(unknown, include_id=True)
+    )
+
+
+def test_cron_edits_observe_durable_id_checkpoint_and_never_transiently_enable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CheckpointGuardCli(StatefulCronCli):
+        item: core.IntegrationManager | None = None
+
+        def run(self, args: list[str], *, timeout: int = 120, check: bool = True):
+            if args[:2] == ["cron", "edit"] and (
+                "--failure-alert" in args or "--description" in args
+            ):
+                assert self.item is not None
+                transaction = self.item.store.read()
+                job = next(entry for entry in self.jobs if entry["id"] == args[2])
+                intent = next(
+                    value for bucket in (
+                        transaction.get("cronStagingIntents", {}),
+                        transaction.get("cronRestoreIntents", {}),
+                    )
+                    for value in bucket.values()
+                    if value.get("jobId") == args[2]
+                )
+                assert intent["jobId"] == args[2]
+                assert job["enabled"] is False
+                assert "--disable" in args
+            result = super().run(args, timeout=timeout, check=check)
+            if args[:2] == ["cron", "edit"] and "--description" in args:
+                job = next(entry for entry in self.jobs if entry["id"] == args[2])
+                assert job["enabled"] is False
+            return result
+
+    cli = CheckpointGuardCli()
+    item = manager(tmp_path, cli)
+    cli.item = item
+    transaction = write_staging_transaction(item, [], set())
+
+    job_id = item._apply_managed_spec(item._incremental_spec(), transaction)
+    restored_id = item._restore_cron_definition(
+        core._job_definition(legacy_snapshot_job(item)), transaction,
+    )
+    full_script = item.paths.project_root / "scripts/knowledge_index_full.sh"
+    full_script.parent.mkdir(parents=True, exist_ok=True)
+    full_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    full_script.chmod(0o700)
+    monkeypatch.setattr(
+        core.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 1, "", ""),
+    )
+    state, initial_id = item.mark_ready_or_schedule_build(transaction)
+
+    assert item.store.read()["cronStagingIntents"][
+        core.CRON_DECLARATION_KEY
+    ]["jobId"] == job_id
+    assert item.store.read()["restoredCronIdsByDeclaration"][
+        core.LEGACY_SNAPSHOT_DECLARATION_KEY
+    ] == restored_id
+    assert state == "INDEX_BUILDING" and initial_id is not None
+    assert all(job["enabled"] is False for job in cli.jobs if job["id"] != restored_id)
+
+
 def test_integration_includes_exact_gemini_job_in_quiescence_targets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -444,7 +1105,7 @@ def test_integration_includes_exact_gemini_job_in_quiescence_targets(
     }
     captured: set[str] = set()
     monkeypatch.setattr(item, "_preflight_cron_inventory", lambda: ([gemini], []))
-    monkeypatch.setattr(item, "begin", lambda: dict(base))
+    monkeypatch.setattr(item, "begin", lambda **_: dict(base))
 
     def stop_after_capture(
         _jobs: list[dict[str, Any]], target_ids: set[str], _hashes: dict[str, str]
@@ -482,7 +1143,7 @@ def test_integration_persists_creation_intent_without_claiming_uncreated_roots(
     }
     captured: dict[str, Any] = {}
     monkeypatch.setattr(item, "_preflight_cron_inventory", lambda: ([], []))
-    monkeypatch.setattr(item, "begin", lambda: dict(base))
+    monkeypatch.setattr(item, "begin", lambda **_: dict(base))
 
     def stop_before_creation(*_args: Any) -> list[str]:
         captured.update(item.store.read())
@@ -523,7 +1184,7 @@ def test_atomic_capability_failure_happens_before_cron_or_runtime_mutation(
     quiesce_called = False
     rollback_called = False
     monkeypatch.setattr(item, "_preflight_cron_inventory", lambda: ([], []))
-    monkeypatch.setattr(item, "begin", lambda: dict(base))
+    monkeypatch.setattr(item, "begin", lambda **_: dict(base))
 
     def fail_probe(*_args: Any, **_kwargs: Any) -> None:
         receipt = item.store.read()
@@ -1046,7 +1707,7 @@ def test_sensitive_owned_cron_env_blocks_before_transaction_without_echoing_valu
     item.cli.jobs = [unsafe]
     began = False
 
-    def begin() -> dict[str, Any]:
+    def begin(**_kwargs: Any) -> dict[str, Any]:
         nonlocal began
         began = True
         return {}
@@ -1092,9 +1753,10 @@ def test_transaction_store_ignores_stale_interrupted_temporary_file(tmp_path: Pa
 def test_both_recurring_jobs_are_verified_disabled_before_global_enable(tmp_path: Path) -> None:
     cli = StatefulCronCli()
     item = manager(tmp_path, cli)
+    transaction = write_staging_transaction(item, [], set())
 
-    incremental_id = item._apply_managed_spec(item._incremental_spec())
-    snapshot_id = item._apply_managed_spec(item._snapshot_spec())
+    incremental_id = item._apply_managed_spec(item._incremental_spec(), transaction)
+    snapshot_id = item._apply_managed_spec(item._snapshot_spec(), transaction)
 
     assert all(job["enabled"] is False for job in cli.jobs)
     item._verify_recurring_specs(enabled=False)
@@ -1116,8 +1778,11 @@ def test_cli_no_delivery_normalization_passes_disabled_and_enabled_readback(
 
     cli = NormalizingCronCli()
     item = manager(tmp_path, cli)
+    transaction = write_staging_transaction(item, [], set())
 
-    job_id = item._apply_managed_spec(item._incremental_spec(), enable=True)
+    job_id = item._apply_managed_spec(
+        item._incremental_spec(), transaction, enable=True,
+    )
 
     installed = next(job for job in cli.jobs if job["id"] == job_id)
     assert installed["enabled"] is True
@@ -1387,7 +2052,7 @@ def prepare_collision_integration_runtime(
     def guard(*, checkpoint=None) -> Iterator[dict[str, Any]]:
         yield {"snapshotLockCreated": False, "persisted": False}
 
-    monkeypatch.setattr(item, "begin", lambda: dict(base))
+    monkeypatch.setattr(item, "begin", lambda **_: dict(base))
     monkeypatch.setattr(item, "_prepare_snapshot_root", lambda _transaction: create_snapshot_root(item))
     monkeypatch.setattr(item, "_runtime_quiescence_guard", guard)
     monkeypatch.setattr(item, "bootstrap_project", lambda _: False)
@@ -1396,7 +2061,7 @@ def prepare_collision_integration_runtime(
     monkeypatch.setattr(item, "configure_openclaw", lambda _allowed, **_: None)
     monkeypatch.setattr(item, "install_launchd_plist", lambda _: None)
     monkeypatch.setattr(item, "activate_launchd", lambda: None)
-    monkeypatch.setattr(item, "mark_ready_or_schedule_build", lambda: ("READY", None))
+    monkeypatch.setattr(item, "mark_ready_or_schedule_build", lambda *_: ("READY", None))
     monkeypatch.setattr(item, "_sha256_config", lambda _: "0" * 64)
     monkeypatch.setattr(item, "_verify_local_source_map", lambda: None)
     monkeypatch.setattr(item, "_verify_runtime_contract_files", lambda: None)
@@ -1515,7 +2180,7 @@ def test_approved_disabled_collision_fault_rollback_preserves_exact_unknown_inve
         "projectExisted": True,
         "healthReceiptExisted": False,
     }
-    monkeypatch.setattr(item, "begin", lambda: dict(base_transaction))
+    monkeypatch.setattr(item, "begin", lambda **_: dict(base_transaction))
     monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
     monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
     real_quiesce = item._quiesce_prior_jobs
@@ -1606,7 +2271,7 @@ def test_activation_failure_invokes_rollback_before_commit(
         yield {"snapshotLockCreated": False, "persisted": False}
 
     monkeypatch.setattr(item, "_preflight_cron_inventory", lambda: ([], []))
-    monkeypatch.setattr(item, "begin", lambda: dict(base))
+    monkeypatch.setattr(item, "begin", lambda **_: dict(base))
     monkeypatch.setattr(item, "_prepare_snapshot_root", lambda _transaction: create_snapshot_root(item))
     monkeypatch.setattr(item, "_runtime_quiescence_guard", guard)
     monkeypatch.setattr(item, "bootstrap_project", lambda _: False)
@@ -1616,10 +2281,11 @@ def test_activation_failure_invokes_rollback_before_commit(
     monkeypatch.setattr(item, "install_launchd_plist", lambda _: events.append("plist"))
     monkeypatch.setattr(item, "activate_launchd", lambda: events.append("launchd"))
     staged = iter(["incremental", "snapshot"])
-    monkeypatch.setattr(item, "_apply_managed_spec", lambda _: next(staged))
+    monkeypatch.setattr(item, "_apply_managed_spec", lambda *_: next(staged))
     monkeypatch.setattr(item, "_verify_recurring_specs", lambda **_: events.append("global-disabled"))
     monkeypatch.setattr(item, "disable_owned_gemini_jobs", lambda: [])
-    monkeypatch.setattr(item, "mark_ready_or_schedule_build", lambda: ("READY", None))
+    monkeypatch.setattr(item, "mark_ready_or_schedule_build", lambda *_: ("READY", None))
+    monkeypatch.setattr(item, "_verify_success_cron_inventory", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(item, "_sha256_config", lambda _: "0" * 64)
     monkeypatch.setattr(item.cli, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""))
     monkeypatch.setattr(item, "_enable_recurring_jobs", lambda _: (_ for _ in ()).throw(RuntimeError("enable fault")))
@@ -1659,7 +2325,7 @@ def test_failed_phase_write_failure_cannot_suppress_rollback(
         return real_write(payload)
 
     monkeypatch.setattr(item, "_preflight_cron_inventory", lambda: ([], []))
-    monkeypatch.setattr(item, "begin", lambda: dict(base))
+    monkeypatch.setattr(item, "begin", lambda **_: dict(base))
     monkeypatch.setattr(
         item,
         "_quiesce_prior_jobs",
@@ -1695,7 +2361,7 @@ def test_incomplete_automatic_rollback_raises_typed_recovery_state_and_preserves
         "healthReceiptExisted": False,
     }
     monkeypatch.setattr(item, "_preflight_cron_inventory", lambda: ([], []))
-    monkeypatch.setattr(item, "begin", lambda: dict(base))
+    monkeypatch.setattr(item, "begin", lambda **_: dict(base))
     monkeypatch.setattr(item, "_quiesce_prior_jobs", lambda *_: (_ for _ in ()).throw(primary))
     monkeypatch.setattr(item, "_rollback_locked", lambda **_: (_ for _ in ()).throw(rollback))
 
@@ -1733,6 +2399,320 @@ def customer_job(*, job_id: str = "customer") -> dict[str, Any]:
     }
 
 
+def write_staging_transaction(
+    item: core.IntegrationManager,
+    jobs_before: list[dict[str, Any]],
+    target_ids: set[str],
+) -> dict[str, Any]:
+    definitions = [
+        core._job_definition(job) for job in jobs_before
+        if str(job["id"]) in target_ids
+    ]
+    inventory_hashes = item._inventory_hashes(jobs_before)
+    transaction = {
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "runId": "staging-fixture",
+        "phase": "replacing_managed_cron",
+        "cronContractHashVersion": core.CRON_CONTRACT_HASH_VERSION,
+        "cronDefinitionsBefore": definitions,
+        "cronInventoryTotalBefore": len(jobs_before),
+        "cronInventoryHashesBefore": inventory_hashes,
+        "cronUnknownHashesBefore": {
+            job_id: fingerprint for job_id, fingerprint in inventory_hashes.items()
+            if job_id not in target_ids
+        },
+        "cronReplaceIdsBefore": sorted(
+            str(job["id"]) for job in jobs_before
+            if job.get("declarationKey") in core.MANAGED_CRON_KEYS
+        ),
+        "disabledGeminiJobs": [
+            {"id": str(job["id"]), "wasEnabled": True}
+            for job in jobs_before
+            if str(job["id"]) in target_ids
+            and job.get("declarationKey") == core.GEMINI_DECLARATION_KEY
+            and job.get("enabled") is True
+        ],
+        "cronPreservedGeminiHashesAfterQuiesce": {
+            str(job["id"]): core._job_contract_hash(
+                {**core._job_definition(job), "enabled": False},
+                include_id=True,
+            )
+            for job in jobs_before
+            if str(job["id"]) in target_ids
+            and job.get("declarationKey") == core.GEMINI_DECLARATION_KEY
+        },
+        "cronTargetIdsBefore": sorted(target_ids),
+        "managedCronIdsAfter": [],
+        "cronStagingIntents": {},
+        "cronRestoreIntents": {},
+        "restoredCronIdsByDeclaration": {},
+    }
+    item.store.write(transaction)
+    return transaction
+
+
+def test_replacement_receipt_graph_cross_binds_inventory_managed_and_gemini(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="prior-managed", enabled=True,
+    )
+    gemini = gemini_job(item, job_id="prior-gemini", enabled=True)
+    unknown = customer_job()
+    transaction = write_staging_transaction(
+        item,
+        [managed, gemini, unknown],
+        {"prior-managed", "prior-gemini"},
+    )
+
+    assert item._validate_replacement_receipt_graph(transaction) is True
+    assert transaction["cronInventoryTotalBefore"] == 3
+    assert transaction["cronReplaceIdsBefore"] == ["prior-managed"]
+    assert transaction["disabledGeminiJobs"] == [
+        {"id": "prior-gemini", "wasEnabled": True}
+    ]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["missing", "extra", "nonhex", "wrong-hash-with-live-drift"],
+)
+def test_replacement_receipt_graph_rejects_gemini_rebaseline(
+    tmp_path: Path, fault: str,
+) -> None:
+    item = manager(tmp_path / fault)
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="prior-managed", enabled=True,
+    )
+    gemini = gemini_job(item, job_id="prior-gemini", enabled=True)
+    transaction = write_staging_transaction(
+        item,
+        [managed, gemini],
+        {"prior-managed", "prior-gemini"},
+    )
+    receipt = transaction["cronPreservedGeminiHashesAfterQuiesce"]
+    if fault == "missing":
+        transaction.pop("cronPreservedGeminiHashesAfterQuiesce")
+    elif fault == "extra":
+        receipt["extra-gemini"] = "0" * 64
+    elif fault == "nonhex":
+        receipt["prior-gemini"] = "not-a-sha256"
+    else:
+        drifted = json.loads(json.dumps(gemini))
+        drifted["enabled"] = False
+        drifted["schedule"]["expr"] = "17 4 * * *"
+        receipt["prior-gemini"] = core._job_contract_hash(
+            drifted, include_id=True,
+        )
+
+    with pytest.raises(RuntimeError, match="Cron replacement"):
+        item._validate_replacement_receipt_graph(transaction)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["inventory-total", "replace-ids", "removed-ids", "disabled-gemini", "phase"],
+)
+def test_replacement_receipt_graph_tamper_fails_closed(
+    tmp_path: Path, fault: str,
+) -> None:
+    item = manager(tmp_path / fault)
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="prior-managed", enabled=True,
+    )
+    gemini = gemini_job(item, job_id="prior-gemini", enabled=True)
+    unknown = customer_job()
+    transaction = write_staging_transaction(
+        item,
+        [managed, gemini, unknown],
+        {"prior-managed", "prior-gemini"},
+    )
+    if fault == "inventory-total":
+        transaction["cronInventoryTotalBefore"] += 1
+    elif fault == "replace-ids":
+        transaction["cronReplaceIdsBefore"] = []
+    elif fault == "removed-ids":
+        transaction["phase"] = "staging_managed_cron"
+        transaction["removedManagedCronIdsBeforeAdd"] = []
+    elif fault == "disabled-gemini":
+        transaction["disabledGeminiJobs"] = []
+    else:
+        transaction["phase"] = "failed"
+        transaction["failurePhase"] = "quiesced"
+
+    with pytest.raises(RuntimeError, match="Cron replacement"):
+        item._validate_replacement_receipt_graph(transaction)
+
+
+@pytest.mark.parametrize(
+    ("phase", "failure_phase"),
+    [
+        ("failed", None),
+        ("failed", "unknown-phase"),
+        ("rollback_failed", None),
+        ("rollback_failed", "unknown-phase"),
+    ],
+)
+def test_replacement_receipt_terminal_phase_requires_recognized_origin(
+    tmp_path: Path, phase: str, failure_phase: str | None,
+) -> None:
+    item = manager(tmp_path / f"{phase}-{failure_phase}")
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="prior-managed", enabled=True,
+    )
+    transaction = write_staging_transaction(
+        item, [managed], {"prior-managed"},
+    )
+    transaction["phase"] = phase
+    if failure_phase is not None:
+        transaction["failurePhase"] = failure_phase
+
+    with pytest.raises(RuntimeError, match="terminal phase authority"):
+        item._validate_replacement_receipt_graph(transaction)
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["cronReplaceIdsBefore", "removedManagedCronIdsBeforeAdd"],
+)
+def test_replacement_receipt_terminal_post_replace_requires_both_receipts(
+    tmp_path: Path, missing_field: str,
+) -> None:
+    item = manager(tmp_path / missing_field)
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="prior-managed", enabled=True,
+    )
+    transaction = write_staging_transaction(
+        item, [managed], {"prior-managed"},
+    )
+    transaction.update({
+        "phase": "failed",
+        "failurePhase": "activation_pending",
+        "removedManagedCronIdsBeforeAdd": ["prior-managed"],
+    })
+    transaction.pop(missing_field)
+
+    with pytest.raises(RuntimeError, match="Cron replacement"):
+        item._validate_replacement_receipt_graph(transaction)
+
+
+def test_replacing_phase_rejects_premature_removed_receipt(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="prior-managed", enabled=True,
+    )
+    transaction = write_staging_transaction(
+        item, [managed], {"prior-managed"},
+    )
+    transaction["removedManagedCronIdsBeforeAdd"] = ["prior-managed"]
+
+    with pytest.raises(RuntimeError, match="phase boundary"):
+        item._validate_replacement_receipt_graph(transaction)
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_new_only_phase_cannot_downgrade_by_removing_all_graph_fields(
+    tmp_path: Path, terminal: bool,
+) -> None:
+    item = manager(tmp_path / str(terminal))
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="prior-managed", enabled=True,
+    )
+    transaction = write_staging_transaction(
+        item, [managed], {"prior-managed"},
+    )
+    transaction["phase"] = "activation_pending"
+    transaction["removedManagedCronIdsBeforeAdd"] = ["prior-managed"]
+    if terminal:
+        transaction["failurePhase"] = transaction["phase"]
+        transaction["phase"] = "failed"
+    for field in (
+        "cronInventoryTotalBefore", "disabledGeminiJobs",
+        "cronReplaceIdsBefore", "removedManagedCronIdsBeforeAdd",
+    ):
+        transaction.pop(field)
+
+    with pytest.raises(RuntimeError, match="receipt graph is missing"):
+        item._validate_replacement_receipt_graph(transaction)
+
+
+@pytest.mark.parametrize("origin", [None, "unknown-phase"])
+def test_rolled_back_graph_requires_explicit_recognized_origin(
+    tmp_path: Path, origin: str | None,
+) -> None:
+    item = manager(tmp_path / str(origin))
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="prior-managed", enabled=True,
+    )
+    transaction = write_staging_transaction(
+        item, [managed], {"prior-managed"},
+    )
+    transaction["phase"] = "rolled_back"
+    if origin is not None:
+        transaction["rollbackOriginPhase"] = origin
+
+    with pytest.raises(RuntimeError, match="terminal phase authority"):
+        item._validate_replacement_receipt_graph(transaction)
+
+
+def test_rolled_back_graph_preserves_explicit_replacement_origin(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="prior-managed", enabled=True,
+    )
+    transaction = write_staging_transaction(
+        item, [managed], {"prior-managed"},
+    )
+    transaction.update({
+        "phase": "rolled_back",
+        "rollbackOriginPhase": "replacing_managed_cron",
+    })
+
+    assert item._validate_replacement_receipt_graph(transaction) is True
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["definition-hash", "target-partition", "unknown-collision", "unknown-gap"],
+)
+def test_replacement_graph_tamper_stops_before_any_exact_removal(
+    tmp_path: Path, fault: str,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path / fault, cli)
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="prior-managed", enabled=True,
+    )
+    unknown = customer_job()
+    jobs_before = [managed, unknown]
+    cli.jobs = json.loads(json.dumps(jobs_before))
+    hashes = item._inventory_hashes(jobs_before)
+    transaction = write_staging_transaction(
+        item, jobs_before, {"prior-managed"},
+    )
+    if fault == "definition-hash":
+        transaction["cronDefinitionsBefore"][0]["name"] = "Different valid name"
+    elif fault == "target-partition":
+        transaction["cronTargetIdsBefore"] = []
+    elif fault == "unknown-collision":
+        transaction["cronUnknownHashesBefore"]["prior-managed"] = hashes[
+            "prior-managed"
+        ]
+    else:
+        transaction["cronUnknownHashesBefore"].pop("customer")
+    item.store.write(transaction)
+
+    with pytest.raises(RuntimeError, match="Cron replacement"):
+        item._remove_prior_managed_jobs_for_replacement(
+            jobs_before, {"prior-managed"}, hashes,
+        )
+
+    assert not any(call[:2] == ["cron", "rm"] for call in cli.calls)
+    assert {job["id"] for job in cli.jobs} == {"prior-managed", "customer"}
+
+
 def write_rollback_transaction(
     item: core.IntegrationManager,
     *,
@@ -1760,16 +2740,665 @@ def write_rollback_transaction(
         "snapshotRunIno": 2,
         "cronMutationStarted": True,
         "runtimeMutationStarted": False,
+        "cronContractHashVersion": core.CRON_CONTRACT_HASH_VERSION,
         "cronDefinitionsBefore": prior_definitions,
         "cronUnknownHashesBefore": {
             str(unknown["id"]): core._job_contract_hash(unknown, include_id=True),
         },
-        "cronInventoryHashesBefore": {},
+        "cronInventoryHashesBefore": {
+            str(definition["id"]): core._job_contract_hash(definition, include_id=True)
+            for definition in prior_definitions
+        } | {
+            str(unknown["id"]): core._job_contract_hash(unknown, include_id=True),
+        },
+        "cronPreservedGeminiHashesAfterQuiesce": {
+            str(definition["id"]): core._job_contract_hash(
+                {**definition, "enabled": False}, include_id=True,
+            )
+            for definition in prior_definitions
+            if definition.get("declarationKey") == core.GEMINI_DECLARATION_KEY
+        },
         "cronTargetIdsBefore": target_ids,
         "managedCronIdsAfter": managed_after,
+        "cronStagingIntents": {},
+        "cronRestoreIntents": {},
+        "restoredCronIdsByDeclaration": {},
         "snapshotRootCreated": False,
         "snapshotLockCreated": False,
     })
+
+
+def arm_activation_fail_safe_transaction(
+    item: core.IntegrationManager,
+    cli: StatefulCronCli,
+    *,
+    enabled_keys: set[str],
+    include_initial: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    unknown = customer_job()
+    write_rollback_transaction(
+        item,
+        prior_definitions=[],
+        unknown=unknown,
+        target_ids=[],
+        managed_after=[],
+    )
+    transaction = item.store.read()
+    jobs: list[dict[str, Any]] = []
+    expected_by_key = {
+        core.CRON_DECLARATION_KEY: "new-incremental",
+        core.SNAPSHOT_CRON_DECLARATION_KEY: "new-snapshot",
+    }
+    for spec in (item._incremental_spec(), item._snapshot_spec()):
+        intent = item._ensure_cron_intent(
+            transaction,
+            bucket_name="cronStagingIntents",
+            declaration_key=spec.key,
+            canonical_description=spec.description,
+            role="managed",
+            expected_factory=lambda description, expected=spec: (
+                item._managed_pre_alert_definition(expected, description)
+            ),
+        )
+        intent["jobId"] = expected_by_key[spec.key]
+        intent["configured"] = True
+        lifecycle = item._managed_intent_lifecycle_contracts(intent)
+        job = json.loads(json.dumps(
+            lifecycle[3 if spec.key in enabled_keys else 2]
+        ))
+        job["id"] = expected_by_key[spec.key]
+        jobs.append(job)
+
+    if include_initial:
+        scheduled_at = "2026-09-07T07:00:00.000Z"
+        intent = item._ensure_cron_intent(
+            transaction,
+            bucket_name="cronStagingIntents",
+            declaration_key=core.INITIAL_CRON_DECLARATION_KEY,
+            canonical_description=core.INITIAL_CRON_DESCRIPTION,
+            role="initial",
+            expected_factory=lambda description: item._initial_pre_alert_definition(
+                description, scheduled_at,
+            ),
+            extra_fields={"scheduledAt": scheduled_at},
+        )
+        intent["jobId"] = "new-initial"
+        intent["configured"] = True
+        lifecycle = item._managed_intent_lifecycle_contracts(intent)
+        job = json.loads(json.dumps(
+            lifecycle[
+                3 if core.INITIAL_CRON_DECLARATION_KEY in enabled_keys else 2
+            ]
+        ))
+        job["id"] = "new-initial"
+        jobs.append(job)
+        expected_by_key[core.INITIAL_CRON_DECLARATION_KEY] = "new-initial"
+
+    transaction.update({
+        "phase": "failed",
+        "failurePhase": "activation_pending",
+        "cronInventoryTotalBefore": 1,
+        "cronReplaceIdsBefore": [],
+        "removedManagedCronIdsBeforeAdd": [],
+        "disabledGeminiJobs": [],
+        "cronId": expected_by_key[core.CRON_DECLARATION_KEY],
+        "snapshotCronId": expected_by_key[core.SNAPSHOT_CRON_DECLARATION_KEY],
+        "initialIndexJobId": expected_by_key.get(
+            core.INITIAL_CRON_DECLARATION_KEY
+        ),
+        "indexState": "INDEX_BUILDING" if include_initial else "READY",
+        "managedCronIdsAfter": list(expected_by_key.values()),
+        "activationFailSafeRequired": True,
+        "activationFailSafeDisabledCronIds": [],
+        "activationFailSafeComplete": False,
+    })
+    item.store.write(transaction)
+    cli.jobs = [*jobs, json.loads(json.dumps(unknown))]
+    return transaction, unknown
+
+
+@pytest.mark.parametrize(
+    ("phase", "failure_phase"),
+    [
+        ("activation_pending", None),
+        ("commit_closeout_pending", None),
+        ("failed", "activation_pending"),
+        ("rollback_failed", "commit_closeout_pending"),
+    ],
+)
+def test_armed_noncommitted_reentry_disables_partial_activation_before_refusal(
+    tmp_path: Path, phase: str, failure_phase: str | None,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path / phase, cli)
+    transaction, original_unknown = arm_activation_fail_safe_transaction(
+        item,
+        cli,
+        enabled_keys={core.CRON_DECLARATION_KEY},
+    )
+    transaction["phase"] = phase
+    if failure_phase is None:
+        transaction.pop("failurePhase", None)
+    else:
+        transaction["failurePhase"] = failure_phase
+    item.store.write(transaction)
+    unknown = next(job for job in cli.jobs if job["id"] == "customer")
+    unknown["description"] = "Concurrent customer change during installer crash."
+    drifted_unknown = json.loads(json.dumps(unknown))
+
+    with pytest.raises(RuntimeError, match="safely disabled and requires rollback"):
+        item._integrate_locked({"runtimePort": 18888})
+
+    assert all(job["enabled"] is False for job in cli.jobs if job["id"] != "customer")
+    assert next(job for job in cli.jobs if job["id"] == "customer") == drifted_unknown
+    assert original_unknown != drifted_unknown
+    assert not any(call[:2] in (["cron", "add"], ["cron", "rm"]) for call in cli.calls)
+    assert not any(
+        call[:2] == ["cron", "edit"] and call[2] == "customer"
+        for call in cli.calls
+    )
+    receipt = item.store.read()
+    assert receipt["phase"] == phase
+    assert receipt["activationFailSafeRequired"] is True
+    assert receipt["activationFailSafeComplete"] is True
+    assert set(receipt["activationFailSafeDisabledCronIds"]) == {
+        "new-incremental", "new-snapshot",
+    }
+
+
+def test_armed_reentry_compensation_failure_is_typed_and_persisted(
+    tmp_path: Path,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    transaction, unknown = arm_activation_fail_safe_transaction(
+        item,
+        cli,
+        enabled_keys={core.CRON_DECLARATION_KEY, core.SNAPSHOT_CRON_DECLARATION_KEY},
+    )
+    transaction["phase"] = "activation_pending"
+    transaction.pop("failurePhase", None)
+    item.store.write(transaction)
+    cli.jobs = [job for job in cli.jobs if job["id"] != "new-incremental"]
+
+    with pytest.raises(core.ActivationFailSafeIncomplete) as caught:
+        item._integrate_locked({"runtimePort": 18888})
+
+    assert "compensation was incomplete" in str(caught.value.compensation_error)
+    assert caught.value.recovery_state == "activation_fail_safe_incomplete"
+    assert next(job for job in cli.jobs if job["id"] == "new-snapshot")[
+        "enabled"
+    ] is False
+    assert next(job for job in cli.jobs if job["id"] == "customer") == unknown
+    receipt = item.store.read()
+    assert receipt["phase"] == "activation_pending"
+    assert receipt["activationFailSafeRequired"] is True
+    assert receipt["activationFailSafeStarted"] is True
+    assert receipt["activationFailSafeComplete"] is False
+    assert "new-snapshot" in receipt["activationFailSafeDisabledCronIds"]
+    assert not any(call[:2] in (["cron", "add"], ["cron", "rm"]) for call in cli.calls)
+
+
+def test_armed_reentry_rejects_malformed_marker_before_cron_mutation(
+    tmp_path: Path,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    transaction, _ = arm_activation_fail_safe_transaction(
+        item, cli, enabled_keys={core.CRON_DECLARATION_KEY},
+    )
+    transaction["phase"] = "activation_pending"
+    transaction.pop("failurePhase", None)
+    transaction["activationFailSafeRequired"] = "true"
+    item.store.write(transaction)
+    cli.calls.clear()
+
+    with pytest.raises(RuntimeError, match="durable marker is malformed"):
+        item._integrate_locked({"runtimePort": 18888})
+
+    assert cli.calls == []
+    assert next(job for job in cli.jobs if job["id"] == "new-incremental")[
+        "enabled"
+    ] is True
+
+
+def test_activation_fail_safe_marker_write_failure_still_disables_every_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    _, unknown = arm_activation_fail_safe_transaction(
+        item,
+        cli,
+        enabled_keys={core.CRON_DECLARATION_KEY, core.SNAPSHOT_CRON_DECLARATION_KEY},
+    )
+    real_write = item.store.write
+    failed = False
+
+    def fail_first_progress_write(payload: dict[str, Any]) -> Path:
+        nonlocal failed
+        if payload.get("activationFailSafeStarted") is True and not failed:
+            failed = True
+            raise OSError("simulated first progress write failure")
+        return real_write(payload)
+
+    monkeypatch.setattr(item.store, "write", fail_first_progress_write)
+
+    with pytest.raises(RuntimeError, match="compensation was incomplete"):
+        item._disable_uncommitted_managed_jobs_for_activation_failure(
+            item.store.read()
+        )
+
+    assert failed is True
+    assert all(job["enabled"] is False for job in cli.jobs if job["id"] != "customer")
+    assert next(job for job in cli.jobs if job["id"] == "customer") == unknown
+    assert not any(
+        call[:2] == ["cron", "edit"] and call[2] == "customer"
+        for call in cli.calls
+    )
+    receipt = item.store.read()
+    assert receipt["activationFailSafeStarted"] is True
+    assert receipt["activationFailSafeComplete"] is False
+    assert set(receipt["activationFailSafeDisabledCronIds"]) == {
+        "new-incremental", "new-snapshot",
+    }
+
+
+@pytest.mark.parametrize("enabled_count", [1, 2])
+def test_activation_failure_after_first_or_second_enable_disables_every_new_job_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enabled_count: int,
+) -> None:
+    class FailNthEnableCli(StatefulCronCli):
+        enable_count = 0
+
+        def run(self, args: list[str], *, timeout: int = 120, check: bool = True):
+            result = super().run(args, timeout=timeout, check=check)
+            if args[:2] == ["cron", "edit"] and "--enable" in args:
+                self.enable_count += 1
+                if self.enable_count == enabled_count:
+                    raise RuntimeError(f"activation edit {enabled_count} failed")
+            return result
+
+    cli = FailNthEnableCli()
+    item = manager(tmp_path / str(enabled_count), cli)
+    arm_activation_fail_safe_transaction(
+        item, cli, enabled_keys=set(),
+    )
+    with pytest.raises(RuntimeError, match=f"activation edit {enabled_count} failed"):
+        item._enable_recurring_jobs(["new-incremental", "new-snapshot"])
+    monkeypatch.setattr(
+        item,
+        "_snapshot_root_from_transaction",
+        lambda _transaction: (_ for _ in ()).throw(
+            RuntimeError("strict rollback continued after fail-safe")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="strict rollback continued"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    managed = [job for job in cli.jobs if job["id"] != "customer"]
+    assert len(managed) == 2
+    assert all(job["enabled"] is False for job in managed)
+    receipt = item.store.read()
+    assert receipt["activationFailSafeComplete"] is True
+    assert set(receipt["activationFailSafeDisabledCronIds"]) == {
+        "new-incremental", "new-snapshot",
+    }
+
+
+@pytest.mark.parametrize("failure_point", ["health", "activation-verify"])
+def test_post_activation_failure_disables_all_managed_despite_unknown_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path / failure_point, cli)
+    _, original_unknown = arm_activation_fail_safe_transaction(
+        item,
+        cli,
+        enabled_keys=set(),
+        include_initial=True,
+    )
+    pending = item.store.read()
+    pending["phase"] = "activation_pending"
+    pending.pop("failurePhase", None)
+    item.store.write(pending)
+    item._enable_recurring_jobs(["new-incremental", "new-snapshot"])
+    item._enable_initial_job("new-initial")
+    assert all(job["enabled"] is True for job in cli.jobs if job["id"] != "customer")
+    unknown = next(job for job in cli.jobs if job["id"] == "customer")
+    unknown["description"] = "Unrelated concurrent customer edit."
+    unknown_after_drift = json.loads(json.dumps(unknown))
+    if failure_point == "health":
+        monkeypatch.setattr(
+            item,
+            "_write_health_receipt",
+            lambda **_: (_ for _ in ()).throw(RuntimeError("health write failed")),
+        )
+        with pytest.raises(RuntimeError, match="health write failed"):
+            item._write_health_receipt(event="initial", status="pending")
+    else:
+        monkeypatch.setattr(
+            item,
+            "_verify_activation_pending",
+            lambda _transaction: (_ for _ in ()).throw(
+                RuntimeError("activation verification failed")
+            ),
+        )
+        with pytest.raises(RuntimeError, match="activation verification failed"):
+            item._verify_activation_pending(item.store.read())
+    failed = item.store.read()
+    failed["failurePhase"] = failed["phase"]
+    failed["phase"] = "failed"
+    item.store.write(failed)
+    monkeypatch.setattr(
+        item, "_snapshot_root_from_transaction", lambda _transaction: item.snapshot_root,
+    )
+    monkeypatch.setattr(
+        item, "_project_root_from_transaction", lambda _transaction: item.paths.project_root,
+    )
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_preflight_rollback_assets", lambda *_, **__: {})
+    monkeypatch.setattr(item, "_preflight_created_snapshot_artifacts", lambda *_: None)
+
+    with pytest.raises(RuntimeError, match="unknown cron receipt drifted"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    managed = [job for job in cli.jobs if job["id"] != "customer"]
+    assert len(managed) == 3
+    assert all(job["enabled"] is False for job in managed)
+    assert next(job for job in cli.jobs if job["id"] == "customer") == unknown_after_drift
+    assert original_unknown != unknown_after_drift
+    assert not any(
+        call[:2] in (["cron", "edit"], ["cron", "rm"])
+        and len(call) > 2 and call[2] == "customer"
+        for call in cli.calls
+    )
+    assert item.store.read()["activationFailSafeComplete"] is True
+
+
+def test_activation_fail_safe_resumes_after_interrupted_disable_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailOnceDuringCompensationCli(StatefulCronCli):
+        disable_count = 0
+        failed = False
+
+        def run(self, args: list[str], *, timeout: int = 120, check: bool = True):
+            result = super().run(args, timeout=timeout, check=check)
+            if args[:2] == ["cron", "edit"] and "--disable" in args:
+                self.disable_count += 1
+                if self.disable_count == 2 and not self.failed:
+                    self.failed = True
+                    raise RuntimeError("interrupted activation compensation")
+            return result
+
+    cli = FailOnceDuringCompensationCli()
+    item = manager(tmp_path, cli)
+    arm_activation_fail_safe_transaction(
+        item,
+        cli,
+        enabled_keys={
+            core.CRON_DECLARATION_KEY,
+            core.SNAPSHOT_CRON_DECLARATION_KEY,
+            core.INITIAL_CRON_DECLARATION_KEY,
+        },
+        include_initial=True,
+    )
+    monkeypatch.setattr(
+        item,
+        "_snapshot_root_from_transaction",
+        lambda _transaction: (_ for _ in ()).throw(RuntimeError("strict rollback resumed")),
+    )
+
+    with pytest.raises(RuntimeError, match="compensation was incomplete"):
+        item._rollback_locked(require_exact_post_config=False)
+    partial = item.store.read()
+    assert partial["activationFailSafeComplete"] is False
+    assert set(partial["activationFailSafeDisabledCronIds"]) == {
+        "new-incremental", "new-snapshot", "new-initial",
+    }
+
+    with pytest.raises(RuntimeError, match="strict rollback resumed"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    assert all(job["enabled"] is False for job in cli.jobs if job["id"] != "customer")
+    completed = item.store.read()
+    assert completed["activationFailSafeComplete"] is True
+    assert set(completed["activationFailSafeDisabledCronIds"]) == {
+        "new-incremental", "new-snapshot", "new-initial",
+    }
+
+
+@pytest.mark.parametrize("fault", ["missing-first", "drift-first"])
+def test_activation_fail_safe_continues_after_one_target_is_unrecoverable(
+    tmp_path: Path, fault: str,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path / fault, cli)
+    _, unknown = arm_activation_fail_safe_transaction(
+        item,
+        cli,
+        enabled_keys={core.CRON_DECLARATION_KEY, core.SNAPSHOT_CRON_DECLARATION_KEY},
+    )
+    if fault == "missing-first":
+        cli.jobs = [job for job in cli.jobs if job["id"] != "new-incremental"]
+    else:
+        first = next(job for job in cli.jobs if job["id"] == "new-incremental")
+        first["description"] = "Concurrent lifecycle drift."
+
+    with pytest.raises(RuntimeError, match="compensation was incomplete"):
+        item._disable_uncommitted_managed_jobs_for_activation_failure(
+            item.store.read()
+        )
+
+    assert next(
+        job for job in cli.jobs if job["id"] == "new-snapshot"
+    )["enabled"] is False
+    assert next(job for job in cli.jobs if job["id"] == "customer") == unknown
+    assert not any(
+        call[:2] in (["cron", "edit"], ["cron", "rm"])
+        and len(call) > 2 and call[2] == "customer"
+        for call in cli.calls
+    )
+    receipt = item.store.read()
+    assert receipt["activationFailSafeComplete"] is False
+    assert "new-snapshot" in receipt["activationFailSafeDisabledCronIds"]
+
+
+def test_activation_fail_safe_continues_after_one_exact_edit_fails(
+    tmp_path: Path,
+) -> None:
+    class FailFirstDisableCli(StatefulCronCli):
+        failed = False
+
+        def run(self, args: list[str], *, timeout: int = 120, check: bool = True):
+            if args == ["cron", "edit", "new-incremental", "--disable"] \
+                    and not self.failed:
+                self.failed = True
+                raise RuntimeError("first exact disable failed")
+            return super().run(args, timeout=timeout, check=check)
+
+    cli = FailFirstDisableCli()
+    item = manager(tmp_path, cli)
+    _, unknown = arm_activation_fail_safe_transaction(
+        item,
+        cli,
+        enabled_keys={core.CRON_DECLARATION_KEY, core.SNAPSHOT_CRON_DECLARATION_KEY},
+    )
+
+    with pytest.raises(RuntimeError, match="compensation was incomplete"):
+        item._disable_uncommitted_managed_jobs_for_activation_failure(
+            item.store.read()
+        )
+
+    assert next(
+        job for job in cli.jobs if job["id"] == "new-incremental"
+    )["enabled"] is True
+    assert next(
+        job for job in cli.jobs if job["id"] == "new-snapshot"
+    )["enabled"] is False
+    assert next(job for job in cli.jobs if job["id"] == "customer") == unknown
+    assert item.store.read()["activationFailSafeComplete"] is False
+
+
+def test_committed_armed_final_verify_failure_disables_jobs_before_unknown_drift_blocks_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    transaction, _ = arm_activation_fail_safe_transaction(
+        item,
+        cli,
+        enabled_keys={core.CRON_DECLARATION_KEY, core.SNAPSHOT_CRON_DECLARATION_KEY},
+    )
+    transaction["phase"] = "committed"
+    transaction.pop("failurePhase", None)
+    item.store.write(transaction)
+    unknown_after_drift: dict[str, Any] = {}
+
+    def fail_final_verify() -> dict[str, Any]:
+        unknown = next(job for job in cli.jobs if job["id"] == "customer")
+        unknown["description"] = "Unknown drift during final verify."
+        unknown_after_drift.update(json.loads(json.dumps(unknown)))
+        raise RuntimeError("final committed verify failed")
+
+    monkeypatch.setattr(item, "verify", fail_final_verify)
+    monkeypatch.setattr(
+        item, "_snapshot_root_from_transaction", lambda _transaction: item.snapshot_root,
+    )
+    monkeypatch.setattr(
+        item, "_project_root_from_transaction", lambda _transaction: item.paths.project_root,
+    )
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_preflight_rollback_assets", lambda *_, **__: {})
+    monkeypatch.setattr(item, "_preflight_created_snapshot_artifacts", lambda *_: None)
+
+    with pytest.raises(core.IntegrationRollbackIncomplete) as caught:
+        item._resume_armed_committed_transaction(transaction)
+
+    assert "final committed verify failed" in str(caught.value.original_error)
+    assert "unknown cron receipt drifted" in str(caught.value.rollback_error)
+    assert all(job["enabled"] is False for job in cli.jobs if job["id"] != "customer")
+    assert next(job for job in cli.jobs if job["id"] == "customer") == unknown_after_drift
+    assert not any(call[:3] == ["cron", "rm", "customer"] for call in cli.calls)
+
+
+def test_committed_armed_disarm_crash_is_resumed_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    transaction, _ = arm_activation_fail_safe_transaction(
+        item,
+        cli,
+        enabled_keys={core.CRON_DECLARATION_KEY, core.SNAPSHOT_CRON_DECLARATION_KEY},
+    )
+    transaction["phase"] = "committed"
+    transaction.pop("failurePhase", None)
+    item.store.write(transaction)
+    monkeypatch.setattr(item, "verify", lambda: {"ok": True, "phase": "committed"})
+    real_write = item.store.write
+    crashed = False
+
+    def crash_before_first_disarm(payload: dict[str, Any]) -> Path:
+        nonlocal crashed
+        if payload.get("phase") == "committed" \
+                and payload.get("activationFailSafeRequired") is False \
+                and not crashed:
+            crashed = True
+            raise SimulatedCrash("process stopped before durable disarm")
+        return real_write(payload)
+
+    monkeypatch.setattr(item.store, "write", crash_before_first_disarm)
+    with pytest.raises(SimulatedCrash):
+        item._resume_armed_committed_transaction(transaction)
+
+    assert item.store.read()["phase"] == "committed"
+    assert item.store.read()["activationFailSafeRequired"] is True
+    monkeypatch.setattr(item.store, "write", real_write)
+
+    result = item._integrate_locked({"runtimePort": 18888})
+
+    assert result["transaction"] == "already_current"
+    assert item.store.read()["activationFailSafeRequired"] is False
+    assert all(job["enabled"] is True for job in cli.jobs if job["id"] != "customer")
+
+
+def test_applied_then_raised_disarm_rearms_before_failed_second_verify_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    transaction, _ = arm_activation_fail_safe_transaction(
+        item,
+        cli,
+        enabled_keys={core.CRON_DECLARATION_KEY, core.SNAPSHOT_CRON_DECLARATION_KEY},
+    )
+    transaction["phase"] = "committed"
+    transaction.pop("failurePhase", None)
+    item.store.write(transaction)
+    real_write = item.store.write
+    disarm_raised = False
+    verify_calls = 0
+    unknown_after_drift: dict[str, Any] = {}
+
+    def applied_then_raised(payload: dict[str, Any]) -> Path:
+        nonlocal disarm_raised
+        if payload.get("phase") == "committed" \
+                and payload.get("activationFailSafeRequired") is False \
+                and not disarm_raised:
+            disarm_raised = True
+            real_write(payload)
+            raise OSError("simulated post-replace disarm write error")
+        return real_write(payload)
+
+    def verify_twice() -> dict[str, Any]:
+        nonlocal verify_calls
+        verify_calls += 1
+        if verify_calls == 1:
+            return {"ok": True, "phase": "committed"}
+        unknown = next(job for job in cli.jobs if job["id"] == "customer")
+        unknown["description"] = "Unknown drift before ambiguous disarm recovery."
+        unknown_after_drift.update(json.loads(json.dumps(unknown)))
+        raise RuntimeError("second committed verification failed")
+
+    monkeypatch.setattr(item.store, "write", applied_then_raised)
+    monkeypatch.setattr(item, "verify", verify_twice)
+    monkeypatch.setattr(
+        item, "_snapshot_root_from_transaction", lambda _transaction: item.snapshot_root,
+    )
+    monkeypatch.setattr(
+        item, "_project_root_from_transaction", lambda _transaction: item.paths.project_root,
+    )
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_preflight_rollback_assets", lambda *_, **__: {})
+    monkeypatch.setattr(item, "_preflight_created_snapshot_artifacts", lambda *_: None)
+
+    with pytest.raises(core.IntegrationRollbackIncomplete) as caught:
+        item._resume_armed_committed_transaction(transaction)
+
+    assert disarm_raised is True
+    assert verify_calls == 2
+    assert "second committed verification failed" in str(caught.value.original_error)
+    assert "unknown cron receipt drifted" in str(caught.value.rollback_error)
+    assert all(job["enabled"] is False for job in cli.jobs if job["id"] != "customer")
+    assert next(job for job in cli.jobs if job["id"] == "customer") == unknown_after_drift
+    assert not any(
+        call[:2] == ["cron", "edit"] and call[2] == "customer"
+        for call in cli.calls
+    )
+    receipt = item.store.read()
+    assert receipt["phase"] == "rollback_failed"
+    assert receipt["activationFailSafeRequired"] is True
+    assert receipt["activationFailSafeComplete"] is True
 
 
 def test_rollback_restores_owned_and_gemini_definitions_and_preserves_unknown_exactly(
@@ -1791,7 +3420,7 @@ def test_rollback_restores_owned_and_gemini_definitions_and_preserves_unknown_ex
         prior_definitions=prior,
         unknown=unknown,
         target_ids=["incremental", "gemini"],
-        managed_after=["incremental"],
+        managed_after=[],
     )
     monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
     monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
@@ -1832,7 +3461,7 @@ def test_rollback_rejects_command_tools_receipt_before_cron_mutation(
         prior_definitions=[prior],
         unknown=unknown,
         target_ids=["incremental"],
-        managed_after=["incremental"],
+        managed_after=[],
     )
     monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
 
@@ -1868,7 +3497,7 @@ def test_rollback_cron_mutation_failure_never_marks_transaction_rolled_back(
         prior_definitions=[core._job_definition(prior_incremental)],
         unknown=unknown,
         target_ids=["incremental"],
-        managed_after=["incremental"],
+        managed_after=[],
     )
     monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
     monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
@@ -2558,7 +4187,7 @@ def initial_job(item: core.IntegrationManager, *, enabled: bool = True) -> dict[
         "sessionTarget": "isolated",
         "sessionKey": None,
         "agentId": None,
-        "schedule": {"kind": "at", "at": "2026-09-04T07:00:00+08:00"},
+        "schedule": {"kind": "at", "at": "2026-09-03T23:00:00.000Z"},
         "payload": {
             "kind": "command",
             "argv": [
@@ -2688,20 +4317,23 @@ class RestoreRecordingCli:
 
 
 def test_cron_rollback_receipt_preserves_one_shot_and_alert_definition(tmp_path: Path) -> None:
-    cli = RestoreRecordingCli()
+    cli = StatefulCronCli()
     item = manager(tmp_path, cli)
     definition = initial_job(item, enabled=True)
     receipt = core._job_definition(definition)
+    transaction = write_staging_transaction(item, [], set())
 
     assert receipt["deleteAfterRun"] is True
-    assert item._restore_cron_definition(receipt) == "restored"
-    add = cli.json_calls[0]
+    restored_id = item._restore_cron_definition(receipt, transaction)
+    add = next(call for call in cli.calls if call[:2] == ["cron", "add"])
     assert add[add.index("--at") + 1] == definition["schedule"]["at"]
     assert "--delete-after-run" in add and "--disabled" in add and "--no-deliver" in add
-    alert = cli.run_calls[0]
+    alert = next(call for call in cli.calls if "--failure-alert" in call)
     assert alert[alert.index("--failure-alert-mode") + 1] == "announce"
     assert "--failure-alert-exclude-skipped" in alert
-    assert cli.run_calls[-1] == ["cron", "edit", "restored", "--enable"]
+    assert not any(call[:3] == ["cron", "edit", restored_id] and "--enable" in call
+                   for call in cli.calls)
+    assert next(job for job in cli.jobs if job["id"] == restored_id)["enabled"] is False
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -2712,16 +4344,19 @@ def test_cron_rollback_round_trips_legacy_definition_exactly(
     item = manager(tmp_path, cli)
     original = legacy_snapshot_job(item, enabled=enabled)
     definition = core._job_definition(original)
+    transaction = write_staging_transaction(item, [], set())
 
-    restored_id = item._restore_cron_definition(definition)
+    restored_id = item._restore_cron_definition(definition, transaction)
 
     restored = next(job for job in cli.jobs if job["id"] == restored_id)
-    assert core._job_contract_hash(restored) == core._job_contract_hash(definition)
+    expected = json.loads(json.dumps(definition))
+    expected["enabled"] = False
+    assert core._job_contract_hash(restored) == core._job_contract_hash(expected)
     add = next(call for call in cli.calls if call[:2] == ["cron", "add"])
     assert "--disabled" in add
     assert add[add.index("--declaration-key") + 1] == core.LEGACY_SNAPSHOT_DECLARATION_KEY
-    assert (any(call[:3] == ["cron", "edit", restored_id] and "--enable" in call
-                for call in cli.calls)) is enabled
+    assert not any(call[:3] == ["cron", "edit", restored_id] and "--enable" in call
+                   for call in cli.calls)
 
 
 def test_configure_openclaw_force_replaces_existing_plugin(
@@ -2756,7 +4391,7 @@ def test_configure_openclaw_force_replaces_existing_plugin(
 def _write_precise_runtime_transaction(
     item: core.IntegrationManager,
     *,
-    cron_mutation_started: bool = False,
+    cron_mutation_started: bool = True,
     **markers: Any,
 ) -> dict[str, Any]:
     config = item.paths.home / ".openclaw/openclaw.json"
@@ -3287,8 +4922,15 @@ def test_launchd_rollback_failure_occurs_before_any_cron_deletion(
     transaction.update({
         "plistBackupPath": str(plist_backup),
         "plistExisted": True,
+        "cronContractHashVersion": core.CRON_CONTRACT_HASH_VERSION,
+        "cronDefinitionsBefore": [core._job_definition(managed)],
+        "cronInventoryHashesBefore": item._inventory_hashes([managed]),
+        "cronUnknownHashesBefore": {},
         "cronTargetIdsBefore": ["managed"],
-        "managedCronIdsAfter": ["managed"],
+        "managedCronIdsAfter": [],
+        "cronStagingIntents": {},
+        "cronRestoreIntents": {},
+        "restoredCronIdsByDeclaration": {},
     })
     item.store.write(transaction)
     monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
@@ -3328,7 +4970,7 @@ def test_successful_integration_commits_after_activation_verification_and_reinst
         return real_write(payload)
 
     monkeypatch.setattr(item.store, "write", record_write)
-    monkeypatch.setattr(item, "begin", lambda: dict(base))
+    monkeypatch.setattr(item, "begin", lambda **_: dict(base))
     monkeypatch.setattr(item, "_preflight_cron_inventory", lambda: ([], []))
     monkeypatch.setattr(item, "_prepare_snapshot_root", lambda _transaction: create_snapshot_root(item))
 
@@ -3343,10 +4985,12 @@ def test_successful_integration_commits_after_activation_verification_and_reinst
     monkeypatch.setattr(item, "configure_openclaw", lambda _allowed, **_: events.append("configure"))
     monkeypatch.setattr(item, "install_launchd_plist", lambda _: events.append("plist"))
     monkeypatch.setattr(item, "activate_launchd", lambda: events.append("launchd"))
-    monkeypatch.setattr(item, "_apply_managed_spec", lambda spec: f"job:{spec.key}")
+    monkeypatch.setattr(item, "_apply_managed_spec", lambda spec, *_: f"job:{spec.key}")
     monkeypatch.setattr(item, "_verify_recurring_specs", lambda **_: events.append("disabled-verified"))
     monkeypatch.setattr(item, "disable_owned_gemini_jobs", lambda: [])
-    monkeypatch.setattr(item, "mark_ready_or_schedule_build", lambda: ("READY", None))
+    monkeypatch.setattr(item, "mark_ready_or_schedule_build", lambda *_: ("READY", None))
+    monkeypatch.setattr(item, "_verify_success_cron_inventory", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(item, "_verify_commit_cron_receipt", lambda *_: None)
     monkeypatch.setattr(item, "_sha256_config", lambda _: "0" * 64)
     monkeypatch.setattr(item.cli, "run", lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""))
     monkeypatch.setattr(item, "_enable_recurring_jobs", lambda _: events.append("recurring-enabled"))
@@ -3365,10 +5009,18 @@ def test_successful_integration_commits_after_activation_verification_and_reinst
 
     monkeypatch.setattr(item, "_verify_activation_pending", verify_pending)
     verify_calls: list[str] = []
-    monkeypatch.setattr(item, "verify", lambda: verify_calls.append("verify") or {"ok": True})
+
+    def verify_while_armed() -> dict[str, bool]:
+        if not verify_calls:
+            assert item.store.read()["activationFailSafeRequired"] is True
+        verify_calls.append("verify")
+        return {"ok": True}
+
+    monkeypatch.setattr(item, "verify", verify_while_armed)
 
     result = item._integrate_locked({"runtimePort": 18888})
     assert result["transaction"] == "committed"
+    assert item.store.read()["activationFailSafeRequired"] is False
     assert events.index("activation-verified") < events.index("write:committed")
     mutation_count = len(events)
 
@@ -3376,3 +5028,1397 @@ def test_successful_integration_commits_after_activation_verification_and_reinst
     assert again["transaction"] == "already_current"
     assert len(events) == mutation_count
     assert len(verify_calls) == 2
+
+
+def legacy_incremental_definition(
+    item: core.IntegrationManager, *, job_id: str = "legacy-incremental", enabled: bool = True,
+) -> dict[str, Any]:
+    job = job_for_spec(item._incremental_spec(), job_id=job_id, enabled=enabled)
+    job["description"] = None
+    job["payload"] = {
+        "kind": "command",
+        "argv": [str(item.paths.project_root / "scripts/knowledge_index_incremental.sh")],
+        "cwd": str(item.paths.project_root),
+        "timeoutSeconds": 7200,
+        "noOutputTimeoutSeconds": 900,
+        "outputMaxBytes": 65536,
+    }
+    job["delivery"] = {"mode": "none"}
+    job["failureAlert"] = None
+    return core._job_definition(job)
+
+
+class ReusedPreflightIdOnAddCli(StatefulCronCli):
+    def json(self, args: list[str], *, timeout: int = 120) -> Any:
+        result = super().json(args, timeout=timeout)
+        if args[:2] != ["cron", "add"]:
+            return result
+        created_id = str(result["id"])
+        staged = next(job for job in self.jobs if str(job["id"]) == created_id)
+        staged = json.loads(json.dumps(staged))
+        staged["id"] = "customer"
+        self.jobs = [
+            job for job in self.jobs if str(job["id"]) not in {created_id, "customer"}
+        ]
+        self.jobs.append(staged)
+        return {"id": "customer"}
+
+
+@pytest.mark.parametrize("role", ["managed", "initial"])
+def test_forged_add_id_never_becomes_rollback_deletion_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str,
+) -> None:
+    cli = ReusedPreflightIdOnAddCli()
+    item = manager(tmp_path / role, cli)
+    unknown = customer_job()
+    cli.jobs = [json.loads(json.dumps(unknown))]
+    write_rollback_transaction(
+        item, prior_definitions=[], unknown=unknown, target_ids=[], managed_after=[],
+    )
+    transaction = item.store.read()
+    if role == "initial":
+        script = item.paths.project_root / "scripts/knowledge_index_full.sh"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(0o700)
+        monkeypatch.setattr(
+            core.subprocess, "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(args, 1, "", ""),
+        )
+        invoke = lambda: item.mark_ready_or_schedule_build(transaction)
+    else:
+        invoke = lambda: item._apply_managed_spec(item._incremental_spec(), transaction)
+
+    with pytest.raises(RuntimeError, match="reuses a preflight job id"):
+        invoke()
+    assert item.store.read().get("managedCronIdsAfter") == []
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
+    with pytest.raises(RuntimeError, match="reuses a preflight job id"):
+        item._rollback_locked(require_exact_post_config=False)
+    assert any(job["id"] == "customer" for job in cli.jobs)
+    assert not any(call[:3] == ["cron", "rm", "customer"] for call in cli.calls)
+
+
+def test_forged_restore_add_id_is_rejected_before_checkpoint_or_edit(tmp_path: Path) -> None:
+    cli = ReusedPreflightIdOnAddCli()
+    item = manager(tmp_path, cli)
+    unknown = customer_job()
+    cli.jobs = [json.loads(json.dumps(unknown))]
+    transaction = write_staging_transaction(item, [unknown], set())
+    definition = core._job_definition(legacy_snapshot_job(item))
+
+    with pytest.raises(RuntimeError, match="reuses a preflight job id"):
+        item._restore_cron_definition(definition, transaction)
+
+    intent = item.store.read()["cronRestoreIntents"][core.LEGACY_SNAPSHOT_DECLARATION_KEY]
+    assert "jobId" not in intent
+    assert not any(call[:2] == ["cron", "edit"] for call in cli.calls)
+
+
+def test_cron_add_rejects_conflicting_outer_and_nested_ids() -> None:
+    with pytest.raises(RuntimeError, match="conflicting"):
+        core.IntegrationManager._job_id_from_add({
+            "id": "outer-job", "job": {"id": "nested-job"},
+        })
+
+
+def test_unsafe_inventory_id_fails_before_any_cron_mutation(tmp_path: Path) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    cli.jobs = [customer_job(job_id="--all")]
+
+    with pytest.raises(RuntimeError, match="invalid job id"):
+        item._preflight_cron_inventory()
+
+    assert cli.calls == [["cron", "list", "--all", "--json"]]
+
+
+@pytest.mark.parametrize("wrapper", ["incremental", "snapshot", "initial"])
+def test_shell_wrapped_unknown_owned_script_collision_fails_closed(
+    tmp_path: Path, wrapper: str,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path / wrapper, cli)
+    paths = {
+        "incremental": item.paths.project_root / "scripts/knowledge_index_incremental.sh",
+        "snapshot": item.paths.project_root / "scripts/run_verified_snapshot.py",
+        "initial": item.paths.project_root / "scripts/knowledge_index_full.sh",
+    }
+    collision = customer_job()
+    collision["payload"]["argv"] = ["sh", "-lc", f"exec '{paths[wrapper]}' --fixture"]
+    cli.jobs = [collision]
+
+    with pytest.raises(RuntimeError, match="Unknown cron job targets"):
+        item._preflight_cron_inventory()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("wakeMode", "next-heartbeat"),
+        ("displayName", "changed display"),
+        ("owner", {"agentId": "other"}),
+        ("trigger", {"script": "/usr/bin/true", "once": True}),
+    ],
+)
+def test_behavior_security_fields_are_hashed_and_rejected_for_managed_jobs(
+    tmp_path: Path, field: str, value: Any,
+) -> None:
+    baseline = customer_job()
+    changed = json.loads(json.dumps(baseline))
+    changed[field] = value
+    assert core._job_contract_hash(changed, include_id=True) != core._job_contract_hash(
+        baseline, include_id=True,
+    )
+
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    managed = job_for_spec(item._incremental_spec(), job_id="managed", enabled=True)
+    managed[field] = value
+    cli.jobs = [managed]
+    with pytest.raises(RuntimeError, match="safe upgrade allowlist"):
+        item._preflight_cron_inventory()
+    assert cli.calls == [["cron", "list", "--all", "--json"]]
+
+
+def test_restore_rejects_unrestorable_behavior_fields_before_cli_mutation(tmp_path: Path) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    definition = core._job_definition(legacy_snapshot_job(item))
+    definition["trigger"] = {"script": "/usr/bin/true"}
+    transaction = write_staging_transaction(item, [], set())
+
+    with pytest.raises(RuntimeError, match="behavior fields"):
+        item._restore_cron_definition(definition, transaction)
+
+    assert cli.calls == []
+
+
+@pytest.mark.parametrize("phase", ["committed", "failed"])
+def test_pre_intent_v3_rollback_uses_old_hash_then_preserves_full_unknown_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path / phase, cli)
+    prior = legacy_incremental_definition(item, job_id="prior-incremental", enabled=True)
+    for field in ("wakeMode", "displayName", "owner", "trigger"):
+        prior.pop(field, None)
+    unknown = customer_job()
+    unknown["owner"] = {"agentId": "customer-agent"}
+    unknown["wakeMode"] = "next-heartbeat"
+    current_incremental = job_for_spec(
+        item._incremental_spec(), job_id="new-incremental", enabled=True,
+    )
+    current_snapshot = job_for_spec(
+        item._snapshot_spec(), job_id="new-snapshot", enabled=True,
+    )
+    cli.jobs = [
+        json.loads(json.dumps(current_incremental)),
+        json.loads(json.dumps(current_snapshot)),
+        json.loads(json.dumps(unknown)),
+    ]
+    write_rollback_transaction(
+        item,
+        prior_definitions=[prior],
+        unknown=unknown,
+        target_ids=["prior-incremental"],
+        managed_after=["new-incremental", "new-snapshot"],
+    )
+    transaction = item.store.read()
+    transaction["phase"] = phase
+    transaction.pop("cronStagingIntents", None)
+    transaction.pop("cronRestoreIntents", None)
+    transaction.pop("restoredCronIdsByDeclaration", None)
+    transaction.pop("cronContractHashVersion", None)
+    transaction["cronInventoryHashesBefore"] = {
+        "prior-incremental": core._legacy_v3_job_contract_hash(prior, include_id=True),
+        "customer": core._legacy_v3_job_contract_hash(unknown, include_id=True),
+    }
+    transaction["cronUnknownHashesBefore"] = {
+        "customer": core._legacy_v3_job_contract_hash(unknown, include_id=True),
+    }
+    item.store.write(transaction)
+    unknown_full_hash = core._job_contract_hash(unknown, include_id=True)
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
+
+    result = item._rollback_locked(require_exact_post_config=False)
+
+    assert result["status"] == "ROLLED_BACK"
+    restored = next(job for job in cli.jobs if job["id"] != "customer")
+    assert restored["description"] is None and restored["enabled"] is True
+    assert core._job_contract_hash(unknown, include_id=True) == unknown_full_hash
+    assert core._job_contract_hash(
+        next(job for job in cli.jobs if job["id"] == "customer"), include_id=True,
+    ) == unknown_full_hash
+
+
+def test_pre_intent_v3_unattributed_add_window_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    prior = legacy_incremental_definition(item, job_id="prior-incremental")
+    for field in ("wakeMode", "displayName", "owner", "trigger"):
+        prior.pop(field, None)
+    unknown = customer_job()
+    orphan = job_for_spec(item._incremental_spec(), job_id="unattributed", enabled=False)
+    cli.jobs = [json.loads(json.dumps(orphan)), json.loads(json.dumps(unknown))]
+    write_rollback_transaction(
+        item,
+        prior_definitions=[prior],
+        unknown=unknown,
+        target_ids=["prior-incremental"],
+        managed_after=[],
+    )
+    transaction = item.store.read()
+    transaction.pop("cronStagingIntents", None)
+    transaction.pop("cronRestoreIntents", None)
+    transaction["cronInventoryHashesBefore"] = {
+        "prior-incremental": core._legacy_v3_job_contract_hash(prior, include_id=True),
+        "customer": core._legacy_v3_job_contract_hash(unknown, include_id=True),
+    }
+    transaction["cronUnknownHashesBefore"] = {
+        "customer": core._legacy_v3_job_contract_hash(unknown, include_id=True),
+    }
+    item.store.write(transaction)
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="unattributed managed cron"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    assert any(job["id"] == "unattributed" for job in cli.jobs)
+    assert not any(call[:2] == ["cron", "rm"] for call in cli.calls)
+
+
+def test_descriptionless_legacy_restore_stays_disabled_until_global_activation(
+    tmp_path: Path,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    definition = legacy_incremental_definition(item, enabled=True)
+    transaction = write_staging_transaction(item, [], set())
+
+    restored_id = item._restore_cron_definition(definition, transaction)
+
+    add = next(call for call in cli.calls if call[:2] == ["cron", "add"])
+    assert "--description" not in add
+    assert next(job for job in cli.jobs if job["id"] == restored_id)["enabled"] is False
+    item._activate_restored_cron_definitions(
+        prior_definitions=[definition], restored_ids=[restored_id], unknown_hashes_before={},
+    )
+    restored = next(job for job in cli.jobs if job["id"] == restored_id)
+    assert restored["enabled"] is True and restored["description"] is None
+
+
+def test_second_restore_failure_never_enables_first_restored_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailSecondAddCli(StatefulCronCli):
+        adds = 0
+
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            if args[:2] == ["cron", "add"]:
+                self.adds += 1
+                if self.adds == 2:
+                    raise RuntimeError("second restore failed")
+            return super().json(args, timeout=timeout)
+
+    cli = FailSecondAddCli()
+    item = manager(tmp_path, cli)
+    unknown = customer_job()
+    incremental = core._job_definition(
+        job_for_spec(item._incremental_spec(), job_id="old-incremental", enabled=True)
+    )
+    snapshot = core._job_definition(
+        job_for_spec(item._snapshot_spec(), job_id="old-snapshot", enabled=True)
+    )
+    cli.jobs = [json.loads(json.dumps(unknown))]
+    write_rollback_transaction(
+        item,
+        prior_definitions=[incremental, snapshot],
+        unknown=unknown,
+        target_ids=["old-incremental", "old-snapshot"],
+        managed_after=[],
+    )
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="second restore failed"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    restored = [job for job in cli.jobs if job["id"] != "customer"]
+    assert len(restored) == 1 and restored[0]["enabled"] is False
+    assert not any(call[:2] == ["cron", "edit"] and "--enable" in call for call in cli.calls)
+
+
+def test_global_restore_activation_failure_compensates_every_job_to_disabled(
+    tmp_path: Path,
+) -> None:
+    class FailSecondEnableCli(StatefulCronCli):
+        enables = 0
+
+        def run(self, args: list[str], *, timeout: int = 120, check: bool = True):
+            result = super().run(args, timeout=timeout, check=check)
+            if args[:2] == ["cron", "edit"] and "--enable" in args:
+                self.enables += 1
+                if self.enables == 2:
+                    raise RuntimeError("second enable failed")
+            return result
+
+    cli = FailSecondEnableCli()
+    item = manager(tmp_path, cli)
+    definitions = [
+        core._job_definition(
+            job_for_spec(item._incremental_spec(), job_id="old-incremental", enabled=True)
+        ),
+        core._job_definition(
+            job_for_spec(item._snapshot_spec(), job_id="old-snapshot", enabled=True)
+        ),
+    ]
+    transaction = write_staging_transaction(item, [], set())
+    restored_ids = [item._restore_cron_definition(definition, transaction)
+                    for definition in definitions]
+
+    with pytest.raises(RuntimeError, match="second enable failed"):
+        item._activate_restored_cron_definitions(
+            prior_definitions=definitions,
+            restored_ids=restored_ids,
+            unknown_hashes_before={},
+        )
+
+    assert all(job["enabled"] is False for job in cli.jobs)
+
+
+def commit_cron_receipt_fixture() -> dict[str, Any]:
+    unknown = {"unknown": "a" * 64}
+    gemini = {"gemini": "b" * 64}
+    return {
+        "cronContractHashVersion": core.CRON_CONTRACT_HASH_VERSION,
+        "managedCronIdsAfter": ["managed-one", "managed-two"],
+        "cronUnknownHashesBefore": dict(unknown),
+        "cronCommitUnknownHashes": dict(unknown),
+        "cronPreservedGeminiHashesAfterQuiesce": dict(gemini),
+        "cronCommitGeminiHashes": dict(gemini),
+        "cronCommitTopologyVerified": True,
+        "cronCommitInventoryHashes": {
+            "managed-one": "c" * 64,
+            "managed-two": "d" * 64,
+            **unknown,
+            **gemini,
+        },
+    }
+
+
+def test_commit_cron_receipt_rejects_nonhex_and_overlapping_authority() -> None:
+    valid = commit_cron_receipt_fixture()
+    assert core.IntegrationManager._validate_commit_cron_receipt_metadata(valid)
+
+    nonhex = json.loads(json.dumps(valid))
+    nonhex["cronCommitInventoryHashes"]["managed-one"] = "x" * 64
+    with pytest.raises(RuntimeError, match="malformed"):
+        core.IntegrationManager._validate_commit_cron_receipt_metadata(nonhex)
+
+    subset_mismatch = json.loads(json.dumps(valid))
+    subset_mismatch["cronCommitInventoryHashes"]["unknown"] = "e" * 64
+    with pytest.raises(RuntimeError, match="inconsistent"):
+        core.IntegrationManager._validate_commit_cron_receipt_metadata(subset_mismatch)
+
+    overlap = json.loads(json.dumps(valid))
+    overlap["cronUnknownHashesBefore"]["managed-one"] = "c" * 64
+    overlap["cronCommitUnknownHashes"]["managed-one"] = "c" * 64
+    with pytest.raises(RuntimeError, match="inconsistent"):
+        core.IntegrationManager._validate_commit_cron_receipt_metadata(overlap)
+
+
+def test_create_incremental_cron_compatibility_lookup_never_mutates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    item.store.write({
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "phase": "committed",
+        "cronId": "committed-incremental",
+    })
+    monkeypatch.setattr(item, "verify", lambda: {"ok": True})
+
+    assert item.create_incremental_cron() == "committed-incremental"
+    assert cli.calls == []
+
+    transaction = item.store.read()
+    transaction["phase"] = "failed"
+    item.store.write(transaction)
+    with pytest.raises(RuntimeError, match="transactional integration workflow"):
+        item.create_incremental_cron()
+    assert cli.calls == []
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "non-string-expr", "nonzero-stagger", "invalid-timezone", "webhook-delivery",
+        "main-session", "string-alert-after", "string-timeout", "future-top-level",
+        "env-secret",
+    ],
+)
+def test_malformed_gemini_contract_fails_before_transaction_or_cron_mutation(
+    tmp_path: Path, fault: str,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path / fault, cli)
+    job = gemini_job(item)
+    if fault == "non-string-expr":
+        job["schedule"]["expr"] = 123
+    elif fault == "nonzero-stagger":
+        job["schedule"]["staggerMs"] = 5000
+    elif fault == "invalid-timezone":
+        job["schedule"]["tz"] = " Invalid/Timezone "
+    elif fault == "webhook-delivery":
+        job["delivery"] = {"mode": "webhook", "to": "https://example.invalid"}
+    elif fault == "main-session":
+        job["sessionTarget"] = "main"
+    elif fault == "string-alert-after":
+        job["failureAlert"] = {
+            "after": "1", "cooldownMs": 3600000, "includeSkipped": False,
+            "channel": "discord", "to": "channel:1493072746702311474",
+        }
+    elif fault == "string-timeout":
+        job["payload"]["timeoutSeconds"] = "7200"
+    elif fault == "future-top-level":
+        job["futureBehavior"] = {"mode": "unreviewed"}
+    elif fault == "env-secret":
+        job["payload"]["env"] = {"FOO": "my-company-password"}
+    cli.jobs = [job]
+
+    with pytest.raises(RuntimeError, match="safe upgrade allowlist"):
+        item._integrate_locked({"runtimePort": 18888})
+
+    assert not item.store.manifest_path.exists()
+    assert cli.calls == [["cron", "list", "--all", "--json"]]
+
+
+def test_job_definition_normalizes_empty_env_and_no_delivery_semantics(tmp_path: Path) -> None:
+    item = manager(tmp_path)
+    job = gemini_job(item)
+    job["payload"]["env"] = {}
+    job["delivery"] = {"mode": "none", "channel": "last"}
+    job["deleteAfterRun"] = None
+
+    definition = core._job_definition(job)
+
+    assert "env" not in definition["payload"]
+    assert definition["delivery"] == {"mode": "none"}
+    assert definition["deleteAfterRun"] is False
+    without_explicit_false = json.loads(json.dumps(job))
+    without_explicit_false.pop("deleteAfterRun")
+    assert core._job_contract_hash(job) == core._job_contract_hash(without_explicit_false)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda job: job.update(name=" --unsafe"),
+        lambda job: job["payload"]["argv"].append("bad\x00value"),
+        lambda job: job["payload"].update(env={"SAFE": "bad\x00value"}),
+    ],
+)
+def test_job_definition_rejects_cli_ambiguous_or_nul_values(
+    tmp_path: Path, mutation: Any,
+) -> None:
+    item = manager(tmp_path)
+    job = gemini_job(item)
+    mutation(job)
+    with pytest.raises(RuntimeError):
+        core._job_definition(job)
+
+
+def test_future_top_level_field_is_hashed_for_unknown_and_rejected_for_owned(
+    tmp_path: Path,
+) -> None:
+    baseline = customer_job()
+    changed = json.loads(json.dumps(baseline))
+    changed["futureBehavior"] = {"mode": "new"}
+    assert core._job_contract_hash(changed, include_id=True) != core._job_contract_hash(
+        baseline, include_id=True,
+    )
+
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    managed = job_for_spec(item._incremental_spec(), job_id="managed", enabled=True)
+    managed["futureBehavior"] = {"mode": "new"}
+    cli.jobs = [managed]
+    with pytest.raises(RuntimeError, match="safe upgrade allowlist"):
+        item._preflight_cron_inventory()
+    assert not any(call[:2] in (["cron", "rm"], ["cron", "edit"])
+                   for call in cli.calls)
+
+
+def test_env_wrapped_owned_script_collision_fails_closed(tmp_path: Path) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    collision = customer_job()
+    collision["payload"]["argv"] = [
+        "/usr/bin/env",
+        str(item.paths.project_root / "scripts/knowledge_index_incremental.sh"),
+    ]
+    cli.jobs = [collision]
+
+    with pytest.raises(RuntimeError, match="Unknown cron job targets"):
+        item._preflight_cron_inventory()
+
+
+def _prepare_committed_verify_runtime(
+    item: core.IntegrationManager,
+    cli: StatefulCronCli,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    jobs = {
+        "incremental": job_for_spec(
+            item._incremental_spec(), job_id="committed-incremental", enabled=True,
+        ),
+        "snapshot": job_for_spec(
+            item._snapshot_spec(), job_id="committed-snapshot", enabled=True,
+        ),
+        "gemini": gemini_job(item, job_id="committed-gemini", enabled=False),
+        "unknown": customer_job(),
+    }
+    cli.jobs = json.loads(json.dumps(list(jobs.values())))
+    hashes = item._inventory_hashes(cli.jobs)
+    unknown = {"customer": hashes["customer"]}
+    gemini = {"committed-gemini": hashes["committed-gemini"]}
+    manifest = {
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "phase": "committed",
+        "ownership": item._ownership_payload(),
+        "indexState": "READY",
+        "cronId": "committed-incremental",
+        "snapshotCronId": "committed-snapshot",
+        "initialIndexJobId": None,
+        "managedCronIdsAfter": ["committed-incremental", "committed-snapshot"],
+        "cronContractHashVersion": core.CRON_CONTRACT_HASH_VERSION,
+        "cronUnknownHashesBefore": dict(unknown),
+        "cronCommitUnknownHashes": dict(unknown),
+        "cronPreservedGeminiHashesAfterQuiesce": dict(gemini),
+        "cronCommitGeminiHashes": dict(gemini),
+        "cronCommitTopologyVerified": True,
+        "cronCommitInventoryHashes": dict(hashes),
+    }
+    item.store.write(manifest)
+    monkeypatch.setattr(item, "_verify_local_source_map", lambda: None)
+    monkeypatch.setattr(item, "_verify_runtime_contract_files", lambda: None)
+    monkeypatch.setattr(item, "_verify_snapshot_wrapper_contract", lambda: None)
+    monkeypatch.setattr(item, "_verify_plugin_skill_gateway", lambda: (True, True, True))
+    monkeypatch.setattr(item, "_health_receipt_status", lambda: "ok")
+    return manifest, jobs
+
+
+@pytest.mark.parametrize("fault", ["removed", "reenabled", "schedule-drift"])
+def test_verify_binds_committed_gemini_ids_and_contracts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path / fault, cli)
+    _prepare_committed_verify_runtime(item, cli, monkeypatch)
+    if fault == "removed":
+        cli.jobs = [job for job in cli.jobs if job["id"] != "committed-gemini"]
+    else:
+        current = next(job for job in cli.jobs if job["id"] == "committed-gemini")
+        if fault == "reenabled":
+            current["enabled"] = True
+        else:
+            current["schedule"]["expr"] = "16 6 * * *"
+
+    with pytest.raises(RuntimeError, match="Gemini cron inventory receipt drifted"):
+        item.verify()
+
+
+def test_verify_allows_later_unrelated_unknown_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    _prepare_committed_verify_runtime(item, cli, monkeypatch)
+    next(job for job in cli.jobs if job["id"] == "customer")["description"] = (
+        "Customer changed this after the Qwen commit."
+    )
+
+    assert item.verify()["ok"] is True
+
+
+@pytest.mark.parametrize("fault", ["removed", "schedule-drift"])
+def test_integrate_never_rebaselines_committed_gemini_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path / fault, cli)
+    _prepare_committed_verify_runtime(item, cli, monkeypatch)
+    if fault == "removed":
+        cli.jobs = [job for job in cli.jobs if job["id"] != "committed-gemini"]
+    else:
+        next(job for job in cli.jobs if job["id"] == "committed-gemini")["schedule"][
+            "expr"
+        ] = "17 6 * * *"
+    monkeypatch.setattr(
+        item, "begin",
+        lambda **_: (_ for _ in ()).throw(AssertionError("drift must not be rebased")),
+    )
+
+    with pytest.raises(RuntimeError, match="Gemini cron inventory receipt drifted"):
+        item._integrate_locked({"runtimePort": 18888})
+    assert not any(call[:2] in (["cron", "rm"], ["cron", "edit"], ["cron", "add"])
+                   for call in cli.calls)
+
+
+def test_nonce_rollback_rejects_forged_target_receipt_without_any_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    unknown = customer_job()
+    victim = customer_job(job_id="victim")
+    victim["declarationKey"] = "victim-v1"
+    cli.jobs = [unknown, victim]
+    write_rollback_transaction(
+        item, prior_definitions=[], unknown=unknown,
+        target_ids=["victim"], managed_after=[],
+    )
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+
+    with pytest.raises(RuntimeError, match="receipt graph is inconsistent"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    assert {job["id"] for job in cli.jobs} == {"customer", "victim"}
+    assert not any(call[:2] == ["cron", "rm"] for call in cli.calls)
+
+
+def test_nonce_rollback_rejects_reused_original_id_without_any_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    unknown = customer_job()
+    original = core._job_definition(
+        job_for_spec(item._incremental_spec(), job_id="old-managed", enabled=True)
+    )
+    hostile = customer_job(job_id="old-managed")
+    hostile["declarationKey"] = "hostile-replacement-v1"
+    cli.jobs = [unknown, hostile]
+    write_rollback_transaction(
+        item, prior_definitions=[original], unknown=unknown,
+        target_ids=["old-managed"], managed_after=[],
+    )
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+
+    with pytest.raises(RuntimeError, match="identity was reused or drifted"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    assert next(job for job in cli.jobs if job["id"] == "old-managed") == hostile
+    assert not any(call[:2] == ["cron", "rm"] for call in cli.calls)
+
+
+def test_nonce_rollback_rejects_reused_checkpointed_id_without_any_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    unknown = customer_job()
+    write_rollback_transaction(
+        item, prior_definitions=[], unknown=unknown, target_ids=[], managed_after=[],
+    )
+    transaction = item.store.read()
+    item._ensure_cron_intent(
+        transaction,
+        bucket_name="cronStagingIntents",
+        declaration_key=core.CRON_DECLARATION_KEY,
+        canonical_description=core.INCREMENTAL_CRON_DESCRIPTION,
+        role="managed",
+        expected_factory=lambda description: item._managed_pre_alert_definition(
+            item._incremental_spec(), description,
+        ),
+    )
+    item._checkpoint_cron_intent_job_id(
+        transaction,
+        bucket_name="cronStagingIntents",
+        declaration_key=core.CRON_DECLARATION_KEY,
+        job_id="staged-id",
+        created=True,
+    )
+    hostile = customer_job(job_id="staged-id")
+    hostile["declarationKey"] = "hostile-staged-replacement-v1"
+    cli.jobs = [unknown, hostile]
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+
+    with pytest.raises(RuntimeError, match="checkpointed cron identity was reused or drifted"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    assert next(job for job in cli.jobs if job["id"] == "staged-id") == hostile
+    assert not any(call[:2] == ["cron", "rm"] for call in cli.calls)
+
+
+def test_integrate_rechecks_committed_gemini_after_late_verify_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DriftOnSecondInventoryCli(StatefulCronCli):
+        inventory_reads = 0
+
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            if args[:4] == ["cron", "list", "--all", "--json"]:
+                self.inventory_reads += 1
+                if self.inventory_reads == 2:
+                    gemini = next(
+                        job for job in self.jobs
+                        if job["id"] == "committed-gemini"
+                    )
+                    gemini["schedule"]["expr"] = "18 6 * * *"
+            return super().json(args, timeout=timeout)
+
+    cli = DriftOnSecondInventoryCli()
+    item = manager(tmp_path, cli)
+    _prepare_committed_verify_runtime(item, cli, monkeypatch)
+    monkeypatch.setattr(
+        item,
+        "_verify_runtime_contract_files",
+        lambda: (_ for _ in ()).throw(RuntimeError("late runtime verify fault")),
+    )
+    monkeypatch.setattr(
+        item,
+        "begin",
+        lambda **_: (_ for _ in ()).throw(
+            AssertionError("Gemini drift must fail before begin")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Gemini cron inventory receipt drifted"):
+        item._integrate_locked({"runtimePort": 18888})
+
+    assert cli.inventory_reads == 2
+    assert not any(
+        call[:2] in (["cron", "add"], ["cron", "edit"], ["cron", "rm"])
+        for call in cli.calls
+    )
+
+
+def test_recurring_activation_snapshot_guard_rejects_same_id_drift_before_enable(
+    tmp_path: Path,
+) -> None:
+    class DriftBeforeEditCli(StatefulCronCli):
+        inventory_reads = 0
+
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            if args[:4] == ["cron", "list", "--all", "--json"]:
+                self.inventory_reads += 1
+                if self.inventory_reads == 2:
+                    target = next(job for job in self.jobs if job["id"] == "incremental")
+                    target["description"] = "Concurrent same-ID drift."
+            return super().json(args, timeout=timeout)
+
+    cli = DriftBeforeEditCli()
+    item = manager(tmp_path, cli)
+    cli.jobs = [
+        job_for_spec(item._incremental_spec(), job_id="incremental", enabled=False),
+        job_for_spec(item._snapshot_spec(), job_id="snapshot", enabled=False),
+    ]
+
+    with pytest.raises(RuntimeError, match="inventory changed before edit"):
+        item._enable_recurring_jobs(["incremental", "snapshot"])
+
+    assert cli.inventory_reads == 2
+    assert not any(
+        call[:2] == ["cron", "edit"] and "--enable" in call
+        for call in cli.calls
+    )
+    assert all(job["enabled"] is False for job in cli.jobs)
+
+
+def legacy_committed_v3_gemini_fixture(
+    item: core.IntegrationManager,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    prior_gemini = gemini_job(item, job_id="legacy-gemini", enabled=True)
+    current_gemini = json.loads(json.dumps(prior_gemini))
+    current_gemini["enabled"] = False
+    incremental = job_for_spec(
+        item._incremental_spec(), job_id="current-incremental", enabled=True,
+    )
+    snapshot = job_for_spec(
+        item._snapshot_spec(), job_id="current-snapshot", enabled=True,
+    )
+    prior_gemini_hash = core._legacy_v3_job_contract_hash(
+        prior_gemini, include_id=True,
+    )
+    transaction = {
+        "schemaVersion": 1,
+        "contractVersion": core.INTEGRATION_CONTRACT_VERSION,
+        "phase": "committed",
+        "ownership": item._ownership_payload(),
+        "indexState": "READY",
+        "cronId": "current-incremental",
+        "snapshotCronId": "current-snapshot",
+        "initialIndexJobId": None,
+        "cronDefinitionsBefore": [prior_gemini],
+        "cronTargetIdsBefore": ["legacy-gemini"],
+        "cronInventoryHashesBefore": {"legacy-gemini": prior_gemini_hash},
+        "cronUnknownHashesBefore": {},
+        "disabledGeminiJobs": [{"id": "legacy-gemini", "wasEnabled": True}],
+    }
+    return transaction, [incremental, snapshot, current_gemini]
+
+
+def test_legacy_committed_v3_repair_authority_accepts_exact_gemini_receipt(
+    tmp_path: Path,
+) -> None:
+    item = manager(tmp_path)
+    transaction, jobs = legacy_committed_v3_gemini_fixture(item)
+
+    item._verify_legacy_committed_v3_repair_authority(transaction, jobs)
+
+
+@pytest.mark.parametrize("fault", ["missing", "schedule-drift"])
+def test_legacy_committed_v3_repair_authority_rejects_gemini_drift(
+    tmp_path: Path, fault: str,
+) -> None:
+    item = manager(tmp_path / fault)
+    transaction, jobs = legacy_committed_v3_gemini_fixture(item)
+    if fault == "missing":
+        jobs = [job for job in jobs if job["id"] != "legacy-gemini"]
+    else:
+        next(job for job in jobs if job["id"] == "legacy-gemini")["schedule"][
+            "expr"
+        ] = "19 6 * * *"
+
+    with pytest.raises(RuntimeError, match="Legacy committed v3 Gemini contract drifted"):
+        item._verify_legacy_committed_v3_repair_authority(transaction, jobs)
+
+
+def _valid_announce_alert(item: core.IntegrationManager) -> dict[str, Any]:
+    return {
+        "after": 1,
+        "cooldownMs": 3600000,
+        "includeSkipped": False,
+        "mode": "announce",
+        "channel": item.report_channel,
+        "to": item.report_to,
+        "accountId": item.report_account_id,
+    }
+
+
+@pytest.mark.parametrize(
+    ("case", "mutation"),
+    [
+        ("name", lambda job, item: job.update(name="-unsafe-name")),
+        ("description", lambda job, item: job.update(description="-unsafe-description")),
+        ("cron-option", lambda job, item: job["schedule"].update(expr="--help")),
+        (
+            "cron-invalid",
+            lambda job, item: job["schedule"].update(expr="not a cron expression"),
+        ),
+        ("timezone", lambda job, item: job["schedule"].update(tz="--help")),
+        (
+            "delivery-channel",
+            lambda job, item: job.update(delivery={
+                "mode": "announce", "channel": "--help", "to": item.report_to,
+            }),
+        ),
+        (
+            "delivery-to",
+            lambda job, item: job.update(delivery={
+                "mode": "announce", "channel": item.report_channel, "to": "--help",
+            }),
+        ),
+        (
+            "alert-channel",
+            lambda job, item: job.update(failureAlert={
+                **_valid_announce_alert(item), "channel": "--help",
+            }),
+        ),
+        (
+            "alert-to",
+            lambda job, item: job.update(failureAlert={
+                **_valid_announce_alert(item), "to": "--help",
+            }),
+        ),
+        (
+            "env-value",
+            lambda job, item: job["payload"].update(env={"SAFE_VALUE": "--help"}),
+        ),
+    ],
+)
+def test_cli_option_like_or_invalid_contract_fails_before_begin(
+    tmp_path: Path, case: str, mutation: Any,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path / case, cli)
+    unsafe = gemini_job(item)
+    mutation(unsafe, item)
+    cli.jobs = [unsafe]
+
+    with pytest.raises(RuntimeError, match="safe upgrade allowlist"):
+        item._integrate_locked({"runtimePort": 18888})
+
+    assert not item.store.manifest_path.exists()
+    assert cli.calls == [["cron", "list", "--all", "--json"]]
+
+
+def test_valid_cli_option_values_restore_to_exact_disabled_contract(
+    tmp_path: Path,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    original = job_for_spec(
+        item._incremental_spec(), job_id="prior-incremental", enabled=True,
+    )
+    original["delivery"] = {
+        "mode": "announce",
+        "channel": item.report_channel,
+        "to": item.report_to,
+        "accountId": item.report_account_id,
+    }
+    definition = core._job_definition(original)
+    transaction = write_staging_transaction(item, [], set())
+
+    restored_id = item._restore_cron_definition(definition, transaction)
+
+    restored = next(job for job in cli.jobs if job["id"] == restored_id)
+    expected = json.loads(json.dumps(definition))
+    expected["id"] = restored_id
+    expected["enabled"] = False
+    assert core._job_definition(restored) == expected
+    assert any(
+        call[:2] == ["cron", "add"]
+        and call[call.index("--cron") + 1] == original["schedule"]["expr"]
+        and call[call.index("--tz") + 1] == original["schedule"]["tz"]
+        and call[call.index("--channel") + 1] == item.report_channel
+        and call[call.index("--to") + 1] == item.report_to
+        for call in cli.calls
+    )
+
+
+def test_quiescence_waits_until_live_running_at_ms_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RunningAtMsCli(StatefulCronCli):
+        inventory_reads = 0
+
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            if args[:4] == ["cron", "list", "--all", "--json"]:
+                self.inventory_reads += 1
+                if self.inventory_reads == 3:
+                    self.jobs[0]["state"].pop("runningAtMs")
+            return super().json(args, timeout=timeout)
+
+    cli = RunningAtMsCli()
+    item = manager(tmp_path, cli)
+    active = job_for_spec(
+        item._incremental_spec(), job_id="incremental", enabled=False,
+    )
+    active["state"] = {"runningAtMs": 1788746400000}
+    cli.jobs = [active]
+    monkeypatch.setattr(core.time, "sleep", lambda _: None)
+
+    item._wait_for_quiesced_jobs(
+        {"incremental"}, timeout_seconds=1, poll_seconds=0.01,
+    )
+
+    assert cli.inventory_reads == 3
+    assert "runningAtMs" not in cli.jobs[0]["state"]
+
+
+def test_quiescence_times_out_while_live_running_at_ms_remains(tmp_path: Path) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    active = job_for_spec(
+        item._incremental_spec(), job_id="incremental", enabled=False,
+    )
+    active["state"] = {"runningAtMs": 1788746400000}
+    cli.jobs = [active]
+
+    with pytest.raises(RuntimeError, match="did not quiesce"):
+        item._wait_for_quiesced_jobs({"incremental"}, timeout_seconds=0)
+
+    assert not any(call[:2] == ["cron", "edit"] for call in cli.calls)
+
+
+@pytest.mark.parametrize("running_at_ms", [True, 0, "1788746400000"])
+def test_quiescence_rejects_malformed_live_running_at_ms(
+    tmp_path: Path, running_at_ms: Any,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    malformed = job_for_spec(
+        item._incremental_spec(), job_id="incremental", enabled=False,
+    )
+    malformed["state"] = {"runningAtMs": running_at_ms}
+    cli.jobs = [malformed]
+
+    with pytest.raises(RuntimeError, match="running timestamp"):
+        item._wait_for_quiesced_jobs({"incremental"}, timeout_seconds=0)
+
+    assert cli.calls == [["cron", "list", "--all", "--json"]]
+
+
+@pytest.mark.parametrize("fault", ["mutated-unknown", "extra-job"])
+def test_managed_add_inventory_guard_stops_before_checkpoint_or_edit(
+    tmp_path: Path, fault: str,
+) -> None:
+    class HostileAddCli(StatefulCronCli):
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            result = super().json(args, timeout=timeout)
+            if args[:2] == ["cron", "add"]:
+                if fault == "mutated-unknown":
+                    unknown = next(job for job in self.jobs if job["id"] == "customer")
+                    unknown["description"] = "Concurrent unknown mutation."
+                else:
+                    injected = customer_job(job_id="concurrent-extra")
+                    injected["declarationKey"] = "concurrent-extra-v1"
+                    self.jobs.append(injected)
+            return result
+
+    cli = HostileAddCli()
+    item = manager(tmp_path / fault, cli)
+    unknown = customer_job()
+    cli.jobs = [json.loads(json.dumps(unknown))]
+    transaction = write_staging_transaction(item, [unknown], set())
+    spec = item._incremental_spec()
+
+    with pytest.raises(RuntimeError, match="changed more than its exact staged candidate"):
+        item._apply_managed_spec(spec, transaction)
+
+    persisted = item.store.read()
+    intent = persisted["cronStagingIntents"][spec.key]
+    assert "jobId" not in intent
+    assert persisted["managedCronIdsAfter"] == []
+    assert not any(call[:2] == ["cron", "edit"] for call in cli.calls)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("enabled-missing", None),
+        ("enabled-none", None),
+        ("enabled-string", "false"),
+        ("delete-after-run-int", 0),
+    ],
+)
+def test_managed_contract_rejects_non_boolean_state_fields(
+    tmp_path: Path, field: str, value: Any,
+) -> None:
+    item = manager(tmp_path / field)
+    job = job_for_spec(item._incremental_spec(), job_id="managed", enabled=False)
+    if field == "enabled-missing":
+        job.pop("enabled")
+    elif field.startswith("enabled-"):
+        job["enabled"] = value
+    else:
+        job["deleteAfterRun"] = value
+
+    assert not core._job_matches_spec(
+        job, item._incremental_spec(), require_enabled=False,
+    )
+    assert not core._job_matches_spec(
+        job, item._incremental_spec(), require_enabled=True,
+    )
+    with pytest.raises(RuntimeError):
+        core._job_definition(job)
+
+
+@pytest.mark.parametrize("enabled", [0, 1])
+def test_legacy_snapshot_rejects_integer_enabled_state(
+    tmp_path: Path, enabled: int,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path / str(enabled), cli)
+    legacy = legacy_snapshot_job(item)
+    legacy["enabled"] = enabled
+    cli.jobs = [legacy]
+
+    assert not item._legacy_snapshot_job_matches(legacy, require_known_key=True)
+    with pytest.raises(RuntimeError):
+        core._job_definition(legacy)
+    with pytest.raises(RuntimeError, match="exact migration allowlist"):
+        item._preflight_cron_inventory()
+
+
+def test_rollback_waits_for_running_disabled_removal_target_before_rm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    original = job_for_spec(
+        item._incremental_spec(), job_id="prior-incremental", enabled=True,
+    )
+    disabled_running = json.loads(json.dumps(original))
+    disabled_running["enabled"] = False
+    disabled_running["state"] = {"runningAtMs": 1788746400000}
+    unknown = customer_job()
+    cli.jobs = [disabled_running, unknown]
+    write_rollback_transaction(
+        item,
+        prior_definitions=[core._job_definition(original)],
+        unknown=unknown,
+        target_ids=["prior-incremental"],
+        managed_after=[],
+    )
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monotonic_calls = 0
+
+    def expired_monotonic() -> float:
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        return 0.0 if monotonic_calls == 1 else 2000.0
+
+    monkeypatch.setattr(core.time, "monotonic", expired_monotonic)
+
+    with pytest.raises(RuntimeError, match="did not quiesce"):
+        item._rollback_locked(require_exact_post_config=False)
+
+    assert monotonic_calls == 2
+    assert not any(call[:2] == ["cron", "rm"] for call in cli.calls)
+    assert any(job["id"] == "prior-incremental" for job in cli.jobs)
+
+
+@pytest.mark.parametrize(
+    ("late_state", "message"),
+    [
+        ({"runningAtMs": 1788746400000}, "became active"),
+        ("malformed-runtime-state", "runtime state is malformed"),
+    ],
+)
+def test_exact_cron_removal_rechecks_late_runtime_state_before_every_rm(
+    tmp_path: Path, late_state: Any, message: str,
+) -> None:
+    class LateRuntimeStateCli(StatefulCronCli):
+        inventory_reads = 0
+
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            if args[:4] == ["cron", "list", "--all", "--json"]:
+                self.inventory_reads += 1
+                if self.inventory_reads == 2:
+                    target = next(job for job in self.jobs if job["id"] == "managed")
+                    target["state"] = late_state
+            return super().json(args, timeout=timeout)
+
+    cli = LateRuntimeStateCli()
+    item = manager(tmp_path, cli)
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="managed", enabled=False,
+    )
+    cli.jobs = [json.loads(json.dumps(managed))]
+
+    with pytest.raises(RuntimeError, match=message):
+        item._remove_cron_ids_with_snapshot_guard(
+            [json.loads(json.dumps(managed))], {"managed"},
+        )
+
+    assert cli.inventory_reads == 2
+    assert not any(call[:2] == ["cron", "rm"] for call in cli.calls)
+    assert any(job["id"] == "managed" for job in cli.jobs)
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("null-state", "runtime state is malformed"),
+        ("null-running-at", "running timestamp is malformed"),
+        ("null-state-status", "runtime status is malformed"),
+        ("null-top-status", "runtime status is malformed"),
+    ],
+)
+def test_exact_cron_removal_rejects_explicit_null_runtime_markers(
+    tmp_path: Path, fault: str, message: str,
+) -> None:
+    class NullRuntimeMarkerCli(StatefulCronCli):
+        inventory_reads = 0
+
+        def json(self, args: list[str], *, timeout: int = 120) -> Any:
+            if args[:4] == ["cron", "list", "--all", "--json"]:
+                self.inventory_reads += 1
+                if self.inventory_reads == 2:
+                    target = next(job for job in self.jobs if job["id"] == "managed")
+                    if fault == "null-state":
+                        target["state"] = None
+                    elif fault == "null-running-at":
+                        target["state"] = {"runningAtMs": None}
+                    elif fault == "null-state-status":
+                        target["state"] = {"status": None}
+                    else:
+                        target["status"] = None
+            return super().json(args, timeout=timeout)
+
+    cli = NullRuntimeMarkerCli()
+    item = manager(tmp_path / fault, cli)
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="managed", enabled=False,
+    )
+    cli.jobs = [json.loads(json.dumps(managed))]
+
+    with pytest.raises(RuntimeError, match=message):
+        item._remove_cron_ids_with_snapshot_guard(
+            [json.loads(json.dumps(managed))], {"managed"},
+        )
+
+    assert cli.inventory_reads == 2
+    assert not any(call[:2] == ["cron", "rm"] for call in cli.calls)
+    assert any(job["id"] == "managed" for job in cli.jobs)
+
+
+def test_exact_cron_removal_rejects_enabled_target_before_rm(tmp_path: Path) -> None:
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    managed = job_for_spec(
+        item._incremental_spec(), job_id="managed", enabled=True,
+    )
+    cli.jobs = [json.loads(json.dumps(managed))]
+
+    with pytest.raises(RuntimeError, match="not disabled"):
+        item._remove_cron_ids_with_snapshot_guard(
+            [json.loads(json.dumps(managed))], {"managed"},
+        )
+
+    assert not any(call[:2] == ["cron", "rm"] for call in cli.calls)
+    assert any(job["id"] == "managed" for job in cli.jobs)
+
+
+def test_integrate_rollback_failure_preserves_checkpointed_restore_receipt_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailOnceAfterRestoreCheckpointCli(StatefulCronCli):
+        item: core.IntegrationManager | None = None
+        failed = False
+
+        def run(self, args: list[str], *, timeout: int = 120, check: bool = True):
+            if args[:2] == ["cron", "edit"] and not self.failed:
+                job = next(entry for entry in self.jobs if entry["id"] == args[2])
+                if str(job.get("name", "")).startswith("qwen-restore-stage-"):
+                    assert self.item is not None
+                    receipt = self.item.store.read()
+                    intent = receipt["cronRestoreIntents"][job["declarationKey"]]
+                    assert intent["jobId"] == args[2]
+                    assert receipt["restoredCronIdsByDeclaration"][
+                        job["declarationKey"]
+                    ] == args[2]
+                    self.failed = True
+                    raise RuntimeError("rollback failed after durable restore checkpoint")
+            return super().run(args, timeout=timeout, check=check)
+
+    cli = FailOnceAfterRestoreCheckpointCli()
+    item = manager(tmp_path, cli)
+    cli.item = item
+    prior_incremental = job_for_spec(
+        item._incremental_spec(), job_id="prior-incremental", enabled=True,
+    )
+    prior_snapshot = job_for_spec(
+        item._snapshot_spec(), job_id="prior-snapshot", enabled=True,
+    )
+    unknown = customer_job()
+    prior_definitions = [
+        core._job_definition(prior_incremental),
+        core._job_definition(prior_snapshot),
+    ]
+    cli.jobs = json.loads(json.dumps([prior_incremental, prior_snapshot, unknown]))
+    write_rollback_transaction(
+        item,
+        prior_definitions=prior_definitions,
+        unknown=unknown,
+        target_ids=["prior-incremental", "prior-snapshot"],
+        managed_after=[],
+    )
+    begin_receipt = item.store.read()
+    begin_receipt["phase"] = "prepared"
+    begin_receipt["cronMutationStarted"] = False
+    begin_receipt["projectExisted"] = True
+    item.store.write({
+        "schemaVersion": 1,
+        "contractVersion": 1,
+        "runId": "prior-install",
+        "phase": "committed",
+        "ownership": {"schema": "qwen-local-openclaw.v1"},
+    })
+    prepare_collision_integration_runtime(item, monkeypatch, run_id="rollback-retry")
+    monkeypatch.setattr(
+        item, "begin", lambda **_: json.loads(json.dumps(begin_receipt)),
+    )
+    monkeypatch.setattr(item, "_verify_config_snapshot", lambda *_, **__: None)
+    monkeypatch.setattr(item, "_remove_created_snapshot_artifacts", lambda _: None)
+    monkeypatch.setattr(item, "_checkpoint_mutation", lambda *_: None)
+    monkeypatch.setattr(
+        item,
+        "_verify_recurring_specs",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("primary integration fault")),
+    )
+
+    with pytest.raises(core.IntegrationRollbackIncomplete) as caught:
+        item._integrate_locked({"runtimePort": 18888})
+
+    assert "primary integration fault" in str(caught.value.original_error)
+    assert "durable restore checkpoint" in str(caught.value.rollback_error)
+    failed_receipt = item.store.read()
+    assert failed_receipt["phase"] == "rollback_failed"
+    checkpointed = next(
+        intent for intent in failed_receipt["cronRestoreIntents"].values()
+        if "jobId" in intent
+    )
+    checkpointed_id = checkpointed["jobId"]
+    assert checkpointed_id in failed_receipt["restoredCronIdsByDeclaration"].values()
+
+    result = item._rollback_locked(require_exact_post_config=False)
+
+    assert result["status"] == "ROLLED_BACK"
+    assert item.store.read()["phase"] == "rolled_back"
+    assert sum(call[:2] == ["cron", "add"] for call in cli.calls) == 4
+    restored = [job for job in cli.jobs if job["id"] != "customer"]
+    assert sorted(core._job_contract_hash(job) for job in restored) == sorted(
+        core._job_contract_hash(definition) for definition in prior_definitions
+    )
+
+
+def test_first_prepared_receipt_survives_write_crash_and_can_restart_begin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SimulatedCrash(BaseException):
+        pass
+
+    cli = StatefulCronCli()
+    item = manager(tmp_path, cli)
+    config = item.paths.home / ".openclaw/openclaw.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("{}", encoding="utf-8")
+    config.chmod(0o600)
+    unknown = customer_job()
+    cli.jobs = [unknown]
+    inventory_hashes = item._inventory_hashes(cli.jobs)
+    monkeypatch.setattr(item, "preflight", lambda: {})
+    monkeypatch.setattr(item, "_config_file", lambda: config)
+    real_write = item.store.write
+    write_calls = 0
+
+    def crash_after_first_durable_write(payload: dict[str, Any]) -> Path:
+        nonlocal write_calls
+        write_calls += 1
+        path = real_write(payload)
+        if write_calls == 1:
+            raise SimulatedCrash("process stopped after first durable receipt")
+        return path
+
+    monkeypatch.setattr(item.store, "write", crash_after_first_durable_write)
+
+    with pytest.raises(SimulatedCrash):
+        item.begin(cron_inventory_hashes=inventory_hashes)
+
+    monkeypatch.setattr(item.store, "write", real_write)
+    prepared = item.store.read()
+    assert prepared["phase"] == "prepared"
+    assert prepared["ownership"] == item._ownership_payload()
+    assert prepared["cronMutationStarted"] is False
+    assert prepared["runtimeMutationStarted"] is False
+    assert prepared["cronInventoryHashesBefore"] == inventory_hashes
+    assert prepared["cronUnknownHashesBefore"] == inventory_hashes
+
+    rolled_back = item._rollback_locked(require_exact_post_config=False)
+    restarted = item.begin(cron_inventory_hashes=inventory_hashes)
+
+    assert rolled_back["status"] == "ROLLED_BACK"
+    assert restarted["phase"] == "prepared"
+    assert restarted["runId"] != prepared["runId"]
+    assert restarted["cronInventoryHashesBefore"] == inventory_hashes

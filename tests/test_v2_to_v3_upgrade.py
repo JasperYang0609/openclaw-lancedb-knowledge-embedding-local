@@ -94,7 +94,7 @@ def _prepare_upgrade_runtime(
     monkeypatch.setattr(item, "install_launchd_plist", lambda _: None)
     monkeypatch.setattr(item, "activate_launchd", lambda: None)
     monkeypatch.setattr(item, "deactivate_launchd", lambda: None)
-    monkeypatch.setattr(item, "mark_ready_or_schedule_build", lambda: ("READY", None))
+    monkeypatch.setattr(item, "mark_ready_or_schedule_build", lambda *_: ("READY", None))
 
     def write_health(**_: Any) -> None:
         item.health_receipt_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

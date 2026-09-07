@@ -7,6 +7,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -14,7 +15,7 @@ import sys
 import time
 import uuid
 import fcntl
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,7 @@ GEMINI_DECLARATION_KEY = "openclaw-lancedb-knowledge-gemini-incremental-v1"
 SCHEMA_VERSION = 1
 INTEGRATION_CONTRACT_VERSION = 3
 OWNERSHIP_SCHEMA = "qwen-local-openclaw.v3"
+CRON_CONTRACT_HASH_VERSION = 2
 ASSET_ROLLBACK_RECEIPT_SCHEMA = "qwen-local.rollback-assets.v1"
 SNAPSHOT_CONTRACT = "qwen-local-verified-snapshot.v1"
 HEALTH_RECEIPT_SCHEMA = "backup-health-component.v1"
@@ -68,7 +70,14 @@ MANAGED_CRON_KEYS = {
 CRON_DEFINITION_FIELDS = (
     "id", "name", "description", "enabled", "declarationKey", "schedule", "payload",
     "delivery", "failureAlert", "sessionTarget", "sessionKey", "agentId", "deleteAfterRun",
+    "wakeMode", "displayName", "owner", "trigger",
 )
+LEGACY_V3_CRON_DEFINITION_FIELDS = CRON_DEFINITION_FIELDS[:-4]
+CRON_VOLATILE_FIELDS = {
+    "createdAtMs", "updatedAtMs", "state", "status", "lastDelivered",
+    "lastDeliveryError", "lastDeliveryStatus", "lastFailureNotificationDeliveryStatus",
+    "lastRunAtMs", "lastRunError", "lastRunStatus", "nextRunAtMs",
+}
 DISCORD_CHANNEL_TARGET_RE = re.compile(r"^channel:[1-9][0-9]{16,21}$")
 SAFE_ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SAFE_CRON_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -102,6 +111,49 @@ ROLLBACK_ASSET_IDS = (
     "project.package_json",
     "project.package_lock",
 )
+
+
+def _valid_numeric_cron_expression(expression: str) -> bool:
+    """Accept the bounded five-field numeric cron subset used by managed jobs."""
+    if not expression or expression != expression.strip() \
+            or expression.startswith("-") or "\x00" in expression \
+            or len(expression) > 512:
+        return False
+    fields = expression.split(" ")
+    if len(fields) != 5 or any(not field for field in fields):
+        return False
+    bounds = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 7))
+
+    def valid_atom(atom: str, minimum: int, maximum: int) -> bool:
+        base, separator, step_text = atom.partition("/")
+        if separator:
+            if "/" in step_text or not step_text.isascii() or not step_text.isdigit():
+                return False
+            step = int(step_text)
+            if not 1 <= step <= maximum - minimum + 1:
+                return False
+        if base == "*":
+            return True
+        if "-" in base:
+            start_text, dash, end_text = base.partition("-")
+            if not dash or "-" in end_text:
+                return False
+            if not start_text.isascii() or not start_text.isdigit() \
+                    or not end_text.isascii() or not end_text.isdigit():
+                return False
+            start = int(start_text)
+            end = int(end_text)
+            return minimum <= start <= end <= maximum
+        if separator:
+            return False
+        if not base.isascii() or not base.isdigit():
+            return False
+        return minimum <= int(base) <= maximum
+
+    return all(
+        all(valid_atom(atom, minimum, maximum) for atom in field.split(","))
+        for field, (minimum, maximum) in zip(fields, bounds)
+    )
 
 
 def _rename_noreplace_at(source_fd: int, source: str, target_fd: int, target: str) -> None:
@@ -145,6 +197,17 @@ class IntegrationRollbackIncomplete(RuntimeError):
         self.original_error = original_error
         self.rollback_error = rollback_error
         self.recovery_state = "automatic_rollback_incomplete"
+
+
+class ActivationFailSafeIncomplete(RuntimeError):
+    """An armed transaction could not disable every exact managed cron target."""
+
+    def __init__(self, compensation_error: Exception) -> None:
+        super().__init__(
+            "Activation fail-safe compensation did not complete; explicit recovery is required"
+        )
+        self.compensation_error = compensation_error
+        self.recovery_state = "activation_fail_safe_incomplete"
 
 
 def sha256_file(path: Path) -> str:
@@ -320,7 +383,8 @@ def build_cron_add_args(*, project_root: Path, incremental_script: Path,
         "--tz", timezone, "--exact", "--command-argv", json.dumps(argv, separators=(",", ":")),
         "--command-cwd", str(project), "--timeout-seconds", "7200",
         "--no-output-timeout-seconds", "900", "--output-max-bytes", "65536",
-        *extra, "--declaration-key", CRON_DECLARATION_KEY, "--no-deliver", "--json",
+        *extra, "--declaration-key", CRON_DECLARATION_KEY, "--wake", "now",
+        "--no-deliver", "--json",
     ]
     if disabled:
         args.insert(-1, "--disabled")
@@ -346,7 +410,8 @@ def build_snapshot_cron_add_args(*, project_root: Path, snapshot_wrapper: Path,
         json.dumps([str(python), str(wrapper), "--ownership-manifest", str(manifest)], separators=(",", ":")),
         "--command-cwd", str(project), "--timeout-seconds", "7200",
         "--no-output-timeout-seconds", "3600", "--output-max-bytes", "16384",
-        "--declaration-key", SNAPSHOT_CRON_DECLARATION_KEY, "--no-deliver", "--json",
+        "--declaration-key", SNAPSHOT_CRON_DECLARATION_KEY, "--wake", "now",
+        "--no-deliver", "--json",
     ]
     if disabled:
         args.insert(-1, "--disabled")
@@ -371,9 +436,12 @@ class ManagedCronSpec:
     session_target: str = "isolated"
     command_env: tuple[tuple[str, str], ...] = ()
 
-    def add_args(self, *, disabled: bool = True) -> list[str]:
+    def add_args(
+        self, *, disabled: bool = True, description: str | None = None,
+    ) -> list[str]:
+        effective_description = self.description if description is None else description
         args = [
-            "cron", "add", "--name", self.name, "--description", self.description,
+            "cron", "add", "--name", self.name, "--description", effective_description,
             "--session", self.session_target, "--cron", self.schedule,
             "--tz", self.timezone, "--exact", "--command-argv",
             json.dumps(list(self.argv), separators=(",", ":")),
@@ -383,7 +451,7 @@ class ManagedCronSpec:
         ]
         for key, value in self.command_env:
             args.extend(["--command-env", f"{key}={value}"])
-        args.extend(["--declaration-key", self.key, "--no-deliver"])
+        args.extend(["--declaration-key", self.key, "--wake", "now", "--no-deliver"])
         if disabled:
             args.append("--disabled")
         args.append("--json")
@@ -460,15 +528,19 @@ def _argv_targets_exact_script(argv: list[str], expected_script: Path) -> bool:
         candidate = Path(raw).expanduser()
         return candidate.is_absolute() and candidate.resolve(strict=False) == expected
 
-    if argv and same_script(argv[0]):
-        return same_script(argv[0])
+    if any(same_script(raw) for raw in argv):
+        return True
     safe_shells = {"sh", "/bin/sh", "bash", "/bin/bash", "zsh", "/bin/zsh"}
-    return (
-        len(argv) == 3
-        and argv[0] in safe_shells
-        and argv[1] == "-lc"
-        and same_script(argv[2])
-    )
+    if len(argv) != 3 or argv[0] not in safe_shells or argv[1] != "-lc":
+        return False
+    try:
+        lexer = shlex.shlex(argv[2], posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        raise RuntimeError("Cron shell command is not safely parseable")
+    return any(same_script(token) for token in tokens)
 
 
 def _job_targets_exact_script(job: dict[str, Any], expected_script: Path) -> bool:
@@ -477,33 +549,35 @@ def _job_targets_exact_script(job: dict[str, Any], expected_script: Path) -> boo
 
 def _job_targets_snapshot_wrapper(job: dict[str, Any], expected_wrapper: Path) -> bool:
     argv = _job_argv(job)
-    expected = expected_wrapper.resolve(strict=False)
-    for raw in argv:
-        candidate = Path(raw).expanduser()
-        if candidate.is_absolute() and candidate.resolve(strict=False) == expected:
-            return True
-    return False
+    if any(
+        Path(raw).expanduser().is_absolute()
+        and Path(raw).expanduser().resolve(strict=False) == expected_wrapper.resolve(strict=False)
+        for raw in argv
+    ):
+        return True
+    return _argv_targets_exact_script(argv, expected_wrapper)
 
 
 def _cron_jobs(payload: Any) -> list[dict[str, Any]]:
-    if isinstance(payload, dict):
-        if payload.get("truncated") is True or payload.get("hasMore") is not False or payload.get("nextCursor"):
-            raise RuntimeError("OpenClaw cron inventory is incomplete")
-        jobs = payload.get("jobs")
-        total = payload.get("total")
-        if type(total) is not int:
-            raise RuntimeError("OpenClaw cron inventory total is missing")
-    else:
-        jobs = payload
+    if not isinstance(payload, dict):
+        raise RuntimeError("OpenClaw cron inventory lacks a completeness envelope")
+    if payload.get("truncated") is True or payload.get("hasMore") is not False \
+            or payload.get("nextCursor") or payload.get("offset") not in (None, 0) \
+            or payload.get("nextOffset") is not None:
+        raise RuntimeError("OpenClaw cron inventory is incomplete")
+    jobs = payload.get("jobs")
+    total = payload.get("total")
+    if type(total) is not int:
+        raise RuntimeError("OpenClaw cron inventory total is missing")
     if not isinstance(jobs, list) or any(not isinstance(job, dict) for job in jobs):
         raise RuntimeError("OpenClaw cron list returned an unexpected schema")
-    if isinstance(payload, dict) and len(jobs) != total:
+    if len(jobs) != total:
         raise RuntimeError("OpenClaw cron inventory count is incomplete")
     ids: list[str] = []
     keys: list[str] = []
     for job in jobs:
         job_id = job.get("id")
-        if not isinstance(job_id, str) or not job_id:
+        if not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id):
             raise RuntimeError("OpenClaw cron inventory contains an invalid job id")
         ids.append(job_id)
         key = job.get("declarationKey")
@@ -530,14 +604,31 @@ def _no_delivery_contract(value: Any) -> bool:
     )
 
 
+def _default_cron_behavior_contract(job: dict[str, Any]) -> bool:
+    """Accept only cron behavior fields that this installer can round-trip exactly."""
+    return (
+        job.get("wakeMode", "now") == "now"
+        and job.get("displayName") is None
+        and job.get("owner") is None
+        and job.get("trigger") is None
+    )
+
+
+def _known_cron_top_level_contract(job: dict[str, Any]) -> bool:
+    """Reject newly persisted behavior fields until their semantics are reviewed."""
+    return not (set(job) - set(CRON_DEFINITION_FIELDS) - CRON_VOLATILE_FIELDS)
+
+
 def _job_matches_spec(job: dict[str, Any], spec: ManagedCronSpec, *, require_enabled: bool) -> bool:
+    try:
+        _job_definition(job)
+    except RuntimeError:
+        return False
     schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
     payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
     delivery = job.get("delivery") if isinstance(job.get("delivery"), dict) else {}
     alert = job.get("failureAlert") if isinstance(job.get("failureAlert"), dict) else {}
-    if require_enabled and job.get("enabled", True) is False:
-        return False
-    if not require_enabled and job.get("enabled", True) is not False:
+    if job.get("enabled") is not require_enabled:
         return False
     expected_env = dict(spec.command_env)
     expected_payload_keys = {
@@ -555,13 +646,15 @@ def _job_matches_spec(job: dict[str, Any], spec: ManagedCronSpec, *, require_ena
         "accountId": spec.report_account_id,
     }
     return (
-        job.get("declarationKey") == spec.key
+        _known_cron_top_level_contract(job)
+        and job.get("declarationKey") == spec.key
         and job.get("name") == spec.name
         and job.get("description") == spec.description
+        and _default_cron_behavior_contract(job)
         and job.get("sessionTarget") == spec.session_target
         and job.get("sessionKey") is None
         and job.get("agentId") is None
-        and job.get("deleteAfterRun") in (None, False)
+        and (job.get("deleteAfterRun") is None or job.get("deleteAfterRun") is False)
         and schedule == {
             "kind": "cron", "expr": spec.schedule, "tz": spec.timezone, "staggerMs": 0,
         }
@@ -621,7 +714,16 @@ def _cron_contract_payload(job: dict[str, Any], *, include_id: bool) -> dict[str
     fields = CRON_DEFINITION_FIELDS if include_id else tuple(
         key for key in CRON_DEFINITION_FIELDS if key != "id"
     )
-    return {key: job.get(key) for key in fields}
+    contract = {key: job.get(key) for key in fields}
+    for key in sorted(set(job) - set(CRON_DEFINITION_FIELDS) - CRON_VOLATILE_FIELDS):
+        contract[key] = job[key]
+    if "wakeMode" not in job:
+        contract["wakeMode"] = "now"
+    if contract.get("deleteAfterRun") is None or contract.get("deleteAfterRun") is False:
+        contract["deleteAfterRun"] = False
+    if _no_delivery_contract(contract.get("delivery")):
+        contract["delivery"] = {"mode": "none"}
+    return contract
 
 
 def _job_contract_hash(job: dict[str, Any], *, include_id: bool = False) -> str:
@@ -634,48 +736,229 @@ def _job_contract_hash(job: dict[str, Any], *, include_id: bool = False) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _legacy_v3_job_contract_hash(
+    job: dict[str, Any], *, include_id: bool = False,
+) -> str:
+    fields = LEGACY_V3_CRON_DEFINITION_FIELDS if include_id else tuple(
+        key for key in LEGACY_V3_CRON_DEFINITION_FIELDS if key != "id"
+    )
+    encoded = json.dumps(
+        {key: job.get(key) for key in fields},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _staging_contract_hash(job: dict[str, Any]) -> str:
+    """Hash a staged cron contract with only the supported no-delivery normalization."""
+    contract = _cron_contract_payload(job, include_id=False)
+    if _no_delivery_contract(contract.get("delivery")):
+        contract["delivery"] = {"mode": "none"}
+    encoded = json.dumps(
+        contract,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _job_definition(job: dict[str, Any]) -> dict[str, Any]:
     """Persist a bounded, restorable definition allowlist, never arbitrary cron payload data."""
-    raw = _cron_contract_payload(job, include_id=True)
+    if not isinstance(job, dict) \
+            or set(job) - set(CRON_DEFINITION_FIELDS) - CRON_VOLATILE_FIELDS:
+        raise RuntimeError("Owned cron definition has unsupported top-level fields")
+    try:
+        serialized = json.dumps(
+            _cron_contract_payload(job, include_id=True), ensure_ascii=False,
+        )
+        encoded = serialized.encode("utf-8")
+        if len(encoded) > 128 * 1024:
+            raise ValueError("definition exceeds the rollback receipt size limit")
+        raw = json.loads(serialized)
+    except (TypeError, ValueError, UnicodeError) as error:
+        raise RuntimeError("Owned cron definition is not JSON-safe") from error
     payload = raw.get("payload")
+    if isinstance(payload, dict) and payload.get("env") == {}:
+        payload.pop("env")
     schedule = raw.get("schedule")
     delivery = raw.get("delivery")
     alert = raw.get("failureAlert")
+    job_id = raw.get("id")
+    name = raw.get("name")
+    description = raw.get("description")
+    declaration_key = raw.get("declarationKey")
+    if not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id):
+        raise RuntimeError("Owned cron definition id is not safely restorable")
+    if not isinstance(name, str) or not name or name != name.strip() or name.startswith("-") \
+            or len(name) > 512 or "\x00" in name:
+        raise RuntimeError("Owned cron definition name is not safely restorable")
+    if description is not None and (
+        not isinstance(description, str) or not description or description != description.strip()
+        or description.startswith("-")
+        or len(description) > 4096
+        or "\x00" in description
+    ):
+        raise RuntimeError("Owned cron definition description is not safely restorable")
+    if not isinstance(declaration_key, str) or not declaration_key \
+            or declaration_key != declaration_key.strip() \
+            or declaration_key.startswith("-") \
+            or len(declaration_key) > 512 or "\x00" in declaration_key:
+        raise RuntimeError("Owned cron definition declaration key is not safely restorable")
+    if type(raw.get("enabled")) is not bool:
+        raise RuntimeError("Owned cron definition enabled state is not safely restorable")
+    if raw.get("sessionTarget") != "isolated" or raw.get("sessionKey") is not None \
+            or raw.get("agentId") is not None:
+        raise RuntimeError("Owned cron definition session routing is not safely restorable")
+    if type(raw.get("deleteAfterRun")) is not bool \
+            or not _default_cron_behavior_contract(raw):
+        raise RuntimeError("Owned cron definition behavior fields are not safely restorable")
     allowed_payload = {
         "kind", "argv", "cwd", "timeoutSeconds", "noOutputTimeoutSeconds", "outputMaxBytes",
         "env",
     }
     if isinstance(payload, dict) and "toolsAllow" in payload:
         raise RuntimeError("Owned command cron definition tools policy is not safely restorable")
-    if not isinstance(payload, dict) or set(payload) - allowed_payload:
+    if not isinstance(payload, dict) or set(payload) not in (
+        allowed_payload - {"env"}, allowed_payload,
+    ):
         raise RuntimeError("Owned cron definition payload is outside the safe rollback allowlist")
     if payload.get("kind") != "command":
         raise RuntimeError("Owned cron definition payload is not a command")
-    if not isinstance(schedule, dict) or set(schedule) - {"kind", "expr", "tz", "staggerMs", "at", "everyMs"}:
+    if not isinstance(schedule, dict):
         raise RuntimeError("Owned cron definition schedule is outside the safe rollback allowlist")
-    if delivery is not None and (
-        not isinstance(delivery, dict) or set(delivery) - {"mode", "channel", "to", "accountId"}
-    ):
+    kind = schedule.get("kind")
+    if kind == "cron":
+        schedule_valid = (
+            set(schedule) == {"kind", "expr", "tz", "staggerMs"}
+            and isinstance(schedule.get("expr"), str)
+            and _valid_numeric_cron_expression(schedule["expr"])
+            and isinstance(schedule.get("tz"), str) and bool(schedule["tz"])
+            and schedule["tz"] == schedule["tz"].strip()
+            and not schedule["tz"].startswith("-")
+            and len(schedule["tz"]) <= 128 and "\x00" not in schedule["tz"]
+            and type(schedule.get("staggerMs")) is int and schedule["staggerMs"] == 0
+        )
+        if schedule_valid:
+            try:
+                ZoneInfo(schedule["tz"])
+            except (KeyError, ValueError):
+                schedule_valid = False
+    elif kind == "at":
+        at = schedule.get("at")
+        schedule_valid = set(schedule) == {"kind", "at"} and isinstance(at, str)
+        if schedule_valid:
+            try:
+                parsed_at = datetime.fromisoformat(at.replace("Z", "+00:00"))
+                canonical_at = parsed_at.astimezone(timezone.utc).isoformat(
+                    timespec="milliseconds"
+                ).replace("+00:00", "Z")
+                schedule_valid = (
+                    parsed_at.tzinfo is not None and at == canonical_at
+                    and not at.startswith("-")
+                    and len(at) <= 128 and "\x00" not in at
+                )
+            except (ValueError, OverflowError):
+                schedule_valid = False
+    elif kind == "every":
+        schedule_valid = (
+            set(schedule) == {"kind", "everyMs"}
+            and type(schedule.get("everyMs")) is int
+            and 1 <= schedule["everyMs"] <= 31 * 24 * 60 * 60 * 1000
+        )
+    else:
+        schedule_valid = False
+    if not schedule_valid:
+        raise RuntimeError("Owned cron definition schedule is not exactly restorable")
+    if not isinstance(delivery, dict) or set(delivery) - {"mode", "channel", "to", "accountId"}:
         raise RuntimeError("Owned cron definition delivery is outside the safe rollback allowlist")
+    if delivery.get("mode") == "none":
+        delivery_valid = delivery == {"mode": "none"}
+    elif delivery.get("mode") == "announce":
+        delivery_valid = (
+            set(delivery) in (
+                {"mode", "channel", "to"},
+                {"mode", "channel", "to", "accountId"},
+            )
+            and all(
+                isinstance(delivery.get(key), str) and bool(delivery[key])
+                and delivery[key] == delivery[key].strip()
+                and not delivery[key].startswith("-")
+                and len(delivery[key]) <= 512 and "\x00" not in delivery[key]
+                for key in ("channel", "to")
+            )
+            and delivery["channel"] == delivery["channel"].lower()
+            and (
+                "accountId" not in delivery
+                or isinstance(delivery["accountId"], str)
+                and SAFE_ACCOUNT_ID_RE.fullmatch(delivery["accountId"]) is not None
+            )
+        )
+    else:
+        delivery_valid = False
+    if not delivery_valid:
+        raise RuntimeError("Owned cron definition delivery is not exactly restorable")
     if alert is not None and (
         not isinstance(alert, dict)
         or set(alert) - {"after", "cooldownMs", "includeSkipped", "mode", "channel", "to", "accountId"}
     ):
         raise RuntimeError("Owned cron definition alert is outside the safe rollback allowlist")
+    if alert is not None:
+        required_alert = {"after", "cooldownMs", "includeSkipped", "channel"}
+        if not required_alert.issubset(alert) \
+                or type(alert.get("after")) is not int or not 1 <= alert["after"] <= 1_000_000 \
+                or type(alert.get("cooldownMs")) is not int \
+                or not 0 <= alert["cooldownMs"] <= 31 * 24 * 60 * 60 * 1000 \
+                or type(alert.get("includeSkipped")) is not bool \
+                or not isinstance(alert.get("channel"), str) or not alert["channel"] \
+                or alert["channel"] != alert["channel"].strip().lower() \
+                or alert["channel"].startswith("-") \
+                or len(alert["channel"]) > 512 or "\x00" in alert["channel"] \
+                or "mode" in alert and alert["mode"] != "announce" \
+                or "to" in alert and (
+                    not isinstance(alert["to"], str) or not alert["to"]
+                    or alert["to"] != alert["to"].strip()
+                    or alert["to"].startswith("-")
+                    or len(alert["to"]) > 512 or "\x00" in alert["to"]
+                ) \
+                or "accountId" in alert and (
+                    not isinstance(alert["accountId"], str)
+                    or SAFE_ACCOUNT_ID_RE.fullmatch(alert["accountId"]) is None
+                ):
+            raise RuntimeError("Owned cron definition alert is not exactly restorable")
     argv = payload.get("argv")
     env = payload.get("env", {})
     if not isinstance(argv, list) or not 1 <= len(argv) <= 16 \
-            or any(not isinstance(item, str) or not item or len(item) > 8192 for item in argv):
+            or any(
+                not isinstance(item, str) or not item or len(item) > 8192 or "\x00" in item
+                for item in argv
+            ):
         raise RuntimeError("Owned cron definition argv is outside the safe rollback allowlist")
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not cwd or cwd != cwd.strip() \
+            or len(cwd) > 4096 or "\x00" in cwd \
+            or not Path(cwd).is_absolute():
+        raise RuntimeError("Owned cron definition cwd is outside the safe rollback allowlist")
+    for field, maximum in (
+        ("timeoutSeconds", 31 * 24 * 60 * 60),
+        ("noOutputTimeoutSeconds", 31 * 24 * 60 * 60),
+        ("outputMaxBytes", 64 * 1024 * 1024),
+    ):
+        value = payload.get(field)
+        if type(value) is not int or not 1 <= value <= maximum:
+            raise RuntimeError("Owned cron definition resource limit is not safely restorable")
     if not isinstance(env, dict) or len(env) > 16 \
-            or any(not isinstance(key, str) or not isinstance(value, str) or len(key) > 128
-                   or len(value) > 4096 or _sensitive_key(key) or _contains_forbidden_key(value)
+            or any(not isinstance(key, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", key) is None
+                   or not isinstance(value, str)
+                   or len(value) > 4096 or "\x00" in value
+                   or _sensitive_key(key) or _contains_forbidden_key(value)
                    for key, value in env.items()):
         raise RuntimeError("Owned cron definition environment is outside the safe rollback allowlist")
     if _contains_forbidden_key(raw):
         raise RuntimeError("Owned cron definition contains sensitive material")
-    # JSON round-trip produces an owned deep copy without preserving attacker-controlled subclasses.
-    return json.loads(json.dumps({key: value for key, value in raw.items() if value is not None}, ensure_ascii=False))
+    return {key: value for key, value in raw.items() if value is not None}
 
 
 def owned_gemini_jobs(jobs: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2883,12 +3166,28 @@ class IntegrationManager:
 
     def _owned_gemini_jobs_exact(self, jobs: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         expected = self.paths.workspace / "knowledge-lancedb/scripts/knowledge_index_incremental.sh"
-        return [
+        candidates = [
             job for job in jobs
             if job.get("declarationKey") == GEMINI_DECLARATION_KEY
-            and _job_argv(job) == [str(expected)]
-            and _job_targets_exact_script(job, expected)
         ]
+        if any(
+            _job_argv(job) != [str(expected)]
+            or not _job_targets_exact_script(job, expected)
+            or not _default_cron_behavior_contract(job)
+            or (job.get("payload") if isinstance(job.get("payload"), dict) else {}).get(
+                "env"
+            ) not in (None, {})
+            for job in candidates
+        ):
+            raise RuntimeError("Existing owned Gemini cron is outside the safe upgrade allowlist")
+        for job in candidates:
+            try:
+                _job_definition(job)
+            except RuntimeError as error:
+                raise RuntimeError(
+                    "Existing owned Gemini cron is outside the safe upgrade allowlist"
+                ) from error
+        return candidates
 
     @staticmethod
     def _inventory_hashes(jobs: list[dict[str, Any]]) -> dict[str, str]:
@@ -2897,10 +3196,67 @@ class IntegrationManager:
             for job in jobs
         }
 
+    def _edit_cron_with_snapshot_guard(
+        self,
+        job_id: str,
+        args: list[str],
+        *,
+        before: Callable[[dict[str, Any]], bool],
+        after: Callable[[dict[str, Any]], bool],
+        label: str,
+    ) -> None:
+        """Bound an ID-based cron edit to exact before/after full-inventory snapshots."""
+        if not SAFE_CRON_JOB_ID_RE.fullmatch(job_id) \
+                or args[:3] != ["cron", "edit", job_id]:
+            raise RuntimeError(f"{label} cron edit authority is malformed")
+        inventory_before = self._inventory()
+        before_by_id = {str(job["id"]): job for job in inventory_before}
+        candidate = before_by_id.get(job_id)
+        if candidate is None or not before(candidate):
+            raise RuntimeError(f"{label} cron identity was reused or drifted before edit")
+        hashes_before = self._inventory_hashes(inventory_before)
+        if self._inventory_hashes(self._inventory()) != hashes_before:
+            raise RuntimeError(f"{label} cron inventory changed before edit")
+        self.cli.run(args)
+        inventory_after = self._inventory()
+        after_by_id = {str(job["id"]): job for job in inventory_after}
+        edited = after_by_id.get(job_id)
+        if edited is None or not after(edited):
+            raise RuntimeError(f"{label} cron contract drifted during edit")
+        hashes_after = self._inventory_hashes(inventory_after)
+        if set(hashes_after) != set(hashes_before) or any(
+            hashes_after[other_id] != fingerprint
+            for other_id, fingerprint in hashes_before.items()
+            if other_id != job_id
+        ):
+            raise RuntimeError(f"{label} cron edit changed another inventory entry")
+
     @staticmethod
     def _runtime_job_active(job: dict[str, Any]) -> bool:
-        state = job.get("state") if isinstance(job.get("state"), dict) else {}
-        return state.get("status") in {"running", "starting"} or job.get("status") in {"running", "starting"}
+        if "state" in job:
+            raw_state = job["state"]
+            if not isinstance(raw_state, dict):
+                raise RuntimeError("Cron runtime state is malformed")
+            state = raw_state
+        else:
+            state = {}
+        if "runningAtMs" in state:
+            running_at = state["runningAtMs"]
+            if type(running_at) is not int or running_at <= 0:
+                raise RuntimeError("Cron running timestamp is malformed")
+            return True
+        state_status: str | None = None
+        top_status: str | None = None
+        if "status" in state:
+            state_status = state["status"]
+            if not isinstance(state_status, str) or not state_status.strip():
+                raise RuntimeError("Cron runtime status is malformed")
+        if "status" in job:
+            top_status = job["status"]
+            if not isinstance(top_status, str) or not top_status.strip():
+                raise RuntimeError("Cron runtime status is malformed")
+        return state_status in {"running", "starting"} \
+            or top_status in {"running", "starting"}
 
     def _wait_for_quiesced_jobs(self, job_ids: set[str], *, timeout_seconds: float = 1800,
                                 poll_seconds: float = 1.0) -> None:
@@ -2917,6 +3273,45 @@ class IntegrationManager:
                 raise RuntimeError("Owned cron execution did not quiesce before the bounded deadline")
             time.sleep(min(max(0.01, poll_seconds), max(0.01, deadline - time.monotonic())))
 
+    def _quiesce_rollback_removals(
+        self, current_jobs: list[dict[str, Any]], removable_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        """Disable every present removal target, then wait for live runs to finish."""
+        current_by_id = {str(job["id"]): job for job in current_jobs}
+        present_ids = removable_ids & set(current_by_id)
+        for job_id in sorted(present_ids):
+            original = current_by_id[job_id]
+            enabled = original.get("enabled")
+            if type(enabled) is not bool:
+                raise RuntimeError("Rollback removal target enabled state is malformed")
+            if enabled:
+                expected_disabled = json.loads(json.dumps(original))
+                expected_disabled["enabled"] = False
+                self._edit_cron_with_snapshot_guard(
+                    job_id,
+                    ["cron", "edit", job_id, "--disable"],
+                    before=lambda job, expected=original: _job_contract_hash(
+                        job, include_id=True,
+                    ) == _job_contract_hash(expected, include_id=True),
+                    after=lambda job, expected=expected_disabled: _job_contract_hash(
+                        job, include_id=True,
+                    ) == _job_contract_hash(expected, include_id=True),
+                    label="Rollback removal quiescence",
+                )
+                current_by_id[job_id] = expected_disabled
+        expected_hashes = {
+            job_id: _job_contract_hash(job, include_id=True)
+            for job_id, job in current_by_id.items()
+        }
+        disabled_inventory = self._inventory()
+        if self._inventory_hashes(disabled_inventory) != expected_hashes:
+            raise RuntimeError("Cron inventory drifted during rollback quiescence")
+        self._wait_for_quiesced_jobs(present_ids)
+        quiesced_inventory = self._inventory()
+        if self._inventory_hashes(quiesced_inventory) != expected_hashes:
+            raise RuntimeError("Cron inventory drifted while rollback waited for active runs")
+        return quiesced_inventory
+
     def _quiesce_prior_jobs(self, jobs_before: list[dict[str, Any]], target_ids: set[str],
                             inventory_hashes_before: dict[str, str]) -> list[str]:
         current = self._inventory()
@@ -2929,7 +3324,19 @@ class IntegrationManager:
             if original is None:
                 raise RuntimeError("Cron quiescence target disappeared after preflight")
             if original.get("enabled", True) is True:
-                self.cli.run(["cron", "edit", job_id, "--disable"])
+                expected_disabled = json.loads(json.dumps(original))
+                expected_disabled["enabled"] = False
+                self._edit_cron_with_snapshot_guard(
+                    job_id,
+                    ["cron", "edit", job_id, "--disable"],
+                    before=lambda job, expected=original: _job_contract_hash(
+                        job, include_id=True,
+                    ) == _job_contract_hash(expected, include_id=True),
+                    after=lambda job, expected=expected_disabled: _job_contract_hash(
+                        job, include_id=True,
+                    ) == _job_contract_hash(expected, include_id=True),
+                    label="Owned quiescence",
+                )
                 enabled_before.append(job_id)
         self._wait_for_quiesced_jobs(target_ids)
         after = self._inventory()
@@ -2953,6 +3360,140 @@ class IntegrationManager:
         if unknown_after != unknown_before:
             raise RuntimeError("Unknown cron definitions changed during owned-job quiescence")
         return enabled_before
+
+    def _remove_prior_managed_jobs_for_replacement(
+        self,
+        jobs_before: list[dict[str, Any]],
+        target_ids: set[str],
+        inventory_hashes_before: dict[str, str],
+    ) -> list[str]:
+        """Remove only write-ahead-receipted managed IDs after exact quiescence readback."""
+        transaction = self.store.read()
+        raw_receipt = transaction.get("cronReplaceIdsBefore")
+        if transaction.get("phase") != "replacing_managed_cron" \
+                or not isinstance(raw_receipt, list) \
+                or any(
+                    not isinstance(value, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(value)
+                    for value in raw_receipt
+                ) \
+                or len(raw_receipt) != len(set(raw_receipt)):
+            raise RuntimeError("Cron replacement durable authority is missing or malformed")
+        self._validate_replacement_receipt_graph(transaction)
+        persisted_hashes = transaction.get("cronInventoryHashesBefore")
+        if persisted_hashes != inventory_hashes_before:
+            raise RuntimeError("Cron replacement inventory receipt drifted")
+        if self._inventory_hashes(jobs_before) != inventory_hashes_before:
+            raise RuntimeError("Cron replacement preflight receipt is inconsistent")
+        original_by_id = {str(job["id"]): job for job in jobs_before}
+        replace_ids = sorted(
+            job_id for job_id, job in original_by_id.items()
+            if job.get("declarationKey") in MANAGED_CRON_KEYS
+        )
+        if raw_receipt != replace_ids:
+            raise RuntimeError("Cron replacement ids do not match durable authority")
+        if any(job_id not in target_ids for job_id in replace_ids):
+            raise RuntimeError("Cron replacement target is outside the quiesced ownership set")
+
+        expected_quiesced: dict[str, str] = {}
+        for job_id, original in original_by_id.items():
+            expected = dict(original)
+            if job_id in target_ids:
+                expected["enabled"] = False
+            expected_quiesced[job_id] = _job_contract_hash(expected, include_id=True)
+        current_quiesced = self._inventory()
+        if self._inventory_hashes(current_quiesced) != expected_quiesced:
+            raise RuntimeError("Cron inventory changed before managed replacement")
+        self._remove_cron_ids_with_snapshot_guard(
+            current_quiesced, set(replace_ids),
+        )
+
+        expected_remaining = {
+            job_id: fingerprint for job_id, fingerprint in expected_quiesced.items()
+            if job_id not in replace_ids
+        }
+        after = self._inventory()
+        if self._inventory_hashes(after) != expected_remaining:
+            raise RuntimeError("Cron inventory changed during managed replacement")
+        if any(job.get("declarationKey") in MANAGED_CRON_KEYS for job in after):
+            raise RuntimeError("Prior managed cron declaration remained after replacement removal")
+        return replace_ids
+
+    def _verify_pre_legacy_removal_inventory(
+        self, transaction: dict[str, Any], jobs: list[dict[str, Any]],
+    ) -> None:
+        """Bind legacy deletion to the complete durable post-staging topology."""
+        if transaction.get("phase") != "staging_managed_cron" \
+                or transaction.get("cronContractHashVersion") != CRON_CONTRACT_HASH_VERSION:
+            raise RuntimeError("Legacy cron removal phase is not durably authorized")
+        legacy_ids = transaction.get("cronLegacyRemoveIdsBefore")
+        definitions = transaction.get("cronDefinitionsBefore")
+        unknown_hashes = transaction.get("cronUnknownHashesBefore")
+        gemini_hashes = transaction.get("cronPreservedGeminiHashesAfterQuiesce")
+        receipts = (unknown_hashes, gemini_hashes)
+        if not isinstance(legacy_ids, list) \
+                or any(
+                    not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    for job_id in legacy_ids
+                ) \
+                or len(legacy_ids) != len(set(legacy_ids)) \
+                or not isinstance(definitions, list) \
+                or any(not isinstance(item, dict) for item in definitions) \
+                or any(
+                    not isinstance(receipt, dict)
+                    or any(
+                        not isinstance(job_id, str)
+                        or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                        or not isinstance(fingerprint, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                        for job_id, fingerprint in receipt.items()
+                    )
+                    for receipt in receipts
+                ):
+            raise RuntimeError("Legacy cron removal receipt graph is malformed")
+        assert isinstance(unknown_hashes, dict) and isinstance(gemini_hashes, dict)
+        expected_hashes = dict(unknown_hashes)
+        if set(expected_hashes) & set(gemini_hashes):
+            raise RuntimeError("Legacy cron removal receipt authority overlaps")
+        expected_hashes.update(gemini_hashes)
+
+        legacy_id_set = set(legacy_ids)
+        definitions_by_id = {
+            str(definition.get("id")): _job_definition(definition)
+            for definition in definitions
+            if str(definition.get("id")) in legacy_id_set
+        }
+        if set(definitions_by_id) != legacy_id_set:
+            raise RuntimeError("Legacy cron removal definitions are incomplete")
+        for job_id, definition in definitions_by_id.items():
+            disabled = json.loads(json.dumps(definition))
+            disabled["enabled"] = False
+            if job_id in expected_hashes:
+                raise RuntimeError("Legacy cron removal receipt authority overlaps")
+            expected_hashes[job_id] = _job_contract_hash(disabled, include_id=True)
+
+        intents = self._validated_cron_intent_receipts(
+            transaction, "cronStagingIntents",
+        )
+        expected_intents = {CRON_DECLARATION_KEY, SNAPSHOT_CRON_DECLARATION_KEY}
+        if set(intents) != expected_intents:
+            raise RuntimeError("Legacy cron removal contains an unexpected staging intent")
+        for declaration_key in sorted(expected_intents):
+            intent = intents[declaration_key]
+            if intent.get("configured") is not True:
+                raise RuntimeError("Legacy cron removal lacks configured managed intent")
+            job_id = intent.get("jobId")
+            if not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id) \
+                    or job_id in expected_hashes:
+                raise RuntimeError("Legacy cron removal managed id authority is invalid")
+            configured_disabled = json.loads(json.dumps(
+                self._managed_intent_lifecycle_contracts(intent)[2]
+            ))
+            configured_disabled["id"] = job_id
+            expected_hashes[job_id] = _job_contract_hash(
+                configured_disabled, include_id=True,
+            )
+        if self._inventory_hashes(jobs) != expected_hashes:
+            raise RuntimeError("Cron inventory drifted before legacy removal")
 
     @staticmethod
     def _validate_index_lock(metadata: os.stat_result) -> None:
@@ -3630,8 +4171,14 @@ class IntegrationManager:
         if not isinstance(payload, dict):
             raise RuntimeError("OpenClaw cron add returned an unexpected schema")
         nested = payload.get("job") if isinstance(payload.get("job"), dict) else {}
-        job_id = payload.get("id") or nested.get("id")
-        if not isinstance(job_id, str) or not job_id:
+        outer_present = "id" in payload
+        nested_present = "id" in nested
+        outer_id = payload.get("id")
+        nested_id = nested.get("id")
+        if outer_present and nested_present and outer_id != nested_id:
+            raise RuntimeError("OpenClaw cron add returned conflicting job ids")
+        job_id = outer_id if outer_present else nested_id
+        if not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id):
             raise RuntimeError("OpenClaw cron add did not return a job id")
         return job_id
 
@@ -3644,7 +4191,11 @@ class IntegrationManager:
 
     def _legacy_incremental_job(self, job: dict[str, Any]) -> bool:
         payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
-        if "toolsAllow" in payload:
+        if not _known_cron_top_level_contract(job) or "toolsAllow" in payload:
+            return False
+        try:
+            _job_definition(job)
+        except RuntimeError:
             return False
         payload_keys = {
             "kind", "argv", "cwd", "timeoutSeconds", "noOutputTimeoutSeconds", "outputMaxBytes",
@@ -3657,10 +4208,11 @@ class IntegrationManager:
         if job.get("declarationKey") != CRON_DECLARATION_KEY \
                 or job.get("name") != "Qwen local knowledge incremental index" \
                 or job.get("description") is not None \
-                or job.get("enabled", True) not in (True, False) \
+                or not _default_cron_behavior_contract(job) \
+                or type(job.get("enabled")) is not bool \
                 or job.get("sessionTarget") != "isolated" \
                 or job.get("sessionKey") is not None or job.get("agentId") is not None \
-                or job.get("deleteAfterRun") not in (None, False) \
+                or not (job.get("deleteAfterRun") is None or job.get("deleteAfterRun") is False) \
                 or job.get("schedule") != {
                     "kind": "cron", "expr": "30 6 * * *", "tz": self.timezone_name, "staggerMs": 0,
                 }:
@@ -3693,6 +4245,10 @@ class IntegrationManager:
         if require_known_key and job.get("declarationKey") != LEGACY_SNAPSHOT_DECLARATION_KEY:
             return False
         payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        try:
+            _job_definition(job)
+        except RuntimeError:
+            return False
         expected_argv = [
             "sh", "-lc", _legacy_snapshot_shell_command(
                 project_root=self.paths.project_root,
@@ -3701,13 +4257,15 @@ class IntegrationManager:
             ),
         ]
         return (
-            job.get("name") == LEGACY_SNAPSHOT_NAME
+            _known_cron_top_level_contract(job)
+            and job.get("name") == LEGACY_SNAPSHOT_NAME
             and job.get("description") == LEGACY_SNAPSHOT_DESCRIPTION
-            and job.get("enabled", True) in (True, False)
+            and _default_cron_behavior_contract(job)
+            and type(job.get("enabled")) is bool
             and job.get("sessionTarget") == "isolated"
             and job.get("sessionKey") is None
             and job.get("agentId") is None
-            and job.get("deleteAfterRun") in (None, False)
+            and (job.get("deleteAfterRun") is None or job.get("deleteAfterRun") is False)
             and job.get("schedule") == {
                 "kind": "cron", "expr": "50 6 * * *", "tz": self.timezone_name, "staggerMs": 0,
             }
@@ -3800,7 +4358,11 @@ class IntegrationManager:
             "sessionTarget": "isolated",
             "sessionKey": None,
             "agentId": None,
-            "deleteAfterRun": None,
+            "deleteAfterRun": False,
+            "wakeMode": "now",
+            "displayName": None,
+            "owner": None,
+            "trigger": None,
         }
         return (
             job.get("enabled") is False
@@ -3852,6 +4414,7 @@ class IntegrationManager:
         self._validate_existing_owned_jobs(jobs)
         incremental = self.paths.project_root / "scripts/knowledge_index_incremental.sh"
         snapshot_wrapper = self.paths.project_root / "scripts/run_verified_snapshot.py"
+        full_index = self.paths.project_root / "scripts/knowledge_index_full.sh"
         approved = self._approved_disabled_collision_job(jobs)
         approved_id = str(approved["id"]) if approved is not None else None
         for job in jobs:
@@ -3868,24 +4431,913 @@ class IntegrationManager:
                 raise RuntimeError("Unknown cron job targets the owned incremental wrapper")
             if _job_targets_snapshot_wrapper(job, snapshot_wrapper) and key != SNAPSHOT_CRON_DECLARATION_KEY:
                 raise RuntimeError("Unknown cron job targets the owned snapshot wrapper")
+            if _job_targets_exact_script(job, full_index) and key != INITIAL_CRON_DECLARATION_KEY:
+                raise RuntimeError("Unknown cron job targets the owned initial index wrapper")
         legacy = self._legacy_snapshot_candidates(jobs)
         return jobs, legacy
 
-    def _apply_managed_spec(self, spec: ManagedCronSpec, *, enable: bool = False) -> str:
-        job_id = self._job_id_from_add(self.cli.json(spec.add_args(disabled=True)))
-        self.cli.run(spec.alert_args(job_id))
+    @staticmethod
+    def _managed_pre_alert_definition(
+        spec: ManagedCronSpec, staging_description: str,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "kind": "command",
+            "argv": list(spec.argv),
+            "cwd": spec.cwd,
+            "timeoutSeconds": spec.timeout_seconds,
+            "noOutputTimeoutSeconds": spec.no_output_timeout_seconds,
+            "outputMaxBytes": spec.output_max_bytes,
+        }
+        if spec.command_env:
+            payload["env"] = dict(spec.command_env)
+        return {
+            "name": spec.name,
+            "description": staging_description,
+            "enabled": False,
+            "declarationKey": spec.key,
+            "schedule": {
+                "kind": "cron", "expr": spec.schedule, "tz": spec.timezone,
+                "staggerMs": 0,
+            },
+            "payload": payload,
+            "delivery": {"mode": "none"},
+            "failureAlert": None,
+            "sessionTarget": spec.session_target,
+            "sessionKey": None,
+            "agentId": None,
+            "deleteAfterRun": False,
+        }
+
+    def _ensure_cron_intent(
+        self,
+        transaction: dict[str, Any],
+        *,
+        bucket_name: str,
+        declaration_key: str,
+        canonical_description: str,
+        role: str,
+        expected_factory: Callable[[str], dict[str, Any]],
+        extra_fields: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not declaration_key or not canonical_description:
+            raise RuntimeError("Cron staging intent identity is incomplete")
+        raw_bucket = transaction.setdefault(bucket_name, {})
+        if not isinstance(raw_bucket, dict):
+            raise RuntimeError("Cron staging intent receipt is malformed")
+        intent = raw_bucket.get(declaration_key)
+        if intent is None:
+            staging_description = (
+                f"{canonical_description} [qwen-stage:{uuid.uuid4()}]"
+            )
+            intent = {
+                "schema": "qwen-local.cron-intent.v1",
+                "declarationKey": declaration_key,
+                "role": role,
+                "stagingDescription": staging_description,
+                "canonicalDescription": canonical_description,
+                "preAlertContractSha256": _staging_contract_hash(
+                    expected_factory(staging_description)
+                ),
+            }
+            if extra_fields:
+                intent.update(extra_fields)
+            raw_bucket[declaration_key] = intent
+            self.store.write(transaction)
+        if not isinstance(intent, dict) or intent.get("schema") != "qwen-local.cron-intent.v1" \
+                or intent.get("declarationKey") != declaration_key \
+                or intent.get("role") != role \
+                or intent.get("canonicalDescription") != canonical_description:
+            raise RuntimeError("Cron staging intent receipt drifted")
+        if extra_fields and any(intent.get(key) != value for key, value in extra_fields.items()):
+            raise RuntimeError("Cron staging intent metadata drifted")
+        staging_description = intent.get("stagingDescription")
+        expected_hash = intent.get("preAlertContractSha256")
+        if not isinstance(staging_description, str) or not staging_description \
+                or not isinstance(expected_hash, str) \
+                or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None \
+                or _staging_contract_hash(expected_factory(staging_description)) != expected_hash:
+            raise RuntimeError("Cron staging intent contract drifted")
+        job_id = intent.get("jobId")
+        if job_id is not None and (
+            not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+        ):
+            raise RuntimeError("Cron staging intent job id is malformed")
+        return intent
+
+    def _ensure_restore_cron_intent(
+        self,
+        transaction: dict[str, Any],
+        definition: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a nonce name before restoring an exact prior cron definition."""
+        declaration_key = definition.get("declarationKey")
+        canonical_name = definition.get("name")
+        canonical_description = definition.get("description")
+        if not isinstance(declaration_key, str) or not declaration_key \
+                or not isinstance(canonical_name, str) or not canonical_name \
+                or canonical_description is not None \
+                and (not isinstance(canonical_description, str) or not canonical_description):
+            raise RuntimeError("Cron restore intent identity is incomplete")
+        raw_bucket = transaction.setdefault("cronRestoreIntents", {})
+        if not isinstance(raw_bucket, dict):
+            raise RuntimeError("Cron restore intent receipt is malformed")
+        intent = raw_bucket.get(declaration_key)
+        if intent is None:
+            staging_name = f"qwen-restore-stage-{uuid.uuid4()}"
+            intent = {
+                "schema": "qwen-local.cron-restore-intent.v1",
+                "declarationKey": declaration_key,
+                "role": "restore",
+                "stagingName": staging_name,
+                "canonicalName": canonical_name,
+                "canonicalDescription": canonical_description,
+                "preAlertContractSha256": _staging_contract_hash(
+                    self._restore_pre_alert_definition(definition, staging_name)
+                ),
+            }
+            raw_bucket[declaration_key] = intent
+            self.store.write(transaction)
+        if not isinstance(intent, dict) \
+                or intent.get("schema") != "qwen-local.cron-restore-intent.v1" \
+                or intent.get("declarationKey") != declaration_key \
+                or intent.get("role") != "restore" \
+                or intent.get("canonicalName") != canonical_name \
+                or intent.get("canonicalDescription") != canonical_description:
+            raise RuntimeError("Cron restore intent receipt drifted")
+        staging_name = intent.get("stagingName")
+        expected_hash = intent.get("preAlertContractSha256")
+        if not isinstance(staging_name, str) or not staging_name \
+                or not isinstance(expected_hash, str) \
+                or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None \
+                or _staging_contract_hash(
+                    self._restore_pre_alert_definition(definition, staging_name)
+                ) != expected_hash:
+            raise RuntimeError("Cron restore intent contract drifted")
+        job_id = intent.get("jobId")
+        if job_id is not None and (
+            not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+        ):
+            raise RuntimeError("Cron restore intent job id is malformed")
+        return intent
+
+    def _checkpoint_cron_intent_job_id(
+        self,
+        transaction: dict[str, Any],
+        *,
+        bucket_name: str,
+        declaration_key: str,
+        job_id: str,
+        created: bool,
+    ) -> None:
+        bucket = transaction.get(bucket_name)
+        intent = bucket.get(declaration_key) if isinstance(bucket, dict) else None
+        if not isinstance(intent, dict):
+            raise RuntimeError("Cron staging intent is missing before id checkpoint")
+        prior_id = intent.get("jobId")
+        if prior_id not in (None, job_id):
+            raise RuntimeError("Cron staging intent id changed")
+        intent["jobId"] = job_id
+        if created:
+            ids = transaction.setdefault("managedCronIdsAfter", [])
+            if not isinstance(ids, list) or any(not isinstance(value, str) for value in ids):
+                raise RuntimeError("Managed cron id receipt is malformed")
+            if job_id not in ids:
+                ids.append(job_id)
+        else:
+            restored = transaction.setdefault("restoredCronIdsByDeclaration", {})
+            if not isinstance(restored, dict):
+                raise RuntimeError("Restored cron id receipt is malformed")
+            existing = restored.get(declaration_key)
+            if existing not in (None, job_id):
+                raise RuntimeError("Restored cron id receipt changed")
+            restored[declaration_key] = job_id
+        self.store.write(transaction)
+
+    def _uncheckpointed_intent_candidate(
+        self, intent: dict[str, Any], jobs: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        description = intent["stagingDescription"]
+        declaration_key = intent["declarationKey"]
+        description_matches = [job for job in jobs if job.get("description") == description]
+        exact = [
+            job for job in description_matches
+            if job.get("declarationKey") == declaration_key
+            and job.get("enabled", True) is False
+            and _staging_contract_hash(job) == intent["preAlertContractSha256"]
+        ]
+        if len(description_matches) > 1 or len(exact) > 1:
+            raise RuntimeError("Cron staging intent match is ambiguous")
+        if description_matches and not exact:
+            raise RuntimeError("Cron staging intent candidate contract drifted")
+        return exact[0] if exact else None
+
+    def _uncheckpointed_restore_intent_candidate(
+        self, intent: dict[str, Any], jobs: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        staging_name = intent["stagingName"]
+        declaration_key = intent["declarationKey"]
+        name_matches = [job for job in jobs if job.get("name") == staging_name]
+        exact = [
+            job for job in name_matches
+            if job.get("declarationKey") == declaration_key
+            and job.get("enabled", True) is False
+            and _staging_contract_hash(job) == intent["preAlertContractSha256"]
+        ]
+        if len(name_matches) > 1 or len(exact) > 1:
+            raise RuntimeError("Cron restore intent match is ambiguous")
+        if name_matches and not exact:
+            raise RuntimeError("Cron restore intent candidate contract drifted")
+        return exact[0] if exact else None
+
+    def _validate_intent_candidate_authority(
+        self,
+        transaction: dict[str, Any],
+        intent: dict[str, Any],
+        candidate: dict[str, Any],
+        *,
+        returned_id: str | None = None,
+        jobs_before_add: list[dict[str, Any]] | None = None,
+        jobs_after_add: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Prove a nonce-staged job identity before making its ID destructive authority."""
+        candidate_id = str(candidate.get("id") or "")
+        if not SAFE_CRON_JOB_ID_RE.fullmatch(candidate_id):
+            raise RuntimeError("Cron staging intent candidate id is malformed")
+        persisted = self.store.read()
+        bucket_name = (
+            "cronRestoreIntents" if intent.get("role") == "restore"
+            else "cronStagingIntents"
+        )
+        bucket = persisted.get(bucket_name)
+        persisted_intent = bucket.get(intent.get("declarationKey")) \
+            if isinstance(bucket, dict) else None
+        if persisted_intent != intent:
+            raise RuntimeError("Cron staging intent is not durably identical")
+        inventory_before = persisted.get("cronInventoryHashesBefore")
+        if not isinstance(inventory_before, dict) or any(
+            not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+            or not isinstance(fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+            for job_id, fingerprint in inventory_before.items()
+        ):
+            raise RuntimeError("Cron staging inventory authority is malformed")
+        if candidate_id in inventory_before:
+            raise RuntimeError("Cron staging candidate reuses a preflight job id")
+        if returned_id is not None:
+            if not SAFE_CRON_JOB_ID_RE.fullmatch(returned_id):
+                raise RuntimeError("Cron add returned an unsafe job id")
+            if jobs_before_add is None or jobs_after_add is None:
+                raise RuntimeError("Cron add identity validation lacks its pre-add inventory")
+            hashes_before_add = self._inventory_hashes(jobs_before_add)
+            hashes_after_add = self._inventory_hashes(jobs_after_add)
+            if returned_id in hashes_before_add:
+                raise RuntimeError("Cron add returned a pre-existing job id")
+            if returned_id != candidate_id:
+                raise RuntimeError("Cron add returned an id outside its unique staging intent")
+            if set(hashes_after_add) != set(hashes_before_add) | {candidate_id} \
+                    or any(
+                        hashes_after_add.get(job_id) != fingerprint
+                        for job_id, fingerprint in hashes_before_add.items()
+                    ) \
+                    or hashes_after_add.get(candidate_id) != _job_contract_hash(
+                        candidate, include_id=True,
+                    ):
+                raise RuntimeError("Cron add changed more than its exact staged candidate")
+        return candidate_id
+
+    @staticmethod
+    def _validated_cron_intent_receipts(
+        transaction: dict[str, Any], bucket_name: str,
+    ) -> dict[str, dict[str, Any]]:
+        raw = transaction.get(bucket_name, {})
+        if not isinstance(raw, dict):
+            raise RuntimeError("Cron intent receipt bucket is malformed")
+        validated: dict[str, dict[str, Any]] = {}
+        staging_identities: set[str] = set()
+        for declaration_key, intent in raw.items():
+            if not isinstance(declaration_key, str) or not declaration_key \
+                    or not isinstance(intent, dict) \
+                    or intent.get("declarationKey") != declaration_key \
+                    or intent.get("role") not in {"managed", "initial", "restore"}:
+                raise RuntimeError("Cron intent identity receipt is malformed")
+            if bucket_name == "cronStagingIntents" and (
+                declaration_key not in MANAGED_CRON_KEYS
+                or intent.get("role") == "initial"
+                and declaration_key != INITIAL_CRON_DECLARATION_KEY
+                or intent.get("role") == "managed"
+                and declaration_key == INITIAL_CRON_DECLARATION_KEY
+                or intent.get("role") == "restore"
+            ):
+                raise RuntimeError("Cron staging intent is outside managed declarations")
+            if bucket_name == "cronRestoreIntents" and intent.get("role") != "restore":
+                raise RuntimeError("Cron restore intent role is invalid")
+            fingerprint = intent.get("preAlertContractSha256")
+            if not isinstance(fingerprint, str) \
+                    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
+                raise RuntimeError("Cron intent contract receipt is malformed")
+            if bucket_name == "cronRestoreIntents":
+                identity = intent.get("stagingName")
+                canonical_name = intent.get("canonicalName")
+                canonical_description = intent.get("canonicalDescription")
+                if intent.get("schema") != "qwen-local.cron-restore-intent.v1" \
+                        or not isinstance(identity, str) or not identity \
+                        or not isinstance(canonical_name, str) or not canonical_name \
+                        or canonical_description is not None and (
+                            not isinstance(canonical_description, str)
+                            or not canonical_description
+                        ):
+                    raise RuntimeError("Cron restore intent contract receipt is malformed")
+            else:
+                identity = intent.get("stagingDescription")
+                canonical_description = intent.get("canonicalDescription")
+                if intent.get("schema") != "qwen-local.cron-intent.v1" \
+                        or not isinstance(identity, str) or not identity \
+                        or not isinstance(canonical_description, str) \
+                        or not canonical_description:
+                    raise RuntimeError("Cron intent contract receipt is malformed")
+            if identity in staging_identities:
+                raise RuntimeError("Cron intent staging identity is duplicated")
+            staging_identities.add(identity)
+            job_id = intent.get("jobId")
+            if job_id is not None and (
+                not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+            ):
+                raise RuntimeError("Cron intent job id receipt is malformed")
+            validated[declaration_key] = intent
+        return validated
+
+    def _managed_intent_lifecycle_contracts(
+        self, intent: dict[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        """Recompute every installer-created state authorized by one durable intent."""
+        declaration_key = intent.get("declarationKey")
+        role = intent.get("role")
+        staging_description = intent.get("stagingDescription")
+        canonical_description = intent.get("canonicalDescription")
+        allowed_fields = {
+            "schema", "declarationKey", "role", "stagingDescription",
+            "canonicalDescription", "preAlertContractSha256", "jobId", "configured",
+        }
+        if role == "initial":
+            allowed_fields.add("scheduledAt")
+        if set(intent) - allowed_fields or (
+            "configured" in intent and intent.get("configured") is not True
+        ):
+            raise RuntimeError("Cron staging intent receipt has unsupported fields")
+        if not isinstance(staging_description, str) \
+                or not isinstance(canonical_description, str) \
+                or re.fullmatch(
+                    re.escape(canonical_description)
+                    + r" \[qwen-stage:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\]",
+                    staging_description,
+                ) is None:
+            raise RuntimeError("Cron staging intent nonce is malformed")
+
+        if role == "managed" and declaration_key in {
+            CRON_DECLARATION_KEY, SNAPSHOT_CRON_DECLARATION_KEY,
+        }:
+            spec = (
+                self._incremental_spec()
+                if declaration_key == CRON_DECLARATION_KEY
+                else self._snapshot_spec()
+            )
+            if canonical_description != spec.description:
+                raise RuntimeError("Cron staging intent canonical contract drifted")
+            staged = self._managed_pre_alert_definition(spec, staging_description)
+            alert_spec = spec
+        elif role == "initial" and declaration_key == INITIAL_CRON_DECLARATION_KEY:
+            scheduled_at = intent.get("scheduledAt")
+            if not isinstance(scheduled_at, str) or not scheduled_at:
+                raise RuntimeError("Initial cron staging intent schedule is malformed")
+            try:
+                parsed_at = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise RuntimeError("Initial cron staging intent schedule is malformed") from error
+            canonical_at = parsed_at.astimezone(timezone.utc).isoformat(
+                timespec="milliseconds"
+            ).replace("+00:00", "Z") if parsed_at.tzinfo is not None else None
+            if canonical_at != scheduled_at \
+                    or canonical_description != INITIAL_CRON_DESCRIPTION:
+                raise RuntimeError("Initial cron staging intent canonical contract drifted")
+            staged = self._initial_pre_alert_definition(staging_description, scheduled_at)
+            alert_spec = self._incremental_spec()
+        else:
+            raise RuntimeError("Cron staging intent is outside installer-managed roles")
+
+        if _staging_contract_hash(staged) != intent.get("preAlertContractSha256"):
+            raise RuntimeError("Cron staging intent semantic receipt drifted")
+        alert = {
+            "after": 1,
+            "cooldownMs": 3600000,
+            "includeSkipped": False,
+            "mode": "announce",
+            "channel": alert_spec.report_channel,
+            "to": alert_spec.report_to,
+            "accountId": alert_spec.report_account_id,
+        }
+        staged_alerted = json.loads(json.dumps(staged))
+        staged_alerted["failureAlert"] = alert
+        configured_disabled = json.loads(json.dumps(staged_alerted))
+        configured_disabled["description"] = canonical_description
+        configured_enabled = json.loads(json.dumps(configured_disabled))
+        configured_enabled["enabled"] = True
+        return staged, staged_alerted, configured_disabled, configured_enabled
+
+    def _managed_intent_lifecycle_matches(
+        self, job: dict[str, Any], intent: dict[str, Any],
+    ) -> bool:
+        actual_hash = _staging_contract_hash(job)
+        return any(
+            actual_hash == _staging_contract_hash(candidate)
+            for candidate in self._managed_intent_lifecycle_contracts(intent)
+        )
+
+    def _activation_fail_safe_plan(
+        self, transaction: dict[str, Any],
+    ) -> dict[str, tuple[dict[str, Any], str, str]]:
+        """Validate durable exact-ID authority for an interrupted activation."""
+        if transaction.get("contractVersion") != INTEGRATION_CONTRACT_VERSION \
+                or transaction.get("ownership") != self._ownership_payload() \
+                or transaction.get("phase") not in {
+                    "activation_pending", "commit_closeout_pending", "failed",
+                    "rollback_failed", "committed",
+                }:
+            raise RuntimeError("Activation fail-safe transaction authority is invalid")
+        if transaction.get("activationFailSafeRequired") is not True:
+            raise RuntimeError("Activation fail-safe is not durably armed")
+        self._validate_replacement_receipt_graph(transaction)
+        intents = self._validated_cron_intent_receipts(
+            transaction, "cronStagingIntents",
+        )
+        expected_by_key: dict[str, str | None] = {
+            CRON_DECLARATION_KEY: transaction.get("cronId"),
+            SNAPSHOT_CRON_DECLARATION_KEY: transaction.get("snapshotCronId"),
+        }
+        index_state = transaction.get("indexState")
+        if index_state == "INDEX_BUILDING":
+            expected_by_key[INITIAL_CRON_DECLARATION_KEY] = transaction.get(
+                "initialIndexJobId"
+            )
+        elif index_state == "READY":
+            if transaction.get("initialIndexJobId") is not None:
+                raise RuntimeError("Activation fail-safe READY receipt has an initial job")
+        else:
+            raise RuntimeError("Activation fail-safe index state is invalid")
+        if set(intents) != set(expected_by_key):
+            raise RuntimeError("Activation fail-safe intent topology is incomplete")
+
+        plan: dict[str, tuple[dict[str, Any], str, str]] = {}
+        for declaration_key, raw_job_id in expected_by_key.items():
+            if not isinstance(raw_job_id, str) \
+                    or not SAFE_CRON_JOB_ID_RE.fullmatch(raw_job_id):
+                raise RuntimeError("Activation fail-safe job id receipt is malformed")
+            intent = intents[declaration_key]
+            if intent.get("jobId") != raw_job_id or intent.get("configured") is not True:
+                raise RuntimeError("Activation fail-safe intent id receipt is incomplete")
+            lifecycle = self._managed_intent_lifecycle_contracts(intent)
+            if raw_job_id in plan:
+                raise RuntimeError("Activation fail-safe job id authority overlaps")
+            plan[raw_job_id] = (
+                intent,
+                _staging_contract_hash(lifecycle[2]),
+                _staging_contract_hash(lifecycle[3]),
+            )
+
+        managed_ids = transaction.get("managedCronIdsAfter")
+        if not isinstance(managed_ids, list) \
+                or any(
+                    not isinstance(job_id, str)
+                    or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    for job_id in managed_ids
+                ) \
+                or len(managed_ids) != len(set(managed_ids)) \
+                or set(managed_ids) != set(plan):
+            raise RuntimeError("Activation fail-safe managed id receipt is inconsistent")
+        disabled_ids = transaction.get("activationFailSafeDisabledCronIds", [])
+        if not isinstance(disabled_ids, list) \
+                or any(
+                    not isinstance(job_id, str)
+                    or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    for job_id in disabled_ids
+                ) \
+                or len(disabled_ids) != len(set(disabled_ids)) \
+                or not set(disabled_ids).issubset(plan):
+            raise RuntimeError("Activation fail-safe progress receipt is malformed")
+        if type(transaction.get("activationFailSafeComplete", False)) is not bool:
+            raise RuntimeError("Activation fail-safe completion receipt is malformed")
+        return plan
+
+    def _disable_uncommitted_managed_jobs_for_activation_failure(
+        self, transaction: dict[str, Any],
+    ) -> None:
+        """Disable every durably checkpointed new job before strict rollback checks."""
+        plan = self._activation_fail_safe_plan(transaction)
+        errors: list[Exception] = []
+        progress = json.loads(json.dumps(transaction))
+        progress["activationFailSafeStarted"] = True
+        progress["activationFailSafeComplete"] = False
+        try:
+            self.store.write(progress)
+        except Exception as error:
+            # The already-durable armed receipt remains exact disable authority.
+            # A progress-marker failure must not leave later managed jobs enabled.
+            errors.append(error)
+        for job_id in sorted(plan):
+            try:
+                persisted = self.store.read()
+                persisted_plan = self._activation_fail_safe_plan(persisted)
+                if persisted_plan != plan:
+                    raise RuntimeError("Activation fail-safe durable authority drifted")
+                current_jobs = self._inventory()
+                current = next(
+                    (job for job in current_jobs if str(job["id"]) == job_id), None,
+                )
+                if current is None:
+                    raise RuntimeError("Activation fail-safe target disappeared")
+                _, disabled_hash, enabled_hash = plan[job_id]
+                current_hash = _staging_contract_hash(current)
+                if current_hash not in {disabled_hash, enabled_hash}:
+                    raise RuntimeError("Activation fail-safe target lifecycle drifted")
+                if current_hash == enabled_hash:
+                    self._edit_cron_with_snapshot_guard(
+                        job_id,
+                        ["cron", "edit", job_id, "--disable"],
+                        before=lambda job, expected=enabled_hash: _staging_contract_hash(
+                            job
+                        ) == expected,
+                        after=lambda job, expected=disabled_hash: _staging_contract_hash(
+                            job
+                        ) == expected,
+                        label="Activation failure compensation",
+                    )
+                verified = next(
+                    (job for job in self._inventory() if str(job["id"]) == job_id),
+                    None,
+                )
+                if verified is None or _staging_contract_hash(verified) != disabled_hash:
+                    raise RuntimeError("Activation fail-safe target did not remain disabled")
+                if self._runtime_job_active(verified):
+                    raise RuntimeError("Activation fail-safe target remained active")
+                disabled_ids = persisted.setdefault(
+                    "activationFailSafeDisabledCronIds", []
+                )
+                if job_id not in disabled_ids:
+                    disabled_ids.append(job_id)
+                    disabled_ids.sort()
+                persisted["activationFailSafeStarted"] = True
+                persisted["activationFailSafeComplete"] = False
+                self.store.write(persisted)
+            except Exception as error:
+                errors.append(error)
+
+        try:
+            self._wait_for_quiesced_jobs(set(plan))
+        except Exception as error:
+            errors.append(error)
+        final_jobs = self._inventory()
+        final_by_id = {str(job["id"]): job for job in final_jobs}
+        completed = self.store.read()
+        for job_id, (_, disabled_hash, _) in plan.items():
+            job = final_by_id.get(job_id)
+            try:
+                if job is None:
+                    raise RuntimeError("Activation fail-safe target is missing at closeout")
+                if _staging_contract_hash(job) != disabled_hash \
+                        or self._runtime_job_active(job):
+                    raise RuntimeError(
+                        "Activation fail-safe did not quiesce every managed job"
+                    )
+            except Exception as error:
+                errors.append(error)
+        try:
+            if self._activation_fail_safe_plan(completed) != plan:
+                raise RuntimeError(
+                    "Activation fail-safe durable authority drifted at closeout"
+                )
+        except Exception as error:
+            errors.append(error)
+        safe_ids: set[str] = set()
+        for job_id, (_, disabled_hash, _) in plan.items():
+            job = final_by_id.get(job_id)
+            if job is None:
+                continue
+            try:
+                if _staging_contract_hash(job) == disabled_hash \
+                        and not self._runtime_job_active(job):
+                    safe_ids.add(job_id)
+            except Exception:
+                continue
+        disabled_receipt = completed.setdefault(
+            "activationFailSafeDisabledCronIds", []
+        )
+        for job_id in sorted(safe_ids):
+            if job_id not in disabled_receipt:
+                disabled_receipt.append(job_id)
+        disabled_receipt.sort()
+        completed["activationFailSafeStarted"] = True
+        completed["activationFailSafeComplete"] = not errors \
+            and set(disabled_receipt) == set(plan)
+        self.store.write(completed)
+        transaction.clear()
+        transaction.update(completed)
+        if errors:
+            raise RuntimeError(
+                f"Activation fail-safe compensation was incomplete ({len(errors)} errors)"
+            ) from errors[0]
+
+    def _validate_replacement_receipt_graph(
+        self, transaction: dict[str, Any],
+    ) -> bool:
+        """Cross-bind phase-sensitive replacement receipts for new transactions."""
+        raw_phase = transaction.get("phase")
+        if raw_phase in {"failed", "rollback_failed"}:
+            effective_phase = transaction.get("failurePhase")
+        elif raw_phase == "rolled_back":
+            effective_phase = transaction.get("rollbackOriginPhase")
+        else:
+            effective_phase = raw_phase
+        pre_replace_phases = {
+            "prepared", "preflight_complete", "quiescing", "quiesced",
+            "staging", "activating",
+        }
+        post_replace_phases = {
+            "staging_managed_cron", "restarting_gateway", "activation_pending",
+            "commit_closeout_pending", "committed",
+        }
+        recognized_phases = pre_replace_phases | {
+            "replacing_managed_cron",
+        } | post_replace_phases
+        new_only_phases = {
+            "replacing_managed_cron", "staging_managed_cron",
+            "restarting_gateway", "activation_pending", "commit_closeout_pending",
+        }
+        receipt_fields = {
+            "cronInventoryTotalBefore", "disabledGeminiJobs",
+            "cronReplaceIdsBefore", "removedManagedCronIdsBeforeAdd",
+        }
+        if not (receipt_fields & set(transaction)):
+            committed_new_format = raw_phase == "committed" and (
+                transaction.get("cronContractHashVersion")
+                == CRON_CONTRACT_HASH_VERSION
+                or any(key.startswith("cronCommit") for key in transaction)
+            )
+            if effective_phase in new_only_phases \
+                    or transaction.get("activationFailSafeRequired") is True \
+                    or committed_new_format:
+                raise RuntimeError(
+                    "Cron replacement receipt graph is missing for its effective phase"
+                )
+            return False
+        if raw_phase in {"failed", "rollback_failed", "rolled_back"}:
+            if not isinstance(effective_phase, str) \
+                    or effective_phase not in recognized_phases:
+                raise RuntimeError(
+                    "Cron replacement terminal phase authority is missing or unknown"
+                )
+        elif raw_phase not in recognized_phases:
+            raise RuntimeError("Cron replacement transaction phase is unknown")
+        inventory_before = transaction.get("cronInventoryHashesBefore")
+        unknown_before = transaction.get("cronUnknownHashesBefore")
+        target_ids = transaction.get("cronTargetIdsBefore")
+        raw_definitions = transaction.get("cronDefinitionsBefore")
+        total_before = transaction.get("cronInventoryTotalBefore")
+        disabled_gemini = transaction.get("disabledGeminiJobs")
+        preserved_gemini_hashes = transaction.get(
+            "cronPreservedGeminiHashesAfterQuiesce"
+        )
+        if not isinstance(inventory_before, dict) \
+                or any(
+                    not isinstance(job_id, str)
+                    or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    or not isinstance(fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                    for job_id, fingerprint in inventory_before.items()
+                ) \
+                or not isinstance(unknown_before, dict) \
+                or any(
+                    not isinstance(job_id, str)
+                    or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    or not isinstance(fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                    for job_id, fingerprint in unknown_before.items()
+                ) \
+                or not isinstance(target_ids, list) \
+                or any(
+                    not isinstance(job_id, str)
+                    or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    for job_id in target_ids
+                ) \
+                or len(target_ids) != len(set(target_ids)) \
+                or type(total_before) is not int \
+                or total_before != len(inventory_before) \
+                or not isinstance(raw_definitions, list) \
+                or any(not isinstance(item, dict) for item in raw_definitions) \
+                or not isinstance(disabled_gemini, list) \
+                or not isinstance(preserved_gemini_hashes, dict) \
+                or any(
+                    not isinstance(job_id, str)
+                    or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    or not isinstance(fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                    for job_id, fingerprint in preserved_gemini_hashes.items()
+                ):
+            raise RuntimeError("Cron replacement receipt graph is malformed")
+        definitions = [_job_definition(item) for item in raw_definitions]
+        definitions_by_id = {str(item["id"]): item for item in definitions}
+        if len(definitions_by_id) != len(definitions):
+            raise RuntimeError("Cron replacement definition ids are duplicated")
+        target_set = set(target_ids)
+        unknown_set = set(unknown_before)
+        if target_set != set(definitions_by_id) \
+                or target_set & unknown_set \
+                or set(inventory_before) != target_set | unknown_set \
+                or any(
+                    inventory_before.get(job_id) != fingerprint
+                    for job_id, fingerprint in unknown_before.items()
+                ):
+            raise RuntimeError("Cron replacement ownership partition is inconsistent")
+        for job_id, definition in definitions_by_id.items():
+            if inventory_before.get(job_id) != _job_contract_hash(
+                definition, include_id=True,
+            ):
+                raise RuntimeError(
+                    "Cron replacement definition fingerprint is inconsistent"
+                )
+        expected_replace_ids = sorted(
+            job_id for job_id, definition in definitions_by_id.items()
+            if definition.get("declarationKey") in MANAGED_CRON_KEYS
+        )
+        expected_disabled_gemini = sorted(
+            (
+                {"id": job_id, "wasEnabled": True}
+                for job_id, definition in definitions_by_id.items()
+                if definition.get("declarationKey") == GEMINI_DECLARATION_KEY
+                and definition.get("enabled") is True
+            ),
+            key=lambda item: item["id"],
+        )
+        expected_preserved_gemini_hashes: dict[str, str] = {}
+        for job_id, definition in definitions_by_id.items():
+            if definition.get("declarationKey") != GEMINI_DECLARATION_KEY:
+                continue
+            expected_disabled = json.loads(json.dumps(definition))
+            expected_disabled["enabled"] = False
+            expected_preserved_gemini_hashes[job_id] = _job_contract_hash(
+                expected_disabled, include_id=True,
+            )
+        if preserved_gemini_hashes != expected_preserved_gemini_hashes:
+            raise RuntimeError(
+                "Cron replacement preserved Gemini receipt is inconsistent"
+            )
+        if any(
+            not isinstance(item, dict)
+            or set(item) != {"id", "wasEnabled"}
+            or not isinstance(item.get("id"), str)
+            or not SAFE_CRON_JOB_ID_RE.fullmatch(item["id"])
+            or item.get("wasEnabled") is not True
+            for item in disabled_gemini
+        ) \
+                or sorted(disabled_gemini, key=lambda item: item["id"]) \
+                != expected_disabled_gemini:
+            raise RuntimeError("Cron replacement Gemini disable receipt is inconsistent")
+
+        replace_ids = transaction.get("cronReplaceIdsBefore")
+        removed_ids = transaction.get("removedManagedCronIdsBeforeAdd")
+        for key, value, label in (
+            ("cronReplaceIdsBefore", replace_ids, "replace"),
+            ("removedManagedCronIdsBeforeAdd", removed_ids, "removed"),
+        ):
+            if key in transaction and (
+                not isinstance(value, list)
+                or any(
+                    not isinstance(job_id, str)
+                    or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    for job_id in value
+                )
+                or len(value) != len(set(value))
+                or value != expected_replace_ids
+            ):
+                raise RuntimeError(
+                    f"Cron replacement {label} id receipt is inconsistent"
+                )
+
+        replace_present = "cronReplaceIdsBefore" in transaction
+        removed_present = "removedManagedCronIdsBeforeAdd" in transaction
+        if effective_phase in pre_replace_phases and (
+            replace_present or removed_present
+        ):
+            raise RuntimeError("Cron replacement receipts precede their authorized phase")
+        if effective_phase == "replacing_managed_cron" and (
+            replace_ids != expected_replace_ids or removed_present
+        ):
+            raise RuntimeError(
+                "Cron replacement durable ids or phase boundary are inconsistent"
+            )
+        if effective_phase in post_replace_phases and (
+            not replace_present or not removed_present
+            or replace_ids != expected_replace_ids
+            or removed_ids != expected_replace_ids
+        ):
+            raise RuntimeError("Cron replacement completion receipts are missing")
+        return True
+
+    def _apply_managed_spec(
+        self,
+        spec: ManagedCronSpec,
+        transaction: dict[str, Any],
+        *,
+        enable: bool = False,
+    ) -> str:
+        intent = self._ensure_cron_intent(
+            transaction,
+            bucket_name="cronStagingIntents",
+            declaration_key=spec.key,
+            canonical_description=spec.description,
+            role="managed",
+            expected_factory=lambda description: self._managed_pre_alert_definition(
+                spec, description,
+            ),
+        )
+        if intent.get("jobId") is not None:
+            raise RuntimeError(f"Managed cron {spec.key} staging id already exists")
+        jobs = self._inventory()
+        candidate = self._uncheckpointed_intent_candidate(intent, jobs)
+        if candidate is not None:
+            job_id = self._validate_intent_candidate_authority(
+                transaction, intent, candidate,
+            )
+        else:
+            if self._job_by_key(jobs, spec.key) is not None:
+                raise RuntimeError(f"Managed cron {spec.key} appeared before authorized add")
+            returned_id = self._job_id_from_add(self.cli.json(spec.add_args(
+                disabled=True, description=intent["stagingDescription"],
+            )))
+            after_add = self._inventory()
+            candidate = self._uncheckpointed_intent_candidate(intent, after_add)
+            if candidate is None:
+                raise RuntimeError(f"Managed cron {spec.key} add lacked an exact staging job")
+            job_id = self._validate_intent_candidate_authority(
+                transaction, intent, candidate,
+                returned_id=returned_id, jobs_before_add=jobs,
+                jobs_after_add=after_add,
+            )
+        self._checkpoint_cron_intent_job_id(
+            transaction,
+            bucket_name="cronStagingIntents",
+            declaration_key=spec.key,
+            job_id=job_id,
+            created=True,
+        )
+        staged = next((job for job in self._inventory() if str(job["id"]) == job_id), None)
+        if staged is None or _staging_contract_hash(staged) != intent["preAlertContractSha256"]:
+            raise RuntimeError(f"Managed cron {spec.key} failed staged readback verification")
+        lifecycle = self._managed_intent_lifecycle_contracts(intent)
+        self._edit_cron_with_snapshot_guard(
+            job_id,
+            spec.alert_args(job_id),
+            before=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                lifecycle[0]
+            ),
+            after=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                lifecycle[1]
+            ),
+            label=f"Managed {spec.key} alert",
+        )
+        self._edit_cron_with_snapshot_guard(
+            job_id,
+            ["cron", "edit", job_id, "--description", spec.description, "--disable"],
+            before=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                lifecycle[1]
+            ),
+            after=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                lifecycle[2]
+            ),
+            label=f"Managed {spec.key} description",
+        )
         disabled = self._job_by_key(self._inventory(), spec.key)
         if disabled is None or disabled.get("id") != job_id or not _job_matches_spec(
             disabled, spec, require_enabled=False
         ):
             raise RuntimeError(f"Managed cron {spec.key} failed disabled readback verification")
         if enable:
-            self.cli.run(["cron", "edit", job_id, "--enable"])
+            self._edit_cron_with_snapshot_guard(
+                job_id,
+                ["cron", "edit", job_id, "--enable"],
+                before=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                    lifecycle[2]
+                ),
+                after=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                    lifecycle[3]
+                ),
+                label=f"Managed {spec.key} activation",
+            )
             enabled = self._job_by_key(self._inventory(), spec.key)
             if enabled is None or enabled.get("id") != job_id or not _job_matches_spec(
                 enabled, spec, require_enabled=True
             ):
                 raise RuntimeError(f"Managed cron {spec.key} failed enabled readback verification")
+        intent["configured"] = True
+        self.store.write(transaction)
         return job_id
 
     def _verify_recurring_specs(self, *, enabled: bool) -> list[dict[str, Any]]:
@@ -3900,13 +5352,34 @@ class IntegrationManager:
     def _enable_recurring_jobs(self, job_ids: list[str]) -> None:
         if len(job_ids) != 2 or len(set(job_ids)) != 2:
             raise RuntimeError("Recurring cron activation set is incomplete")
-        for job_id in job_ids:
-            self.cli.run(["cron", "edit", job_id, "--enable"])
+        for job_id, spec in zip(
+            job_ids, (self._incremental_spec(), self._snapshot_spec()),
+        ):
+            self._edit_cron_with_snapshot_guard(
+                job_id,
+                ["cron", "edit", job_id, "--enable"],
+                before=lambda job, expected=spec: _job_matches_spec(
+                    job, expected, require_enabled=False,
+                ),
+                after=lambda job, expected=spec: _job_matches_spec(
+                    job, expected, require_enabled=True,
+                ),
+                label=f"Recurring {spec.key} activation",
+            )
         self._verify_recurring_specs(enabled=True)
 
     def create_incremental_cron(self) -> str:
-        """Backward-compatible entry point; current installs use exact reconciliation."""
-        job_id = self._apply_managed_spec(self._incremental_spec(), enable=True)
+        """Compatibility lookup that never creates cron outside a committed transaction."""
+        transaction = self.store.read()
+        if transaction.get("contractVersion") != INTEGRATION_CONTRACT_VERSION \
+                or transaction.get("phase") != "committed":
+            raise RuntimeError(
+                "Incremental cron creation requires the transactional integration workflow"
+            )
+        self.verify()
+        job_id = transaction.get("cronId")
+        if not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id):
+            raise RuntimeError("Committed incremental cron id is malformed")
         return job_id
 
     def disable_owned_gemini_jobs(self) -> list[dict[str, Any]]:
@@ -3914,11 +5387,26 @@ class IntegrationManager:
         disabled = []
         for job in self._owned_gemini_jobs_exact(jobs):
             if job.get("enabled", True):
-                self.cli.run(["cron", "disable", str(job["id"])])
-                disabled.append({"id": str(job["id"]), "wasEnabled": True})
+                job_id = str(job["id"])
+                expected_disabled = json.loads(json.dumps(job))
+                expected_disabled["enabled"] = False
+                self._edit_cron_with_snapshot_guard(
+                    job_id,
+                    ["cron", "edit", job_id, "--disable"],
+                    before=lambda current, expected=job: _job_contract_hash(
+                        current, include_id=True,
+                    ) == _job_contract_hash(expected, include_id=True),
+                    after=lambda current, expected=expected_disabled: _job_contract_hash(
+                        current, include_id=True,
+                    ) == _job_contract_hash(expected, include_id=True),
+                    label="Gemini quiescence",
+                )
+                disabled.append({"id": job_id, "wasEnabled": True})
         return disabled
 
-    def begin(self) -> dict[str, Any]:
+    def begin(
+        self, *, cron_inventory_hashes: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         if self.store.manifest_path.is_file() and not self.store.manifest_path.is_symlink():
             prior = self.store.read()
             if prior.get("phase") == "rolled_back":
@@ -3935,11 +5423,26 @@ class IntegrationManager:
                     Path(backup_path), (run_dev, run_ino), marker_sha256,
                 )
         self.preflight()
+        if cron_inventory_hashes is None:
+            cron_inventory_hashes = self._inventory_hashes(self._inventory())
+        if not isinstance(cron_inventory_hashes, dict) or any(
+            not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+            or not isinstance(fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+            for job_id, fingerprint in cron_inventory_hashes.items()
+        ):
+            raise RuntimeError("Prepared cron inventory receipt is malformed")
         snapshot = self.snapshot()
         payload = {
             "schemaVersion": SCHEMA_VERSION, "runId": str(uuid.uuid4()), "phase": "prepared",
             "contractVersion": INTEGRATION_CONTRACT_VERSION,
-            "ownedAssets": [], **snapshot,
+            "ownedAssets": [],
+            "ownership": self._ownership_payload(),
+            "cronMutationStarted": False,
+            "runtimeMutationStarted": False,
+            "cronInventoryHashesBefore": dict(cron_inventory_hashes),
+            "cronUnknownHashesBefore": dict(cron_inventory_hashes),
+            **snapshot,
         }
         self.store.write(payload)
         return payload
@@ -4033,7 +5536,42 @@ class IntegrationManager:
             raise RuntimeError("Project allowlist exceeds the supported limit")
         return projects
 
-    def mark_ready_or_schedule_build(self) -> tuple[str, str | None]:
+    def _initial_pre_alert_definition(
+        self, staging_description: str, scheduled_at: str,
+    ) -> dict[str, Any]:
+        return {
+            "name": "Qwen local knowledge initial full index",
+            "description": staging_description,
+            "enabled": False,
+            "declarationKey": INITIAL_CRON_DECLARATION_KEY,
+            "schedule": {"kind": "at", "at": scheduled_at},
+            "payload": {
+                "kind": "command",
+                "argv": [
+                    str(self.paths.project_root / "scripts/knowledge_index_full.sh"),
+                    str(self.ownership_manifest),
+                ],
+                "cwd": str(self.paths.project_root),
+                "timeoutSeconds": 86400,
+                "noOutputTimeoutSeconds": 1800,
+                "outputMaxBytes": 65536,
+                "env": {
+                    "QWEN_OWNERSHIP_MANIFEST": str(self.ownership_manifest),
+                    "QWEN_PYTHON": str(self.python_path),
+                    "OPENCLAW_LANCEDB_ROOT": str(self.paths.project_root),
+                },
+            },
+            "delivery": {"mode": "none"},
+            "failureAlert": None,
+            "sessionTarget": "isolated",
+            "sessionKey": None,
+            "agentId": None,
+            "deleteAfterRun": True,
+        }
+
+    def mark_ready_or_schedule_build(
+        self, transaction: dict[str, Any],
+    ) -> tuple[str, str | None]:
         cli_path = self.paths.project_root / "src/cli.js"
         audit = subprocess.run([str(self.node_path), str(cli_path), "audit", "--mark-ready"],
                                cwd=self.paths.project_root, shell=False, check=False,
@@ -4041,33 +5579,115 @@ class IntegrationManager:
         if audit.returncode == 0:
             existing = self._job_by_key(self._inventory(), INITIAL_CRON_DECLARATION_KEY)
             if existing is not None:
-                self.cli.run(["cron", "rm", str(existing["id"])])
+                raise RuntimeError("Initial cron appeared without durable add authority")
             return "READY", None
         full_script = self.paths.project_root / "scripts/knowledge_index_full.sh"
         if full_script.is_symlink() or not full_script.is_file():
             raise RuntimeError("Initial index wrapper is missing or unsafe")
         argv = [str(full_script), str(self.ownership_manifest)]
-        payload = self.cli.json([
-            "cron", "add", "--name", "Qwen local knowledge initial full index",
-            "--description", INITIAL_CRON_DESCRIPTION, "--session", "isolated", "--at", "+5m",
-            "--command-argv", json.dumps(argv, separators=(",", ":")),
-            "--command-cwd", str(self.paths.project_root), "--timeout-seconds", "86400",
-            "--no-output-timeout-seconds", "1800", "--output-max-bytes", "65536",
-            "--command-env", f"QWEN_OWNERSHIP_MANIFEST={self.ownership_manifest}",
-            "--command-env", f"QWEN_PYTHON={self.python_path}",
-            "--command-env", f"OPENCLAW_LANCEDB_ROOT={self.paths.project_root}",
-            "--declaration-key", INITIAL_CRON_DECLARATION_KEY,
-            "--delete-after-run", "--no-deliver", "--disabled", "--json",
-        ])
-        job_id = self._job_id_from_add(payload)
+        raw_bucket = transaction.get("cronStagingIntents")
+        raw_existing = raw_bucket.get(INITIAL_CRON_DECLARATION_KEY) \
+            if isinstance(raw_bucket, dict) else None
+        if isinstance(raw_existing, dict) and isinstance(raw_existing.get("scheduledAt"), str):
+            scheduled_at = raw_existing["scheduledAt"]
+        else:
+            scheduled_at = (
+                datetime.now(timezone.utc) + timedelta(minutes=5)
+            ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        intent = self._ensure_cron_intent(
+            transaction,
+            bucket_name="cronStagingIntents",
+            declaration_key=INITIAL_CRON_DECLARATION_KEY,
+            canonical_description=INITIAL_CRON_DESCRIPTION,
+            role="initial",
+            expected_factory=lambda description: self._initial_pre_alert_definition(
+                description, scheduled_at,
+            ),
+            extra_fields={"scheduledAt": scheduled_at},
+        )
+        if intent.get("jobId") is not None:
+            raise RuntimeError("Initial cron staging id already exists")
+        jobs = self._inventory()
+        candidate = self._uncheckpointed_intent_candidate(intent, jobs)
+        if candidate is not None:
+            job_id = self._validate_intent_candidate_authority(
+                transaction, intent, candidate,
+            )
+        else:
+            if self._job_by_key(jobs, INITIAL_CRON_DECLARATION_KEY) is not None:
+                raise RuntimeError("Initial cron appeared before authorized add")
+            payload = self.cli.json([
+                "cron", "add", "--name", "Qwen local knowledge initial full index",
+                "--description", intent["stagingDescription"], "--session", "isolated",
+                "--at", scheduled_at,
+                "--command-argv", json.dumps(argv, separators=(",", ":")),
+                "--command-cwd", str(self.paths.project_root), "--timeout-seconds", "86400",
+                "--no-output-timeout-seconds", "1800", "--output-max-bytes", "65536",
+                "--command-env", f"QWEN_OWNERSHIP_MANIFEST={self.ownership_manifest}",
+                "--command-env", f"QWEN_PYTHON={self.python_path}",
+                "--command-env", f"OPENCLAW_LANCEDB_ROOT={self.paths.project_root}",
+                "--declaration-key", INITIAL_CRON_DECLARATION_KEY,
+                "--delete-after-run", "--wake", "now", "--no-deliver", "--disabled", "--json",
+            ])
+            returned_id = self._job_id_from_add(payload)
+            after_add = self._inventory()
+            candidate = self._uncheckpointed_intent_candidate(intent, after_add)
+            if candidate is None:
+                raise RuntimeError("Initial cron add lacked an exact staging job")
+            job_id = self._validate_intent_candidate_authority(
+                transaction, intent, candidate,
+                returned_id=returned_id, jobs_before_add=jobs,
+                jobs_after_add=after_add,
+            )
+        self._checkpoint_cron_intent_job_id(
+            transaction,
+            bucket_name="cronStagingIntents",
+            declaration_key=INITIAL_CRON_DECLARATION_KEY,
+            job_id=job_id,
+            created=True,
+        )
+        staged = next((job for job in self._inventory() if str(job["id"]) == job_id), None)
+        if staged is None or _staging_contract_hash(staged) != intent["preAlertContractSha256"]:
+            raise RuntimeError("Initial index job failed staged readback verification")
         alert_spec = self._incremental_spec()
-        self.cli.run(alert_spec.alert_args(job_id))
+        lifecycle = self._managed_intent_lifecycle_contracts(intent)
+        self._edit_cron_with_snapshot_guard(
+            job_id,
+            alert_spec.alert_args(job_id),
+            before=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                lifecycle[0]
+            ),
+            after=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                lifecycle[1]
+            ),
+            label="Initial index alert",
+        )
+        self._edit_cron_with_snapshot_guard(
+            job_id,
+            [
+                "cron", "edit", job_id, "--description", INITIAL_CRON_DESCRIPTION,
+                "--disable",
+            ],
+            before=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                lifecycle[1]
+            ),
+            after=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                lifecycle[2]
+            ),
+            label="Initial index description",
+        )
         job = self._job_by_key(self._inventory(), INITIAL_CRON_DECLARATION_KEY)
         if job is None or job.get("id") != job_id or not self._initial_job_matches(job, enabled=False):
             raise RuntimeError("Initial index job failed disabled readback verification")
+        intent["configured"] = True
+        self.store.write(transaction)
         return "INDEX_BUILDING", job_id
 
     def _initial_job_matches(self, job: dict[str, Any], *, enabled: bool) -> bool:
+        try:
+            _job_definition(job)
+        except RuntimeError:
+            return False
         schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
         payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
         delivery = job.get("delivery") if isinstance(job.get("delivery"), dict) else {}
@@ -4078,10 +5698,12 @@ class IntegrationManager:
             "OPENCLAW_LANCEDB_ROOT": str(self.paths.project_root),
         }
         return (
-            job.get("declarationKey") == INITIAL_CRON_DECLARATION_KEY
+            _known_cron_top_level_contract(job)
+            and job.get("declarationKey") == INITIAL_CRON_DECLARATION_KEY
             and job.get("name") == "Qwen local knowledge initial full index"
             and job.get("description") == INITIAL_CRON_DESCRIPTION
-            and job.get("enabled", True) is enabled
+            and _default_cron_behavior_contract(job)
+            and job.get("enabled") is enabled
             and job.get("sessionTarget") == "isolated"
             and job.get("sessionKey") is None
             and job.get("agentId") is None
@@ -4117,7 +5739,13 @@ class IntegrationManager:
         )
 
     def _enable_initial_job(self, job_id: str) -> None:
-        self.cli.run(["cron", "edit", job_id, "--enable"])
+        self._edit_cron_with_snapshot_guard(
+            job_id,
+            ["cron", "edit", job_id, "--enable"],
+            before=lambda job: self._initial_job_matches(job, enabled=False),
+            after=lambda job: self._initial_job_matches(job, enabled=True),
+            label="Initial index activation",
+        )
         job = self._job_by_key(self._inventory(), INITIAL_CRON_DECLARATION_KEY)
         if job is None or job.get("id") != job_id or not self._initial_job_matches(job, enabled=True):
             raise RuntimeError("Initial index job did not enable cleanly")
@@ -4132,21 +5760,58 @@ class IntegrationManager:
         ], cwd=self.paths.project_root, shell=False, check=True, text=True,
             capture_output=True, timeout=120)
 
-    def _restore_cron_definition(self, definition: dict[str, Any]) -> str:
+    @staticmethod
+    def _restore_pre_alert_definition(
+        definition: dict[str, Any], staging_name: str,
+    ) -> dict[str, Any]:
+        staged = json.loads(json.dumps(_job_definition(definition)))
+        staged["name"] = staging_name
+        staged["enabled"] = False
+        staged["failureAlert"] = None
+        return staged
+
+    @classmethod
+    def _restore_lifecycle_matches(
+        cls,
+        job: dict[str, Any],
+        definition: dict[str, Any],
+        staging_name: str,
+    ) -> bool:
+        canonical = json.loads(json.dumps(_job_definition(definition)))
+        staged = cls._restore_pre_alert_definition(canonical, staging_name)
+        staged_alerted = json.loads(json.dumps(staged))
+        staged_alerted["failureAlert"] = canonical.get("failureAlert")
+        canonical_disabled = json.loads(json.dumps(canonical))
+        canonical_disabled["enabled"] = False
+        allowed = (staged, staged_alerted, canonical_disabled, canonical)
+        actual_hash = _staging_contract_hash(job)
+        return any(actual_hash == _staging_contract_hash(candidate) for candidate in allowed)
+
+    def _restore_cron_definition(
+        self, definition: dict[str, Any], transaction: dict[str, Any],
+    ) -> str:
         if _contains_forbidden_key(definition):
             raise RuntimeError("Refusing to restore an unsafe cron definition")
         name = definition.get("name")
+        description = definition.get("description")
+        declaration = definition.get("declarationKey")
         schedule = definition.get("schedule") if isinstance(definition.get("schedule"), dict) else {}
         payload = definition.get("payload") if isinstance(definition.get("payload"), dict) else {}
         argv = _job_argv(definition)
-        if not isinstance(name, str) or not name or not argv:
+        if not isinstance(name, str) or not name or not argv \
+                or description is not None \
+                and (not isinstance(description, str) or not description) \
+                or not isinstance(declaration, str) or not declaration:
             raise RuntimeError("Owned cron rollback definition is incomplete")
+        wake_mode = definition.get("wakeMode", "now")
+        if wake_mode != "now" or not _default_cron_behavior_contract(definition):
+            raise RuntimeError("Owned cron rollback behavior fields are not safely restorable")
         if payload.get("kind") != "command":
             raise RuntimeError("Owned cron rollback definition is not a command")
         if "toolsAllow" in payload:
             raise RuntimeError("Owned command cron rollback tools policy is not safely restorable")
-        args = ["cron", "add", "--name", name]
-        description = definition.get("description")
+        intent = self._ensure_restore_cron_intent(transaction, definition)
+        args = ["cron", "add", "--name", intent["stagingName"]]
         if isinstance(description, str):
             args.extend(["--description", description])
         session_target = definition.get("sessionTarget")
@@ -4183,9 +5848,7 @@ class IntegrationManager:
                 args.extend([option, str(payload[key])])
         for key, value in sorted(_job_env(definition).items()):
             args.extend(["--command-env", f"{key}={value}"])
-        declaration = definition.get("declarationKey")
-        if isinstance(declaration, str) and declaration:
-            args.extend(["--declaration-key", declaration])
+        args.extend(["--declaration-key", declaration, "--wake", wake_mode])
         delivery = definition.get("delivery") if isinstance(definition.get("delivery"), dict) else {}
         if delivery.get("mode") == "none":
             args.append("--no-deliver")
@@ -4200,8 +5863,83 @@ class IntegrationManager:
         if definition.get("deleteAfterRun") is True:
             args.append("--delete-after-run")
         args.extend(["--disabled", "--json"])
-        job_id = self._job_id_from_add(self.cli.json(args))
+        jobs = self._inventory()
+        checkpointed_id = intent.get("jobId")
+        if isinstance(checkpointed_id, str):
+            current = next(
+                (job for job in jobs if str(job["id"]) == checkpointed_id), None,
+            )
+            if current is None or not self._restore_lifecycle_matches(
+                current, definition, intent["stagingName"],
+            ):
+                raise RuntimeError("Checkpointed rollback restore job drifted")
+            job_id = checkpointed_id
+        else:
+            candidate = self._uncheckpointed_restore_intent_candidate(intent, jobs)
+            if candidate is not None:
+                job_id = self._validate_intent_candidate_authority(
+                    transaction, intent, candidate,
+                )
+            else:
+                if self._job_by_key(jobs, declaration) is not None:
+                    raise RuntimeError("Rollback restore declaration appeared without authority")
+                returned_id = self._job_id_from_add(self.cli.json(args))
+                after_add = self._inventory()
+                candidate = self._uncheckpointed_restore_intent_candidate(
+                    intent, after_add,
+                )
+                if candidate is None:
+                    raise RuntimeError("Rollback restore add lacked an exact staging job")
+                job_id = self._validate_intent_candidate_authority(
+                    transaction, intent, candidate,
+                    returned_id=returned_id, jobs_before_add=jobs,
+                    jobs_after_add=after_add,
+                )
+            self._checkpoint_cron_intent_job_id(
+                transaction,
+                bucket_name="cronRestoreIntents",
+                declaration_key=declaration,
+                job_id=job_id,
+                created=False,
+            )
+        current = next((job for job in self._inventory() if str(job["id"]) == job_id), None)
+        if current is None or not self._restore_lifecycle_matches(
+            current, definition, intent["stagingName"],
+        ):
+            raise RuntimeError("Rollback restore job failed staged lifecycle verification")
+        disabled_definition = json.loads(json.dumps(_job_definition(definition)))
+        disabled_definition["enabled"] = False
+        if _staging_contract_hash(current) == _staging_contract_hash(disabled_definition):
+            intent["configured"] = True
+            self.store.write(transaction)
+            return job_id
+        if _staging_contract_hash(current) == _staging_contract_hash(definition):
+            self._edit_cron_with_snapshot_guard(
+                job_id,
+                ["cron", "edit", job_id, "--disable"],
+                before=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                    definition
+                ),
+                after=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                    disabled_definition
+                ),
+                label="Rollback restore safe disable",
+            )
+            disabled = next(
+                (job for job in self._inventory() if str(job["id"]) == job_id), None,
+            )
+            if disabled is None or _job_contract_hash(disabled) != _job_contract_hash(
+                disabled_definition
+            ):
+                raise RuntimeError("Rollback restore job failed safe disable verification")
+            intent["configured"] = True
+            self.store.write(transaction)
+            return job_id
         alert = definition.get("failureAlert") if isinstance(definition.get("failureAlert"), dict) else None
+        staged_before_alert = self._restore_pre_alert_definition(
+            definition, intent["stagingName"],
+        )
+        staged_before_name = staged_before_alert
         if alert:
             edit = [
                 "cron", "edit", job_id, "--failure-alert",
@@ -4218,9 +5956,39 @@ class IntegrationManager:
                 edit.extend(["--failure-alert-to", alert["to"]])
             if isinstance(alert.get("accountId"), str):
                 edit.extend(["--failure-alert-account-id", alert["accountId"]])
-            self.cli.run(edit)
-        if definition.get("enabled", True) is True:
-            self.cli.run(["cron", "edit", job_id, "--enable"])
+            edit.append("--disable")
+            staged_after_alert = json.loads(json.dumps(staged_before_alert))
+            staged_after_alert["failureAlert"] = alert
+            self._edit_cron_with_snapshot_guard(
+                job_id,
+                edit,
+                before=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                    staged_before_alert
+                ),
+                after=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                    staged_after_alert
+                ),
+                label="Rollback restore alert",
+            )
+            staged_before_name = staged_after_alert
+        self._edit_cron_with_snapshot_guard(
+            job_id,
+            ["cron", "edit", job_id, "--name", name, "--disable"],
+            before=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                staged_before_name
+            ),
+            after=lambda job: _staging_contract_hash(job) == _staging_contract_hash(
+                disabled_definition
+            ),
+            label="Rollback restore canonical name",
+        )
+        restored = next((job for job in self._inventory() if str(job["id"]) == job_id), None)
+        if restored is None or _job_contract_hash(restored) != _job_contract_hash(
+            disabled_definition
+        ):
+            raise RuntimeError("Rollback restore job failed disabled readback verification")
+        intent["configured"] = True
+        self.store.write(transaction)
         return job_id
 
     def _verify_rollback_cron_state(
@@ -4229,6 +5997,7 @@ class IntegrationManager:
         prior_definitions: list[dict[str, Any]],
         restored_ids: list[str],
         unknown_hashes_before: dict[str, str],
+        force_disabled: bool = False,
     ) -> None:
         if len(restored_ids) != len(prior_definitions) or len(set(restored_ids)) != len(restored_ids):
             raise RuntimeError("Rollback cron restoration set is incomplete")
@@ -4236,7 +6005,10 @@ class IntegrationManager:
         by_id = {str(job["id"]): job for job in jobs}
         for definition, restored_id in zip(prior_definitions, restored_ids):
             restored = by_id.get(restored_id)
-            if restored is None or _job_contract_hash(restored) != _job_contract_hash(definition):
+            expected = json.loads(json.dumps(_job_definition(definition)))
+            if force_disabled:
+                expected["enabled"] = False
+            if restored is None or _job_contract_hash(restored) != _job_contract_hash(expected):
                 raise RuntimeError("Rollback did not restore an owned cron definition exactly")
         unknown_after = {
             job_id: _job_contract_hash(by_id[job_id], include_id=True)
@@ -4247,6 +6019,77 @@ class IntegrationManager:
         expected_ids = set(unknown_hashes_before) | set(restored_ids)
         if set(by_id) != expected_ids or len(jobs) != len(expected_ids):
             raise RuntimeError("Rollback cron inventory contains missing or unexpected jobs")
+
+    def _activate_restored_cron_definitions(
+        self,
+        *,
+        prior_definitions: list[dict[str, Any]],
+        restored_ids: list[str],
+        unknown_hashes_before: dict[str, str],
+    ) -> None:
+        if len(prior_definitions) != len(restored_ids):
+            raise RuntimeError("Rollback cron restoration set is incomplete")
+        enabled = [
+            (definition, restored_id)
+            for definition, restored_id in zip(prior_definitions, restored_ids)
+            if definition.get("enabled", True) is True
+        ]
+        try:
+            for definition, job_id in enabled:
+                disabled_definition = json.loads(json.dumps(_job_definition(definition)))
+                disabled_definition["enabled"] = False
+                self._edit_cron_with_snapshot_guard(
+                    job_id,
+                    ["cron", "edit", job_id, "--enable"],
+                    before=lambda job, expected=disabled_definition: _job_contract_hash(
+                        job
+                    ) == _job_contract_hash(expected),
+                    after=lambda job, expected=definition: _job_contract_hash(
+                        job
+                    ) == _job_contract_hash(expected),
+                    label="Rollback restore activation",
+                )
+            self._verify_rollback_cron_state(
+                prior_definitions=prior_definitions,
+                restored_ids=restored_ids,
+                unknown_hashes_before=unknown_hashes_before,
+            )
+        except Exception as activation_error:
+            compensation_errors: list[Exception] = []
+            for definition, job_id in zip(prior_definitions, restored_ids):
+                try:
+                    canonical = _job_definition(definition)
+                    disabled = json.loads(json.dumps(canonical))
+                    disabled["enabled"] = False
+                    self._edit_cron_with_snapshot_guard(
+                        job_id,
+                        ["cron", "edit", job_id, "--disable"],
+                        before=lambda job, expected=canonical, safe=disabled: (
+                            _job_contract_hash(job) in {
+                                _job_contract_hash(expected), _job_contract_hash(safe),
+                            }
+                        ),
+                        after=lambda job, expected=disabled: _job_contract_hash(
+                            job
+                        ) == _job_contract_hash(expected),
+                        label="Rollback activation compensation",
+                    )
+                except Exception as error:
+                    compensation_errors.append(error)
+            try:
+                self._verify_rollback_cron_state(
+                    prior_definitions=prior_definitions,
+                    restored_ids=restored_ids,
+                    unknown_hashes_before=unknown_hashes_before,
+                    force_disabled=True,
+                )
+            except Exception as error:
+                compensation_errors.append(error)
+            if compensation_errors:
+                raise RuntimeError(
+                    "Rollback cron activation compensation was incomplete"
+                ) from activation_error
+            raise
 
     def _verify_plugin_skill_gateway(self) -> tuple[bool, bool, bool]:
         plugin = self.cli.json(["plugins", "inspect", PLUGIN_ID, "--runtime", "--json"])
@@ -4402,6 +6245,312 @@ class IntegrationManager:
         ], cwd=self.paths.project_root, shell=False, check=True, text=True,
             capture_output=True, timeout=120)
 
+    def _verify_success_cron_inventory(
+        self,
+        transaction: dict[str, Any],
+        *,
+        recurring_enabled: bool,
+        initial_enabled: bool,
+        jobs: list[dict[str, Any]] | None = None,
+    ) -> dict[str, str]:
+        self._validate_replacement_receipt_graph(transaction)
+        current = self._inventory() if jobs is None else jobs
+        by_id = {str(job["id"]): job for job in current}
+        unknown_hashes = transaction.get("cronUnknownHashesBefore")
+        gemini_hashes = transaction.get("cronPreservedGeminiHashesAfterQuiesce")
+        if not isinstance(unknown_hashes, dict) or not isinstance(gemini_hashes, dict) \
+                or any(
+                    not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    or not isinstance(fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                    for receipt in (unknown_hashes, gemini_hashes)
+                    for job_id, fingerprint in receipt.items()
+                ) \
+                or set(unknown_hashes) & set(gemini_hashes):
+            raise RuntimeError("Cron success inventory receipt is malformed")
+        for receipt, message in (
+            (unknown_hashes, "Unknown cron definitions changed during integration"),
+            (gemini_hashes, "Quiesced Gemini cron definitions changed during integration"),
+        ):
+            actual = {
+                job_id: _job_contract_hash(by_id[job_id], include_id=True)
+                for job_id in receipt if job_id in by_id
+            }
+            if actual != receipt:
+                raise RuntimeError(message)
+
+        recurring = (
+            (transaction.get("cronId"), self._incremental_spec()),
+            (transaction.get("snapshotCronId"), self._snapshot_spec()),
+        )
+        recurring_ids: list[str] = []
+        for raw_id, spec in recurring:
+            if not isinstance(raw_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(raw_id):
+                raise RuntimeError("Recurring cron success id receipt is malformed")
+            job = by_id.get(raw_id)
+            if job is None or not _job_matches_spec(
+                job, spec, require_enabled=recurring_enabled,
+            ):
+                raise RuntimeError("Recurring cron success contract drifted")
+            recurring_ids.append(raw_id)
+        if len(set(recurring_ids)) != 2:
+            raise RuntimeError("Recurring cron success ids are not unique")
+
+        expected_managed_ids = set(recurring_ids)
+        index_state = transaction.get("indexState")
+        initial_id = transaction.get("initialIndexJobId")
+        if index_state == "INDEX_BUILDING":
+            if not isinstance(initial_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(initial_id):
+                raise RuntimeError("Initial cron success id receipt is malformed")
+            initial = by_id.get(initial_id)
+            if initial is None or not self._initial_job_matches(
+                initial, enabled=initial_enabled,
+            ):
+                raise RuntimeError("Initial cron success contract drifted")
+            expected_managed_ids.add(initial_id)
+        elif index_state == "READY":
+            if initial_id is not None or any(
+                job.get("declarationKey") == INITIAL_CRON_DECLARATION_KEY
+                for job in current
+            ):
+                raise RuntimeError("Unexpected initial cron exists for a ready index")
+        else:
+            raise RuntimeError("Cron success index state is invalid")
+
+        managed_ids_after = transaction.get("managedCronIdsAfter")
+        if not isinstance(managed_ids_after, list) \
+                or any(
+                    not isinstance(value, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(value)
+                    for value in managed_ids_after
+                ) \
+                or set(managed_ids_after) != expected_managed_ids \
+                or len(managed_ids_after) != len(expected_managed_ids):
+            raise RuntimeError("Managed cron success id receipt is incomplete")
+        intents = self._validated_cron_intent_receipts(
+            transaction, "cronStagingIntents",
+        )
+        expected_intent_keys = {CRON_DECLARATION_KEY, SNAPSHOT_CRON_DECLARATION_KEY}
+        if index_state == "INDEX_BUILDING":
+            expected_intent_keys.add(INITIAL_CRON_DECLARATION_KEY)
+        if not isinstance(intents, dict) or set(intents) != expected_intent_keys:
+            raise RuntimeError("Cron staging intent topology is incomplete")
+        expected_by_key = {
+            CRON_DECLARATION_KEY: transaction["cronId"],
+            SNAPSHOT_CRON_DECLARATION_KEY: transaction["snapshotCronId"],
+        }
+        if index_state == "INDEX_BUILDING":
+            expected_by_key[INITIAL_CRON_DECLARATION_KEY] = initial_id
+        if any(
+            not isinstance(intents.get(key), dict)
+            or intents[key].get("jobId") != expected_id
+            or intents[key].get("configured") is not True
+            for key, expected_id in expected_by_key.items()
+        ):
+            raise RuntimeError("Cron staging intent id receipt is incomplete")
+        for declaration_key, expected_id in expected_by_key.items():
+            enabled = (
+                initial_enabled
+                if declaration_key == INITIAL_CRON_DECLARATION_KEY
+                else recurring_enabled
+            )
+            lifecycle = self._managed_intent_lifecycle_contracts(
+                intents[declaration_key]
+            )
+            expected = json.loads(json.dumps(lifecycle[3 if enabled else 2]))
+            expected["id"] = expected_id
+            if _job_contract_hash(by_id[expected_id], include_id=True) != _job_contract_hash(
+                expected, include_id=True,
+            ):
+                raise RuntimeError("Cron success intent contract drifted")
+
+        expected_ids = set(unknown_hashes) | set(gemini_hashes) | expected_managed_ids
+        if set(by_id) != expected_ids or len(current) != len(expected_ids):
+            raise RuntimeError("Cron success inventory contains missing or unexpected jobs")
+        return self._inventory_hashes(current)
+
+    @staticmethod
+    def _validate_commit_cron_receipt_metadata(
+        transaction: dict[str, Any],
+    ) -> dict[str, str]:
+        if transaction.get("cronContractHashVersion") != CRON_CONTRACT_HASH_VERSION:
+            raise RuntimeError("Committed cron hash contract version is unsupported")
+        receipt = transaction.get("cronCommitInventoryHashes")
+        if not isinstance(receipt, dict) or any(
+            not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+            or not isinstance(fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+            for job_id, fingerprint in receipt.items()
+        ):
+            raise RuntimeError("Committed cron inventory receipt is malformed")
+        if transaction.get("cronCommitUnknownHashes") != transaction.get("cronUnknownHashesBefore") \
+                or transaction.get("cronCommitGeminiHashes") != transaction.get(
+                    "cronPreservedGeminiHashesAfterQuiesce"
+                ) \
+                or transaction.get("cronCommitTopologyVerified") is not True:
+            raise RuntimeError("Committed cron topology receipt is incomplete")
+        managed_ids = transaction.get("managedCronIdsAfter")
+        unknown = transaction.get("cronCommitUnknownHashes")
+        gemini = transaction.get("cronCommitGeminiHashes")
+        if not isinstance(managed_ids, list) \
+                or any(
+                    not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    for job_id in managed_ids
+                ) \
+                or len(managed_ids) != len(set(managed_ids)) \
+                or not isinstance(unknown, dict) or not isinstance(gemini, dict) \
+                or any(
+                    not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    or not isinstance(fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                    for item in (unknown, gemini)
+                    for job_id, fingerprint in item.items()
+                ) \
+                or set(managed_ids) & set(unknown) \
+                or set(managed_ids) & set(gemini) \
+                or set(unknown) & set(gemini) \
+                or set(receipt) != set(managed_ids) | set(unknown) | set(gemini) \
+                or any(
+                    receipt.get(job_id) != fingerprint
+                    for subset in (unknown, gemini)
+                    for job_id, fingerprint in subset.items()
+                ):
+            raise RuntimeError("Committed cron topology id receipt is inconsistent")
+        return receipt
+
+    def _verify_commit_cron_receipt(self, transaction: dict[str, Any]) -> None:
+        if transaction.get("phase") != "commit_closeout_pending":
+            raise RuntimeError("Cron commit closeout phase is invalid")
+        receipt = self._validate_commit_cron_receipt_metadata(transaction)
+        jobs = self._inventory()
+        actual = self._verify_success_cron_inventory(
+            transaction,
+            recurring_enabled=True,
+            initial_enabled=True,
+            jobs=jobs,
+        )
+        if actual != receipt:
+            raise RuntimeError("Cron inventory drifted during commit closeout")
+
+    def _verify_committed_gemini_receipt(
+        self, transaction: dict[str, Any], *, jobs: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Keep the durable Gemini quiescence promise across later repair attempts."""
+        self._validate_commit_cron_receipt_metadata(transaction)
+        current_jobs = self._inventory() if jobs is None else jobs
+        current_gemini = {
+            str(job["id"]): _job_contract_hash(job, include_id=True)
+            for job in self._owned_gemini_jobs_exact(current_jobs)
+        }
+        if current_gemini != transaction.get("cronCommitGeminiHashes"):
+            raise RuntimeError("Committed quiesced Gemini cron inventory receipt drifted")
+
+    def _verify_legacy_committed_v3_repair_authority(
+        self, transaction: dict[str, Any], jobs: list[dict[str, Any]],
+    ) -> None:
+        """Authorize a one-time upgrade of the pre-commit-receipt v3 contract."""
+        new_receipt_fields = {
+            "cronContractHashVersion", "cronCommitInventoryHashes",
+            "cronCommitUnknownHashes", "cronCommitGeminiHashes",
+            "cronPreservedGeminiHashesAfterQuiesce", "cronCommitTopologyVerified",
+        }
+        if any(field in transaction for field in new_receipt_fields) \
+                or transaction.get("phase") != "committed" \
+                or transaction.get("contractVersion") != INTEGRATION_CONTRACT_VERSION \
+                or transaction.get("ownership") != self._ownership_payload():
+            raise RuntimeError("Legacy committed v3 repair authority is not applicable")
+        raw_definitions = transaction.get("cronDefinitionsBefore")
+        target_ids = transaction.get("cronTargetIdsBefore")
+        inventory_before = transaction.get("cronInventoryHashesBefore")
+        unknown_before = transaction.get("cronUnknownHashesBefore")
+        disabled_gemini = transaction.get("disabledGeminiJobs")
+        if not isinstance(raw_definitions, list) \
+                or any(not isinstance(item, dict) for item in raw_definitions) \
+                or not isinstance(target_ids, list) \
+                or not isinstance(inventory_before, dict) \
+                or not isinstance(unknown_before, dict) \
+                or not isinstance(disabled_gemini, list) \
+                or any(
+                    not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    or not isinstance(fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                    for receipt in (inventory_before, unknown_before)
+                    for job_id, fingerprint in receipt.items()
+                ):
+            raise RuntimeError("Legacy committed v3 receipt graph is malformed")
+        definitions = [_job_definition(item) for item in raw_definitions]
+        definitions_by_id = {str(item["id"]): item for item in definitions}
+        raw_by_id = {str(item.get("id")): item for item in raw_definitions}
+        target_set = set(target_ids)
+        if len(definitions_by_id) != len(definitions) \
+                or any(
+                    not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    for job_id in target_ids
+                ) \
+                or len(target_set) != len(target_ids) \
+                or target_set != set(definitions_by_id) \
+                or set(inventory_before) != target_set | set(unknown_before) \
+                or target_set & set(unknown_before):
+            raise RuntimeError("Legacy committed v3 receipt graph is inconsistent")
+        for job_id in definitions_by_id:
+            if inventory_before.get(job_id) != _legacy_v3_job_contract_hash(
+                raw_by_id[job_id], include_id=True,
+            ):
+                raise RuntimeError("Legacy committed v3 definition receipt drifted")
+
+        prior_gemini = [
+            definition for definition in definitions
+            if definition.get("declarationKey") == GEMINI_DECLARATION_KEY
+        ]
+        expected_disabled_receipt = sorted(
+            ({"id": str(job["id"]), "wasEnabled": True} for job in prior_gemini
+             if job.get("enabled", True) is True),
+            key=lambda item: item["id"],
+        )
+        if sorted(disabled_gemini, key=lambda item: str(item) if not isinstance(item, dict)
+                  else str(item.get("id"))) != expected_disabled_receipt:
+            raise RuntimeError("Legacy committed v3 Gemini disable receipt drifted")
+        current_gemini = self._owned_gemini_jobs_exact(jobs)
+        expected_gemini: dict[str, str] = {}
+        for definition in prior_gemini:
+            disabled = json.loads(json.dumps(definition))
+            disabled["enabled"] = False
+            expected_gemini[str(definition["id"])] = _job_contract_hash(
+                disabled, include_id=True,
+            )
+        actual_gemini = {
+            str(job["id"]): _job_contract_hash(job, include_id=True)
+            for job in current_gemini
+        }
+        if actual_gemini != expected_gemini:
+            raise RuntimeError("Legacy committed v3 Gemini contract drifted")
+
+        incremental = self._job_by_key(jobs, CRON_DECLARATION_KEY)
+        snapshot = self._job_by_key(jobs, SNAPSHOT_CRON_DECLARATION_KEY)
+        cron_id = transaction.get("cronId")
+        snapshot_id = transaction.get("snapshotCronId")
+        if incremental is None or snapshot is None \
+                or str(incremental.get("id")) != cron_id \
+                or str(snapshot.get("id")) != snapshot_id \
+                or not _job_matches_spec(
+                    incremental, self._incremental_spec(), require_enabled=True,
+                ) \
+                or not _job_matches_spec(
+                    snapshot, self._snapshot_spec(), require_enabled=True,
+                ):
+            raise RuntimeError("Legacy committed v3 managed cron receipt drifted")
+        initial = self._job_by_key(jobs, INITIAL_CRON_DECLARATION_KEY)
+        if transaction.get("indexState") == "READY":
+            if initial is not None or transaction.get("initialIndexJobId") is not None:
+                raise RuntimeError("Legacy committed v3 READY topology drifted")
+        elif transaction.get("indexState") == "INDEX_BUILDING":
+            initial_id = transaction.get("initialIndexJobId")
+            if not isinstance(initial_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(initial_id) \
+                    or initial is None or str(initial.get("id")) != initial_id \
+                    or not self._initial_job_matches(initial, enabled=True):
+                raise RuntimeError("Legacy committed v3 initial cron receipt drifted")
+        else:
+            raise RuntimeError("Legacy committed v3 index state is invalid")
+
     def _verify_activation_pending(self, transaction: dict[str, Any]) -> None:
         if transaction.get("phase") != "activation_pending" or transaction.get("ownership") != self._ownership_payload():
             raise RuntimeError("Qwen activation transaction is not ready for final verification")
@@ -4409,14 +6558,12 @@ class IntegrationManager:
         if legacy:
             raise RuntimeError("Legacy snapshot declaration remains during activation")
         self._verify_approved_collision_receipt(transaction, jobs)
-        for spec in (self._incremental_spec(), self._snapshot_spec()):
-            job = self._job_by_key(jobs, spec.key)
-            if job is None or not _job_matches_spec(job, spec, require_enabled=True):
-                raise RuntimeError("Recurring cron activation verification failed")
-        if transaction.get("indexState") == "INDEX_BUILDING":
-            initial = self._job_by_key(jobs, INITIAL_CRON_DECLARATION_KEY)
-            if initial is None or not self._initial_job_matches(initial, enabled=True):
-                raise RuntimeError("Initial index activation verification failed")
+        self._verify_success_cron_inventory(
+            transaction,
+            recurring_enabled=True,
+            initial_enabled=True,
+            jobs=jobs,
+        )
         self._verify_local_source_map()
         self._verify_runtime_contract_files()
         self._verify_snapshot_wrapper_contract()
@@ -4430,6 +6577,7 @@ class IntegrationManager:
             return self._verify_legacy_contract(manifest)
         if manifest.get("phase") != "committed" or manifest.get("ownership") != self._ownership_payload():
             raise RuntimeError("Qwen integration ownership contract is incomplete or drifted")
+        committed_inventory = self._validate_commit_cron_receipt_metadata(manifest)
         jobs, legacy = self._preflight_cron_inventory()
         if legacy:
             raise RuntimeError("Legacy snapshot declaration remains after committed reconciliation")
@@ -4440,11 +6588,44 @@ class IntegrationManager:
             raise RuntimeError("Incremental cron does not match the exact managed contract")
         if snapshot is None or not _job_matches_spec(snapshot, self._snapshot_spec(), require_enabled=True):
             raise RuntimeError("Snapshot cron does not match the exact managed contract")
+        cron_id = manifest.get("cronId")
+        snapshot_cron_id = manifest.get("snapshotCronId")
+        if not isinstance(cron_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(cron_id) \
+                or str(incremental.get("id")) != cron_id:
+            raise RuntimeError("Incremental cron id does not match the committed receipt")
+        if not isinstance(snapshot_cron_id, str) \
+                or not SAFE_CRON_JOB_ID_RE.fullmatch(snapshot_cron_id) \
+                or str(snapshot.get("id")) != snapshot_cron_id:
+            raise RuntimeError("Snapshot cron id does not match the committed receipt")
         initial = self._job_by_key(jobs, INITIAL_CRON_DECLARATION_KEY)
-        if manifest.get("indexState") == "INDEX_BUILDING" and (
-            initial is None or not self._initial_job_matches(initial, enabled=True)
+        index_state = manifest.get("indexState")
+        expected_managed_ids = {cron_id, snapshot_cron_id}
+        if index_state == "INDEX_BUILDING":
+            initial_id = manifest.get("initialIndexJobId")
+            if not isinstance(initial_id, str) \
+                    or not SAFE_CRON_JOB_ID_RE.fullmatch(initial_id) \
+                    or initial is None or str(initial.get("id")) != initial_id \
+                    or not self._initial_job_matches(initial, enabled=True):
+                raise RuntimeError(
+                    "Pending initial index job does not match the exact managed contract"
+                )
+            expected_managed_ids.add(initial_id)
+        elif index_state == "READY":
+            if initial is not None or manifest.get("initialIndexJobId") is not None:
+                raise RuntimeError("Unexpected initial cron exists for a ready index")
+        else:
+            raise RuntimeError("Committed Qwen index state is invalid")
+        managed_ids = manifest.get("managedCronIdsAfter")
+        if not isinstance(managed_ids, list) or len(managed_ids) != len(expected_managed_ids) \
+                or set(managed_ids) != expected_managed_ids:
+            raise RuntimeError("Managed cron ids do not match the committed topology")
+        current_inventory = self._inventory_hashes(jobs)
+        if any(
+            committed_inventory.get(job_id) != current_inventory.get(job_id)
+            for job_id in expected_managed_ids
         ):
-            raise RuntimeError("Pending initial index job does not match the exact managed contract")
+            raise RuntimeError("Committed managed cron inventory receipt drifted")
+        self._verify_committed_gemini_receipt(manifest, jobs=jobs)
         self._verify_local_source_map()
         self._verify_runtime_contract_files()
         self._verify_snapshot_wrapper_contract()
@@ -4458,7 +6639,7 @@ class IntegrationManager:
             "gateway": gateway_ok,
             "incrementalCronUnique": True,
             "snapshotCronUnique": True,
-            "indexState": manifest.get("indexState"),
+            "indexState": index_state,
             "healthReceiptStatus": self._health_receipt_status(),
         }
 
@@ -4466,20 +6647,181 @@ class IntegrationManager:
         with self._integration_lock():
             return self._integrate_locked(runtime_manifest)
 
+    def _disarm_activation_fail_safe_after_verify(
+        self, transaction: dict[str, Any],
+    ) -> None:
+        persisted = self.store.read()
+        if persisted != transaction \
+                or persisted.get("phase") != "committed" \
+                or persisted.get("activationFailSafeRequired") is not True:
+            raise RuntimeError("Committed activation fail-safe receipt drifted")
+        persisted["activationFailSafeRequired"] = False
+        self.store.write(persisted)
+        transaction.clear()
+        transaction.update(persisted)
+
+    def _rearm_after_ambiguous_committed_disarm(
+        self,
+        armed_authority: dict[str, Any],
+        durable_disarmed: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Restore an exact armed receipt after a disarm write applied then raised."""
+        original_plan = self._activation_fail_safe_plan(armed_authority)
+        expected_disarmed = json.loads(json.dumps(armed_authority))
+        expected_disarmed["activationFailSafeRequired"] = False
+        if durable_disarmed != expected_disarmed:
+            raise RuntimeError(
+                "Committed disarm recovery receipt differs beyond its fail-safe marker"
+            )
+        rearmed = json.loads(json.dumps(durable_disarmed))
+        rearmed["activationFailSafeRequired"] = True
+        write_error: Exception | None = None
+        try:
+            self.store.write(rearmed)
+        except Exception as error:
+            write_error = error
+        persisted = self.store.read()
+        if persisted != rearmed:
+            failure = RuntimeError(
+                "Committed activation fail-safe could not be durably re-armed"
+            )
+            if write_error is not None:
+                raise failure from write_error
+            raise failure
+        if self._activation_fail_safe_plan(persisted) != original_plan:
+            raise RuntimeError(
+                "Re-armed activation fail-safe authority changed unexpectedly"
+            )
+        return persisted
+
+    def _compensate_armed_noncommitted_reentry(
+        self, transaction: dict[str, Any],
+    ) -> None:
+        """Make an interrupted activation safe, then require explicit rollback."""
+        self._activation_fail_safe_plan(transaction)
+        if self.store.read() != transaction:
+            raise RuntimeError(
+                "Interrupted activation receipt changed before re-entry compensation"
+            )
+        try:
+            self._disable_uncommitted_managed_jobs_for_activation_failure(
+                transaction,
+            )
+        except Exception as error:
+            raise ActivationFailSafeIncomplete(error) from error
+        raise RuntimeError(
+            "Interrupted OpenClaw integration was safely disabled and requires rollback"
+        )
+
+    def _resume_armed_committed_transaction(
+        self, transaction: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Finish or safely roll back a commit that crashed before disarming."""
+        armed_authority = json.loads(json.dumps(transaction))
+        armed_plan = self._activation_fail_safe_plan(armed_authority)
+        try:
+            verification = self.verify()
+            self._disarm_activation_fail_safe_after_verify(transaction)
+            return {
+                "status": transaction.get("indexState"),
+                "transaction": "already_current",
+                **verification,
+            }
+        except Exception as original_error:
+            try:
+                latest = self.store.read()
+                if latest.get("phase") == "committed" \
+                        and latest.get("activationFailSafeRequired") is False:
+                    try:
+                        verification = self.verify()
+                    except Exception as second_verify_error:
+                        original_error = second_verify_error
+                        try:
+                            latest = self._rearm_after_ambiguous_committed_disarm(
+                                armed_authority, latest,
+                            )
+                        except Exception as rearm_error:
+                            raise ActivationFailSafeIncomplete(
+                                rearm_error,
+                            ) from second_verify_error
+                    else:
+                        return {
+                            "status": latest.get("indexState"),
+                            "transaction": "already_current",
+                            **verification,
+                        }
+                if latest.get("phase") != "committed" \
+                        or latest.get("activationFailSafeRequired") is not True \
+                        or self._activation_fail_safe_plan(latest) != armed_plan:
+                    raise RuntimeError(
+                        "Committed activation fail-safe authority drifted during recovery"
+                    )
+                latest["failurePhase"] = "committed"
+                latest["phase"] = "failed"
+                self.store.write(latest)
+            except ActivationFailSafeIncomplete:
+                raise
+            except Exception:
+                latest = self.store.read()
+                if latest.get("activationFailSafeRequired") is not True:
+                    raise ActivationFailSafeIncomplete(
+                        RuntimeError(
+                            "Committed recovery lost durable activation fail-safe authority"
+                        )
+                    ) from original_error
+            rollback_error: Exception | None = None
+            try:
+                self._rollback_locked(require_exact_post_config=False)
+            except Exception as error:
+                rollback_error = error
+                try:
+                    latest = self.store.read()
+                    latest.setdefault("failurePhase", "committed")
+                    latest["phase"] = "rollback_failed"
+                    self.store.write(latest)
+                except Exception:
+                    pass
+            if rollback_error is not None:
+                raise IntegrationRollbackIncomplete(
+                    original_error, rollback_error,
+                ) from original_error
+            raise
+
     def _integrate_locked(self, runtime_manifest: dict[str, Any]) -> dict[str, Any]:
         prior: dict[str, Any] | None = None
+        prior_committed_v3_repair: dict[str, Any] | None = None
         if self.store.manifest_path.is_file() and not self.store.manifest_path.is_symlink():
             existing = self.store.read()
+            armed = existing.get("activationFailSafeRequired", False)
+            if type(armed) is not bool:
+                raise RuntimeError("Activation fail-safe durable marker is malformed")
             if existing.get("phase") == "committed":
                 prior = existing
                 if existing.get("contractVersion") == INTEGRATION_CONTRACT_VERSION:
+                    if armed:
+                        return self._resume_armed_committed_transaction(existing)
                     try:
                         return {"status": existing.get("indexState"), "transaction": "already_current", **self.verify()}
                     except Exception:
-                        pass
+                        prior_committed_v3_repair = existing
+            elif armed:
+                self._compensate_armed_noncommitted_reentry(existing)
             elif existing.get("phase") != "rolled_back":
                 raise RuntimeError("An unfinished OpenClaw integration transaction requires rollback")
         jobs_before, legacy_before = self._preflight_cron_inventory()
+        if prior_committed_v3_repair is not None:
+            if "cronContractHashVersion" in prior_committed_v3_repair \
+                    or any(
+                        key.startswith("cronCommit")
+                        for key in prior_committed_v3_repair
+                    ):
+                self._verify_committed_gemini_receipt(
+                    prior_committed_v3_repair, jobs=jobs_before,
+                )
+            else:
+                self._verify_legacy_committed_v3_repair_authority(
+                    prior_committed_v3_repair, jobs_before,
+                )
         gemini_before = self._owned_gemini_jobs_exact(jobs_before)
         prior_definitions = [
             _job_definition(job) for job in jobs_before
@@ -4488,6 +6830,19 @@ class IntegrationManager:
             } or any(job.get("id") == legacy.get("id") for legacy in legacy_before)
             or any(job.get("id") == gemini.get("id") for gemini in gemini_before)
         ]
+        if any(
+            not isinstance(definition.get("name"), str)
+            or not definition["name"]
+            or definition.get("description") is not None
+            and (
+                not isinstance(definition.get("description"), str)
+                or not definition["description"]
+            )
+            for definition in prior_definitions
+        ):
+            raise RuntimeError(
+                "Owned cron definition cannot be restored through a unique staging identity"
+            )
         target_ids = {
             str(job["id"]) for job in jobs_before
             if job.get("declarationKey") in MANAGED_CRON_KEYS
@@ -4503,15 +6858,31 @@ class IntegrationManager:
             {"id": str(job["id"]), "wasEnabled": True}
             for job in gemini_before if job.get("enabled", True) is True
         ]
-        transaction = self.begin()
+        quiesced_gemini_hashes: dict[str, str] = {}
+        for job in gemini_before:
+            expected = json.loads(json.dumps(job))
+            expected["enabled"] = False
+            quiesced_gemini_hashes[str(job["id"])] = _job_contract_hash(
+                expected, include_id=True,
+            )
+        transaction = self.begin(cron_inventory_hashes=inventory_hashes_before)
         try:
             transaction["previousPhase"] = prior.get("phase") if prior else None
             transaction["previousContractVersion"] = prior.get("contractVersion", 1) if prior else None
             transaction["cronDefinitionsBefore"] = prior_definitions
+            transaction["cronContractHashVersion"] = CRON_CONTRACT_HASH_VERSION
             transaction["cronInventoryTotalBefore"] = len(jobs_before)
             transaction["cronInventoryHashesBefore"] = inventory_hashes_before
             transaction["cronUnknownHashesBefore"] = unknown_hashes_before
+            transaction["cronPreservedGeminiHashesAfterQuiesce"] = quiesced_gemini_hashes
             transaction["cronTargetIdsBefore"] = sorted(target_ids)
+            transaction["cronLegacyRemoveIdsBefore"] = sorted(
+                str(job["id"]) for job in legacy_before
+            )
+            transaction["managedCronIdsAfter"] = []
+            transaction["cronStagingIntents"] = {}
+            transaction["cronRestoreIntents"] = {}
+            transaction["restoredCronIdsByDeclaration"] = {}
             transaction["cronMutationStarted"] = False
             transaction["runtimeMutationStarted"] = False
             transaction["pluginMutationStarted"] = False
@@ -4625,13 +6996,54 @@ class IntegrationManager:
 
                 self._checkpoint_mutation(transaction, "launchdMutationStarted")
                 self.activate_launchd()
-                transaction["cronId"] = self._apply_managed_spec(self._incremental_spec())
-                transaction["snapshotCronId"] = self._apply_managed_spec(self._snapshot_spec())
-                transaction["managedCronIdsAfter"] = [transaction["cronId"], transaction["snapshotCronId"]]
+                transaction["cronReplaceIdsBefore"] = sorted(
+                    str(job["id"]) for job in jobs_before
+                    if job.get("declarationKey") in MANAGED_CRON_KEYS
+                )
+                transaction["phase"] = "replacing_managed_cron"
+                self.store.write(transaction)
+                transaction["removedManagedCronIdsBeforeAdd"] = (
+                    self._remove_prior_managed_jobs_for_replacement(
+                        jobs_before, target_ids, inventory_hashes_before,
+                    )
+                )
+                transaction["phase"] = "staging_managed_cron"
+                self.store.write(transaction)
+                transaction["cronId"] = self._apply_managed_spec(
+                    self._incremental_spec(), transaction,
+                )
+                transaction["snapshotCronId"] = self._apply_managed_spec(
+                    self._snapshot_spec(), transaction,
+                )
                 self._verify_recurring_specs(enabled=False)
                 self.store.write(transaction)
+                persisted = self.store.read()
+                expected_legacy_ids = sorted(str(job["id"]) for job in legacy_before)
+                if persisted.get("cronLegacyRemoveIdsBefore") != expected_legacy_ids:
+                    raise RuntimeError("Legacy cron removal durable authority drifted")
+                legacy_removal_inventory = self._inventory()
+                if legacy_before:
+                    self._verify_pre_legacy_removal_inventory(
+                        persisted, legacy_removal_inventory,
+                    )
+                legacy_current_by_id = {
+                    str(job["id"]): job for job in legacy_removal_inventory
+                }
                 for legacy in legacy_before:
-                    self.cli.run(["cron", "rm", str(legacy["id"])])
+                    job_id = str(legacy["id"])
+                    expected = json.loads(json.dumps(legacy))
+                    expected["enabled"] = False
+                    current_legacy = legacy_current_by_id.get(job_id)
+                    if current_legacy is None or _job_contract_hash(
+                        current_legacy, include_id=True,
+                    ) != _job_contract_hash(expected, include_id=True):
+                        raise RuntimeError(
+                            "Legacy snapshot identity was reused or drifted before removal"
+                        )
+                self._remove_cron_ids_with_snapshot_guard(
+                    legacy_removal_inventory,
+                    {str(legacy["id"]) for legacy in legacy_before},
+                )
                 if legacy_before:
                     current_ids = {str(job["id"]) for job in self._inventory()}
                     if any(str(legacy["id"]) in current_ids for legacy in legacy_before):
@@ -4641,15 +7053,24 @@ class IntegrationManager:
                 if any(current_by_id.get(item["id"], {}).get("enabled", True) is not False
                        for item in planned_gemini_disables):
                     raise RuntimeError("Gemini rollback declarations did not remain quiesced")
-                transaction["indexState"], transaction["initialIndexJobId"] = self.mark_ready_or_schedule_build()
-                if transaction["initialIndexJobId"]:
-                    transaction["managedCronIdsAfter"].append(transaction["initialIndexJobId"])
+                transaction["indexState"], transaction["initialIndexJobId"] = (
+                    self.mark_ready_or_schedule_build(transaction)
+                )
+                self.store.write(transaction)
+                self._verify_success_cron_inventory(
+                    transaction,
+                    recurring_enabled=False,
+                    initial_enabled=False,
+                )
                 self.cli.run(["config", "validate", "--json"])
                 config = Path(transaction["configPath"])
                 transaction["postConfigSha256"] = self._sha256_config(config)
                 transaction["phase"] = "restarting_gateway"
                 self.store.write(transaction)
                 self.cli.run(["gateway", "restart", "--safe", "--json"], timeout=300)
+                transaction["activationFailSafeRequired"] = True
+                transaction["activationFailSafeDisabledCronIds"] = []
+                transaction["activationFailSafeComplete"] = False
                 transaction["phase"] = "activation_pending"
                 self.store.write(transaction)
 
@@ -4662,13 +7083,30 @@ class IntegrationManager:
             transaction["healthReceiptSha256"] = sha256_file(self.health_receipt_path)
             self.store.write(transaction)
             self._verify_activation_pending(transaction)
+            transaction["cronCommitInventoryHashes"] = self._verify_success_cron_inventory(
+                transaction,
+                recurring_enabled=True,
+                initial_enabled=True,
+            )
+            transaction["cronCommitUnknownHashes"] = dict(
+                transaction["cronUnknownHashesBefore"]
+            )
+            transaction["cronCommitGeminiHashes"] = dict(
+                transaction["cronPreservedGeminiHashesAfterQuiesce"]
+            )
+            transaction["cronCommitTopologyVerified"] = True
+            transaction["phase"] = "commit_closeout_pending"
+            self.store.write(transaction)
+            self._verify_commit_cron_receipt(transaction)
             transaction["phase"] = "committed"
             self.store.write(transaction)
             verification = self.verify()
+            self._disarm_activation_fail_safe_after_verify(transaction)
             action = "upgraded" if prior else "committed"
             return {"status": transaction["indexState"], "transaction": action, **verification}
         except Exception as original_error:
             try:
+                transaction["failurePhase"] = transaction.get("phase")
                 transaction["phase"] = "failed"
                 self.store.write(transaction)
             except Exception:
@@ -4679,8 +7117,9 @@ class IntegrationManager:
             except Exception as error:
                 rollback_error = error
                 try:
-                    transaction["phase"] = "rollback_failed"
-                    self.store.write(transaction)
+                    latest = self.store.read()
+                    latest["phase"] = "rollback_failed"
+                    self.store.write(latest)
                 except Exception:
                     pass
             if rollback_error is not None:
@@ -5006,7 +7445,266 @@ class IntegrationManager:
         finally:
             os.close(parent_fd)
 
+    def _preflight_created_snapshot_artifacts(
+        self, transaction: dict[str, Any],
+    ) -> None:
+        """Validate every cleanup capability and inode receipt without mutating state."""
+        project_root = self._project_root_from_transaction(transaction)
+        snapshot_root = self._snapshot_root_from_transaction(transaction)
+
+        def optional_metadata(parent_fd: int, name: str) -> os.stat_result | None:
+            try:
+                return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+
+        def validate_probe(prefix: str, expected_parent: Path) -> None:
+            stage_name = transaction.get(f"{prefix}StageName")
+            final_name = transaction.get(f"{prefix}FinalName")
+            stage_dev = transaction.get(f"{prefix}StageDev")
+            stage_ino = transaction.get(f"{prefix}StageIno")
+            published = transaction.get(f"{prefix}Published")
+            parent_value = transaction.get(f"{prefix}Parent")
+            fields = (stage_name, final_name, stage_dev, stage_ino, published, parent_value)
+            if all(value is None for value in fields):
+                if any(transaction.get(f"{prefix}{suffix}") is not None for suffix in (
+                    "QuarantineName", "Quarantined", "QuarantinePurged", "Preserved",
+                )):
+                    raise RuntimeError("Atomic publication capability receipt is incomplete")
+                return
+            if not isinstance(stage_name, str) \
+                    or CAPABILITY_PROBE_STAGE_RE.fullmatch(stage_name) is None \
+                    or not isinstance(final_name, str) \
+                    or CAPABILITY_PROBE_FINAL_RE.fullmatch(final_name) is None \
+                    or type(stage_dev) is not int or type(stage_ino) is not int \
+                    or type(published) is not bool or not isinstance(parent_value, str):
+                raise RuntimeError("Atomic publication capability receipt is malformed")
+            for suffix in ("Quarantined", "QuarantinePurged", "Preserved"):
+                value = transaction.get(f"{prefix}{suffix}")
+                if value is not None and type(value) is not bool:
+                    raise RuntimeError("Atomic publication capability state is malformed")
+            parent = Path(os.path.abspath(Path(parent_value).expanduser()))
+            if parent != Path(os.path.abspath(expected_parent)):
+                raise RuntimeError("Atomic publication capability parent changed")
+            quarantine_name = transaction.get(f"{prefix}QuarantineName")
+            if quarantine_name is not None and (
+                not isinstance(quarantine_name, str)
+                or QUARANTINE_RE.fullmatch(quarantine_name) is None
+            ):
+                raise RuntimeError("Atomic publication capability quarantine receipt is malformed")
+            if not os.path.lexists(parent):
+                return
+            expected = (stage_dev, stage_ino)
+            with self._open_private_directory(parent) as parent_fd:
+                matches = 0
+                for name in (stage_name, final_name, quarantine_name):
+                    if not isinstance(name, str):
+                        continue
+                    metadata = optional_metadata(parent_fd, name)
+                    if metadata is None:
+                        continue
+                    self._validate_restricted_directory(metadata)
+                    if (metadata.st_dev, metadata.st_ino) != expected:
+                        raise RuntimeError("Atomic publication capability artifact changed")
+                    matches += 1
+                if matches > 1:
+                    raise RuntimeError(
+                        "Atomic publication capability artifact exists at multiple paths"
+                    )
+
+        def validate_staged_path(
+            *, prefix: str, parent: Path, final_name: str,
+            stage_pattern: re.Pattern[str], directory: bool, root: bool = False,
+            created_key: str,
+        ) -> bool:
+            stage_name = transaction.get(f"{prefix}StageName")
+            stage_dev = transaction.get(f"{prefix}StageDev")
+            stage_ino = transaction.get(f"{prefix}StageIno")
+            published = transaction.get(f"{prefix}Published")
+            fields = (stage_name, stage_dev, stage_ino, published)
+            quarantine_name = transaction.get(f"{prefix}QuarantineName")
+            if all(value is None for value in fields):
+                if quarantine_name is not None \
+                        or transaction.get(f"{prefix}Quarantined") is not None \
+                        or transaction.get(f"{prefix}QuarantinePurged") is not None:
+                    raise RuntimeError("Staged cleanup receipt is incomplete")
+                return False
+            if not isinstance(stage_name, str) or stage_pattern.fullmatch(stage_name) is None \
+                    or type(stage_dev) is not int or type(stage_ino) is not int \
+                    or type(published) is not bool:
+                raise RuntimeError("Staged cleanup receipt is missing or malformed")
+            if quarantine_name is not None and (
+                not isinstance(quarantine_name, str)
+                or QUARANTINE_RE.fullmatch(quarantine_name) is None
+            ):
+                raise RuntimeError("Staged cleanup quarantine receipt is malformed")
+            for suffix in ("Quarantined", "QuarantinePurged"):
+                value = transaction.get(f"{prefix}{suffix}")
+                if value is not None and type(value) is not bool:
+                    raise RuntimeError("Staged cleanup state is malformed")
+            if not os.path.lexists(parent):
+                return True
+            expected = (stage_dev, stage_ino)
+            parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                parent_meta = os.fstat(parent_fd)
+                if root:
+                    self._validate_private_directory(parent_meta)
+                elif not stat.S_ISDIR(parent_meta.st_mode) \
+                        or parent_meta.st_uid != os.getuid() \
+                        or parent_meta.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    raise RuntimeError("Runtime lock parent is unsafe during rollback")
+                stage_meta = optional_metadata(parent_fd, stage_name)
+                final_meta = optional_metadata(parent_fd, final_name)
+                quarantine_meta = optional_metadata(parent_fd, quarantine_name) \
+                    if isinstance(quarantine_name, str) else None
+
+                def validate_owned(metadata: os.stat_result) -> None:
+                    if root:
+                        self._validate_restricted_directory(metadata)
+                    elif directory:
+                        self._validate_index_lock(metadata)
+                    else:
+                        self._validate_snapshot_lock(metadata)
+                    if (metadata.st_dev, metadata.st_ino) != expected:
+                        label = "managed root" if root else "runtime lock"
+                        raise RuntimeError(
+                            f"Staged {label} changed before rollback"
+                        )
+
+                if stage_meta is not None:
+                    validate_owned(stage_meta)
+                    if final_meta is not None:
+                        raise RuntimeError("Staged cleanup artifact collided with the final path")
+                final_owned = final_meta is not None \
+                    and (final_meta.st_dev, final_meta.st_ino) == expected
+                if final_owned:
+                    validate_owned(final_meta)
+                elif final_meta is not None and (
+                    published is True or transaction.get(created_key) is True
+                ):
+                    raise RuntimeError("Published cleanup artifact changed before rollback")
+                if quarantine_meta is not None:
+                    validate_owned(quarantine_meta)
+                if sum((stage_meta is not None, final_owned, quarantine_meta is not None)) > 1:
+                    raise RuntimeError("Cleanup artifact exists at multiple paths")
+            finally:
+                os.close(parent_fd)
+            return True
+
+        project_probe_target = (
+            project_root if transaction.get("projectExisted") is True else project_root.parent
+        )
+        snapshot_probe_target = (
+            snapshot_root
+            if transaction.get("snapshotRootCreatePlanned") is False
+            else snapshot_root.parent
+        )
+        project_probe_parent = self._capability_parent_from_transaction(
+            transaction,
+            receipt_prefix="projectParentCapabilityProbe",
+            target_parent=project_probe_target,
+        )
+        snapshot_probe_parent = self._capability_parent_from_transaction(
+            transaction,
+            receipt_prefix="snapshotParentCapabilityProbe",
+            target_parent=snapshot_probe_target,
+        )
+        validate_probe("projectParentCapabilityProbe", project_probe_parent)
+        validate_probe("snapshotParentCapabilityProbe", snapshot_probe_parent)
+
+        validate_staged_path(
+            prefix="projectRoot", parent=project_root.parent,
+            final_name=project_root.name, stage_pattern=PROJECT_ROOT_STAGE_RE,
+            directory=True, root=True, created_key="projectCreated",
+        )
+        if transaction.get("projectCreated") is True and os.path.lexists(project_root):
+            expected_dev = transaction.get("projectRootDev")
+            expected_ino = transaction.get("projectRootIno")
+            if type(expected_dev) is not int or type(expected_ino) is not int:
+                if not self._legacy_unverified_created_root(
+                    transaction,
+                    prefix="projectRoot",
+                    planned_key="projectCreatePlanned",
+                    created_key="projectCreated",
+                ):
+                    raise RuntimeError("Created Qwen project identity is missing")
+            else:
+                with self._open_private_directory(project_root.parent) as parent_fd:
+                    metadata = optional_metadata(parent_fd, project_root.name)
+                    if metadata is not None:
+                        self._validate_restricted_directory(metadata)
+                        if (metadata.st_dev, metadata.st_ino) != (expected_dev, expected_ino):
+                            raise RuntimeError("Created Qwen project identity changed")
+        index_staged = validate_staged_path(
+            prefix="indexLock", parent=project_root / "data", final_name="index.lock",
+            stage_pattern=INDEX_LOCK_STAGE_RE, directory=True,
+            created_key="indexLockCreated",
+        )
+        if not index_staged and transaction.get("indexLockCreated") is True:
+            expected_dev = transaction.get("indexLockDev")
+            expected_ino = transaction.get("indexLockIno")
+            if type(expected_dev) is not int or type(expected_ino) is not int:
+                raise RuntimeError("Created index lock identity is missing")
+            data = project_root / "data"
+            try:
+                with self._open_private_directory(data) as data_fd:
+                    metadata = optional_metadata(data_fd, "index.lock")
+                    if metadata is not None:
+                        self._validate_index_lock(metadata)
+                        if (metadata.st_dev, metadata.st_ino) != (expected_dev, expected_ino):
+                            raise RuntimeError("Created index lock changed before rollback")
+            except OSError as error:
+                raise RuntimeError("Created index lock could not be safely inspected") from error
+
+        snapshot_staged = validate_staged_path(
+            prefix="snapshotLock", parent=snapshot_root,
+            final_name=".snapshot-run.lock", stage_pattern=SNAPSHOT_LOCK_STAGE_RE,
+            directory=False, created_key="snapshotLockCreated",
+        )
+        if not snapshot_staged and transaction.get("snapshotLockCreated") is True:
+            expected_dev = transaction.get("snapshotLockDev")
+            expected_ino = transaction.get("snapshotLockIno")
+            if type(expected_dev) is not int or type(expected_ino) is not int:
+                raise RuntimeError("Created snapshot lock identity is missing")
+            if not os.path.lexists(snapshot_root):
+                if transaction.get("snapshotRootCreated") is not True:
+                    raise RuntimeError("Pre-existing snapshot root disappeared before rollback")
+            else:
+                with self._open_private_directory(snapshot_root) as root_fd:
+                    metadata = optional_metadata(root_fd, ".snapshot-run.lock")
+                    if metadata is not None:
+                        self._validate_snapshot_lock(metadata)
+                        if (metadata.st_dev, metadata.st_ino) != (expected_dev, expected_ino):
+                            raise RuntimeError("Created snapshot lock changed before rollback")
+
+        validate_staged_path(
+            prefix="snapshotRoot", parent=snapshot_root.parent,
+            final_name=snapshot_root.name, stage_pattern=SNAPSHOT_ROOT_STAGE_RE,
+            directory=True, root=True, created_key="snapshotRootCreated",
+        )
+        if transaction.get("snapshotRootCreated") is True \
+                and os.path.lexists(snapshot_root):
+            expected_dev = transaction.get("snapshotRootDev")
+            expected_ino = transaction.get("snapshotRootIno")
+            if type(expected_dev) is not int or type(expected_ino) is not int:
+                if not self._legacy_unverified_created_root(
+                    transaction,
+                    prefix="snapshotRoot",
+                    planned_key="snapshotRootCreatePlanned",
+                    created_key="snapshotRootCreated",
+                ):
+                    raise RuntimeError("Created snapshot root identity is missing")
+            else:
+                with self._open_private_directory(snapshot_root.parent) as parent_fd:
+                    metadata = optional_metadata(parent_fd, snapshot_root.name)
+                    if metadata is not None:
+                        self._validate_restricted_directory(metadata)
+                        if (metadata.st_dev, metadata.st_ino) != (expected_dev, expected_ino):
+                            raise RuntimeError("Created snapshot root is unsafe during rollback")
+
     def _remove_created_snapshot_artifacts(self, transaction: dict[str, Any]) -> None:
+        self._preflight_created_snapshot_artifacts(transaction)
         project_root = self._project_root_from_transaction(transaction)
         project_probe_target = (
             project_root if transaction.get("projectExisted") is True else project_root.parent
@@ -5183,8 +7881,344 @@ class IntegrationManager:
                     directory=True,
                 )
 
+    def _legacy_v3_removable_cron_ids(
+        self,
+        transaction: dict[str, Any],
+        current_jobs: list[dict[str, Any]],
+        prior_definitions: list[dict[str, Any]],
+    ) -> tuple[set[str], dict[str, str]]:
+        """Recover pre-intent contract-v3 receipts using exact, bounded ID authority."""
+        target_ids = transaction.get("cronTargetIdsBefore", [])
+        managed_ids = transaction.get("managedCronIdsAfter", [])
+        inventory_before = transaction.get("cronInventoryHashesBefore")
+        unknown_before = transaction.get("cronUnknownHashesBefore")
+        if not isinstance(target_ids, list) or not isinstance(managed_ids, list) \
+                or any(
+                    not isinstance(value, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(value)
+                    for value in [*target_ids, *managed_ids]
+                ) \
+                or len(target_ids) != len(set(target_ids)) \
+                or len(managed_ids) != len(set(managed_ids)) \
+                or not isinstance(inventory_before, dict) \
+                or not isinstance(unknown_before, dict) \
+                or any(
+                    not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    or not isinstance(fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                    for receipt in (inventory_before, unknown_before)
+                    for job_id, fingerprint in receipt.items()
+                ):
+            raise RuntimeError("Legacy v3 rollback cron receipt is malformed")
+        definitions_by_id: dict[str, dict[str, Any]] = {}
+        for definition in prior_definitions:
+            job_id = definition.get("id")
+            if not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id) \
+                    or job_id in definitions_by_id:
+                raise RuntimeError("Legacy v3 rollback definition identity is malformed")
+            definitions_by_id[job_id] = definition
+        target_set = set(target_ids)
+        managed_set = set(managed_ids)
+        if target_set != set(definitions_by_id) \
+                or target_set & managed_set \
+                or managed_set & set(inventory_before) \
+                or set(inventory_before) != target_set | set(unknown_before) \
+                or set(unknown_before) & target_set:
+            raise RuntimeError("Legacy v3 rollback cron authority is inconsistent")
+        for job_id, definition in definitions_by_id.items():
+            expected = _legacy_v3_job_contract_hash(definition, include_id=True)
+            if inventory_before.get(job_id) != expected:
+                raise RuntimeError("Legacy v3 rollback definition fingerprint drifted")
+
+        current_by_id = {str(job["id"]): job for job in current_jobs}
+        upgraded_unknown_hashes: dict[str, str] = {}
+        for job_id, legacy_fingerprint in unknown_before.items():
+            job = current_by_id.get(job_id)
+            if job is None or _legacy_v3_job_contract_hash(
+                job, include_id=True,
+            ) != legacy_fingerprint:
+                raise RuntimeError("Legacy v3 unknown cron receipt drifted")
+            upgraded_unknown_hashes[job_id] = _job_contract_hash(
+                job, include_id=True,
+            )
+        for job_id in target_set & set(current_by_id):
+            definition = definitions_by_id[job_id]
+            if not _default_cron_behavior_contract(current_by_id[job_id]):
+                raise RuntimeError("Legacy v3 rollback target behavior is not safely restorable")
+            disabled = json.loads(json.dumps(_job_definition(definition)))
+            disabled["enabled"] = False
+            actual = _legacy_v3_job_contract_hash(
+                current_by_id[job_id], include_id=True,
+            )
+            if actual not in {
+                _legacy_v3_job_contract_hash(definition, include_id=True),
+                _legacy_v3_job_contract_hash(disabled, include_id=True),
+            }:
+                raise RuntimeError("Legacy v3 rollback target drifted")
+        for job_id in managed_set & set(current_by_id):
+            job = current_by_id[job_id]
+            key = job.get("declarationKey")
+            if key == CRON_DECLARATION_KEY:
+                exact = any(
+                    _job_matches_spec(job, self._incremental_spec(), require_enabled=enabled)
+                    for enabled in (True, False)
+                )
+            elif key == SNAPSHOT_CRON_DECLARATION_KEY:
+                exact = any(
+                    _job_matches_spec(job, self._snapshot_spec(), require_enabled=enabled)
+                    for enabled in (True, False)
+                )
+            elif key == INITIAL_CRON_DECLARATION_KEY:
+                exact = any(
+                    self._initial_job_matches(job, enabled=enabled)
+                    for enabled in (True, False)
+                )
+            else:
+                exact = False
+            if not exact:
+                raise RuntimeError("Legacy v3 managed cron authority drifted")
+        attributable = target_set | managed_set
+        unexplained_managed = [
+            job for job in current_jobs
+            if job.get("declarationKey") in MANAGED_CRON_KEYS
+            and str(job["id"]) not in attributable
+        ]
+        if unexplained_managed:
+            raise RuntimeError(
+                "Legacy v3 rollback found an unattributed managed cron; manual review required"
+            )
+        return attributable, upgraded_unknown_hashes
+
+    def _nonce_rollback_removal_authority(
+        self,
+        transaction: dict[str, Any],
+        current_jobs: list[dict[str, Any]],
+        prior_definitions: list[dict[str, Any]],
+    ) -> set[str]:
+        """Bind nonce-era deletion authority to the complete durable receipt graph."""
+        self._validate_replacement_receipt_graph(transaction)
+        target_ids = transaction.get("cronTargetIdsBefore")
+        managed_ids = transaction.get("managedCronIdsAfter")
+        inventory_before = transaction.get("cronInventoryHashesBefore")
+        unknown_before = transaction.get("cronUnknownHashesBefore")
+        if transaction.get("cronContractHashVersion") != CRON_CONTRACT_HASH_VERSION \
+                or not isinstance(target_ids, list) or not isinstance(managed_ids, list) \
+                or any(
+                    not isinstance(value, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(value)
+                    for value in [*target_ids, *managed_ids]
+                ) \
+                or len(target_ids) != len(set(target_ids)) \
+                or len(managed_ids) != len(set(managed_ids)) \
+                or not isinstance(inventory_before, dict) \
+                or not isinstance(unknown_before, dict) \
+                or any(
+                    not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                    or not isinstance(fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                    for receipt in (inventory_before, unknown_before)
+                    for job_id, fingerprint in receipt.items()
+                ):
+            raise RuntimeError("Nonce rollback cron receipt graph is malformed")
+
+        definitions_by_id: dict[str, dict[str, Any]] = {}
+        for definition in prior_definitions:
+            job_id = definition.get("id")
+            if not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id) \
+                    or job_id in definitions_by_id:
+                raise RuntimeError("Nonce rollback definition identity is malformed")
+            definitions_by_id[job_id] = definition
+        target_set = set(target_ids)
+        managed_set = set(managed_ids)
+        if target_set != set(definitions_by_id) \
+                or set(inventory_before) != target_set | set(unknown_before) \
+                or target_set & set(unknown_before) \
+                or managed_set & set(inventory_before):
+            raise RuntimeError("Nonce rollback cron receipt graph is inconsistent")
+        for job_id, definition in definitions_by_id.items():
+            if inventory_before.get(job_id) != _job_contract_hash(
+                definition, include_id=True,
+            ):
+                raise RuntimeError("Nonce rollback definition fingerprint drifted")
+
+        staging_intents = self._validated_cron_intent_receipts(
+            transaction, "cronStagingIntents",
+        )
+        checkpointed_ids = {
+            intent["jobId"] for intent in staging_intents.values()
+            if isinstance(intent.get("jobId"), str)
+        }
+        if managed_set != checkpointed_ids \
+                or len(checkpointed_ids) != len([
+                    intent for intent in staging_intents.values()
+                    if isinstance(intent.get("jobId"), str)
+                ]) \
+                or checkpointed_ids & set(inventory_before):
+            raise RuntimeError("Nonce rollback staging id authority is inconsistent")
+        for intent in staging_intents.values():
+            self._managed_intent_lifecycle_contracts(intent)
+
+        definitions_by_key = {
+            str(definition["declarationKey"]): definition
+            for definition in prior_definitions
+        }
+        restore_intents = self._validated_cron_intent_receipts(
+            transaction, "cronRestoreIntents",
+        )
+        if not set(restore_intents).issubset(definitions_by_key):
+            raise RuntimeError("Nonce rollback restore intent is outside prior definitions")
+        restored_receipt = transaction.get("restoredCronIdsByDeclaration", {})
+        if not isinstance(restored_receipt, dict) or any(
+            not isinstance(key, str) or key not in definitions_by_key
+            or not isinstance(value, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(value)
+            for key, value in restored_receipt.items()
+        ):
+            raise RuntimeError("Nonce rollback restored-id receipt is malformed")
+        restore_ids: set[str] = set()
+        for declaration_key, intent in restore_intents.items():
+            definition = definitions_by_key[declaration_key]
+            allowed_restore_fields = {
+                "schema", "declarationKey", "role", "stagingName", "canonicalName",
+                "canonicalDescription", "preAlertContractSha256", "jobId", "configured",
+            }
+            staging_name = intent.get("stagingName")
+            if set(intent) - allowed_restore_fields \
+                    or "configured" in intent and intent.get("configured") is not True \
+                    or intent.get("canonicalName") != definition.get("name") \
+                    or intent.get("canonicalDescription") != definition.get("description") \
+                    or not isinstance(staging_name, str) \
+                    or re.fullmatch(
+                        r"qwen-restore-stage-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                        staging_name,
+                    ) is None \
+                    or intent.get("preAlertContractSha256") != _staging_contract_hash(
+                        self._restore_pre_alert_definition(definition, staging_name)
+                    ):
+                raise RuntimeError("Nonce rollback restore intent semantic receipt drifted")
+            job_id = intent.get("jobId")
+            if isinstance(job_id, str):
+                if job_id in set(inventory_before) | checkpointed_ids | restore_ids \
+                        or restored_receipt.get(declaration_key) != job_id:
+                    raise RuntimeError("Nonce rollback restore id authority is inconsistent")
+                restore_ids.add(job_id)
+            elif declaration_key in restored_receipt:
+                raise RuntimeError("Nonce rollback restore id receipt lacks its intent id")
+        if set(restored_receipt) != {
+            key for key, intent in restore_intents.items()
+            if isinstance(intent.get("jobId"), str)
+        } or len(set(restored_receipt.values())) != len(restored_receipt):
+            raise RuntimeError("Nonce rollback restored-id receipt is inconsistent")
+
+        current_by_id = {str(job["id"]): job for job in current_jobs}
+        for job_id, definition in definitions_by_id.items():
+            current = current_by_id.get(job_id)
+            if current is None:
+                continue
+            disabled = json.loads(json.dumps(definition))
+            disabled["enabled"] = False
+            actual = _job_contract_hash(current, include_id=True)
+            if actual not in {
+                inventory_before[job_id],
+                _job_contract_hash(disabled, include_id=True),
+            }:
+                raise RuntimeError("Nonce rollback original cron identity was reused or drifted")
+
+        removable_ids = target_set | checkpointed_ids
+        for intent in staging_intents.values():
+            job_id = intent.get("jobId")
+            if isinstance(job_id, str):
+                current = current_by_id.get(job_id)
+                if current is not None and not self._managed_intent_lifecycle_matches(
+                    current, intent,
+                ):
+                    raise RuntimeError(
+                        "Nonce rollback checkpointed cron identity was reused or drifted"
+                    )
+                continue
+            candidate = self._uncheckpointed_intent_candidate(intent, current_jobs)
+            if candidate is not None:
+                candidate_id = self._validate_intent_candidate_authority(
+                    transaction, intent, candidate,
+                )
+                if not self._managed_intent_lifecycle_matches(candidate, intent):
+                    raise RuntimeError("Nonce rollback uncheckpointed cron lifecycle drifted")
+                removable_ids.add(candidate_id)
+
+        for declaration_key, intent in restore_intents.items():
+            definition = definitions_by_key[declaration_key]
+            job_id = intent.get("jobId")
+            if isinstance(job_id, str):
+                current = current_by_id.get(job_id)
+                if current is not None and not self._restore_lifecycle_matches(
+                    current, definition, intent["stagingName"],
+                ):
+                    raise RuntimeError(
+                        "Nonce rollback restored cron identity was reused or drifted"
+                    )
+                continue
+            candidate = self._uncheckpointed_restore_intent_candidate(intent, current_jobs)
+            if candidate is not None:
+                candidate_id = self._validate_intent_candidate_authority(
+                    transaction, intent, candidate,
+                )
+                if candidate_id in removable_ids or candidate_id in restore_ids:
+                    raise RuntimeError("Nonce rollback restore candidate identity overlaps authority")
+                restore_ids.add(candidate_id)
+
+        for job_id, fingerprint in unknown_before.items():
+            current = current_by_id.get(job_id)
+            if current is None or _job_contract_hash(current, include_id=True) != fingerprint:
+                raise RuntimeError("Nonce rollback unknown cron receipt drifted")
+
+        allowed_ids = set(unknown_before) | target_set | removable_ids | restore_ids
+        if set(current_by_id) - allowed_ids:
+            raise RuntimeError("Nonce rollback inventory contains an unattributed cron job")
+        baseline = self._inventory_hashes(current_jobs)
+        if self._inventory_hashes(self._inventory()) != baseline:
+            raise RuntimeError("Nonce rollback inventory changed after authority validation")
+        return removable_ids
+
+    def _remove_cron_ids_with_snapshot_guard(
+        self, current_jobs: list[dict[str, Any]], removable_ids: set[str],
+    ) -> None:
+        """Remove exact IDs only while every remaining contract matches the validated snapshot."""
+        remaining = self._inventory_hashes(current_jobs)
+        if self._inventory_hashes(self._inventory()) != remaining:
+            raise RuntimeError("Cron removal snapshot changed before mutation")
+        for job_id in sorted(removable_ids & set(remaining)):
+            fresh_inventory = self._inventory()
+            if self._inventory_hashes(fresh_inventory) != remaining:
+                raise RuntimeError("Cron removal snapshot drifted before exact-id deletion")
+            fresh_by_id = {str(job["id"]): job for job in fresh_inventory}
+            target = fresh_by_id.get(job_id)
+            if target is None or _job_contract_hash(
+                target, include_id=True,
+            ) != remaining[job_id]:
+                raise RuntimeError("Cron removal target contract drifted before exact-id deletion")
+            if target.get("enabled") is not False:
+                raise RuntimeError("Cron removal target is not disabled before exact-id deletion")
+            if self._runtime_job_active(target):
+                raise RuntimeError("Cron removal target became active before exact-id deletion")
+            self.cli.run(["cron", "rm", job_id])
+            remaining.pop(job_id)
+            if self._inventory_hashes(self._inventory()) != remaining:
+                raise RuntimeError("Cron removal changed more than its exact authorized id")
+
     def _rollback_locked(self, *, require_exact_post_config: bool = True) -> dict[str, Any]:
         transaction = self.store.read()
+        activation_fail_safe = transaction.get("activationFailSafeRequired")
+        if activation_fail_safe is not None and type(activation_fail_safe) is not bool:
+            raise RuntimeError("Activation fail-safe durable marker is malformed")
+        if activation_fail_safe is True:
+            self._disable_uncommitted_managed_jobs_for_activation_failure(transaction)
+            transaction = self.store.read()
+        replacement_graph = self._validate_replacement_receipt_graph(transaction)
+        rollback_origin_phase: str | None = None
+        if replacement_graph:
+            if transaction.get("phase") in {"failed", "rollback_failed"}:
+                rollback_origin_phase = transaction.get("failurePhase")
+            elif transaction.get("phase") == "rolled_back":
+                rollback_origin_phase = transaction.get("rollbackOriginPhase")
+            else:
+                rollback_origin_phase = transaction.get("phase")
         self._snapshot_root_from_transaction(transaction)
         project_root = self._project_root_from_transaction(transaction)
         config = Path(transaction["configPath"])
@@ -5206,16 +8240,26 @@ class IntegrationManager:
         prepared_assets = self._preflight_rollback_assets(
             transaction, snapshot_path.parent,
         )
+        self._preflight_created_snapshot_artifacts(transaction)
         if require_exact_post_config and transaction.get("postConfigSha256") and \
                 self._sha256_config(config) != transaction["postConfigSha256"]:
             raise RuntimeError("OpenClaw config drifted after integration; refusing automatic rollback")
         prior_cron_definitions: list[dict[str, Any]] = []
         restored_cron_ids: list[str] = []
-        cron_mutation_started = transaction.get("cronMutationStarted") is True
-        runtime_mutation_started = transaction.get("runtimeMutationStarted") is True
+        if type(transaction.get("cronMutationStarted")) is not bool \
+                or type(transaction.get("runtimeMutationStarted")) is not bool:
+            raise RuntimeError("Rollback mutation markers are missing or malformed")
+        cron_mutation_started = transaction["cronMutationStarted"]
+        runtime_mutation_started = transaction["runtimeMutationStarted"]
+        if runtime_mutation_started and not cron_mutation_started:
+            raise RuntimeError("Rollback mutation marker ordering is inconsistent")
+        cron_jobs_before_rollback: list[dict[str, Any]] | None = None
+        cron_removable_ids: set[str] = set()
         unknown_hashes_before = transaction.get("cronUnknownHashesBefore", {})
         if not isinstance(unknown_hashes_before, dict) or any(
-            not isinstance(key, str) or not isinstance(value, str) or len(value) != 64
+            not isinstance(key, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(key)
+            or not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
             for key, value in unknown_hashes_before.items()
         ):
             raise RuntimeError("Rollback unknown-cron receipt is malformed")
@@ -5224,6 +8268,47 @@ class IntegrationManager:
             if not isinstance(raw_definitions, list) or any(not isinstance(item, dict) for item in raw_definitions):
                 raise RuntimeError("Rollback cron receipt is malformed")
             prior_cron_definitions = [_job_definition(item) for item in raw_definitions]
+            restore_keys = [definition.get("declarationKey") for definition in prior_cron_definitions]
+            if any(not isinstance(key, str) or not key for key in restore_keys) \
+                    or len(restore_keys) != len(set(restore_keys)):
+                raise RuntimeError("Rollback cron declaration receipt is malformed")
+            existing_restore_intents = self._validated_cron_intent_receipts(
+                transaction, "cronRestoreIntents",
+            )
+            if not set(existing_restore_intents).issubset(set(restore_keys)):
+                raise RuntimeError("Rollback restore intent is outside durable definitions")
+        if cron_mutation_started \
+                and transaction.get("contractVersion") == INTEGRATION_CONTRACT_VERSION:
+            cron_jobs_before_rollback = self._inventory()
+            if "cronStagingIntents" in transaction:
+                cron_removable_ids = self._nonce_rollback_removal_authority(
+                    transaction, cron_jobs_before_rollback, prior_cron_definitions,
+                )
+            else:
+                cron_removable_ids, unknown_hashes_before = (
+                    self._legacy_v3_removable_cron_ids(
+                        transaction, cron_jobs_before_rollback, prior_cron_definitions,
+                    )
+                )
+        elif not cron_mutation_started:
+            inventory_before = transaction.get("cronInventoryHashesBefore")
+            if not isinstance(inventory_before, dict) or any(
+                not isinstance(job_id, str) or not SAFE_CRON_JOB_ID_RE.fullmatch(job_id)
+                or not isinstance(fingerprint, str)
+                or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                for job_id, fingerprint in inventory_before.items()
+            ):
+                raise RuntimeError("Rollback non-mutation cron receipt is malformed")
+            if self._inventory_hashes(self._inventory()) != inventory_before:
+                raise RuntimeError("Cron inventory changed before rollback could start")
+
+        if cron_mutation_started:
+            if transaction.get("contractVersion") == INTEGRATION_CONTRACT_VERSION:
+                if cron_jobs_before_rollback is None:
+                    raise RuntimeError("Rollback cron authority was not prevalidated")
+                cron_jobs_before_rollback = self._quiesce_rollback_removals(
+                    cron_jobs_before_rollback, cron_removable_ids,
+                )
         if runtime_mutation_started:
             precise_markers = any(
                 field in transaction for field in (
@@ -5326,36 +8411,38 @@ class IntegrationManager:
                 self.cli.run(["gateway", "restart", "--safe", "--json"], timeout=300)
         if cron_mutation_started:
             if transaction.get("contractVersion") == INTEGRATION_CONTRACT_VERSION:
-                current_jobs = self._inventory()
-                target_ids_before = transaction.get("cronTargetIdsBefore", [])
-                managed_ids_after = transaction.get("managedCronIdsAfter", [])
-                if not isinstance(target_ids_before, list) or not isinstance(managed_ids_after, list):
-                    raise RuntimeError("Rollback cron target receipt is malformed")
-                removable_ids = {
-                    *(str(value) for value in target_ids_before),
-                    *(str(value) for value in managed_ids_after),
-                }
-                for job in current_jobs:
-                    job_id = str(job["id"])
-                    if job.get("declarationKey") in MANAGED_CRON_KEYS | {LEGACY_SNAPSHOT_DECLARATION_KEY} \
-                            or job_id in removable_ids:
-                        self.cli.run(["cron", "rm", job_id])
+                if cron_jobs_before_rollback is None:
+                    raise RuntimeError("Rollback cron authority was not prevalidated")
+                self._remove_cron_ids_with_snapshot_guard(
+                    cron_jobs_before_rollback, cron_removable_ids,
+                )
             else:
                 if transaction.get("cronId"):
                     self.cli.run(["cron", "rm", str(transaction["cronId"])], check=False)
                 if transaction.get("initialIndexJobId"):
-                    self.cli.run(["cron", "rm", str(transaction["initialIndexJobId"])], check=False)
-            restored_cron_ids = [self._restore_cron_definition(item) for item in prior_cron_definitions]
+                    self.cli.run(
+                        ["cron", "rm", str(transaction["initialIndexJobId"])], check=False,
+                    )
+            restored_cron_ids = [
+                self._restore_cron_definition(item, transaction)
+                for item in prior_cron_definitions
+            ]
             self._verify_rollback_cron_state(
                 prior_definitions=prior_cron_definitions,
                 restored_ids=restored_cron_ids,
                 unknown_hashes_before=unknown_hashes_before,
+                force_disabled=True,
             )
-        elif transaction.get("cronInventoryHashesBefore"):
-            if self._inventory_hashes(self._inventory()) != transaction["cronInventoryHashesBefore"]:
-                raise RuntimeError("Cron inventory changed before rollback could start")
-        transaction["restoredCronIds"] = restored_cron_ids
+            transaction["restoredCronIds"] = restored_cron_ids
+            self.store.write(transaction)
         self._remove_created_snapshot_artifacts(transaction)
+        if cron_mutation_started:
+            self._activate_restored_cron_definitions(
+                prior_definitions=prior_cron_definitions,
+                restored_ids=restored_cron_ids,
+                unknown_hashes_before=unknown_hashes_before,
+            )
+        transaction["restoredCronIds"] = restored_cron_ids
         quarantined = [
             resource for resource in (
                 "indexLock", "snapshotLock", "projectRoot", "snapshotRoot",
@@ -5378,6 +8465,10 @@ class IntegrationManager:
         transaction["rollbackOutcome"] = (
             "restored_with_preserved_artifacts" if quarantined or preserved else "restored_exactly"
         )
+        if transaction.get("activationFailSafeRequired") is True:
+            transaction["activationFailSafeRequired"] = False
+        if replacement_graph:
+            transaction["rollbackOriginPhase"] = rollback_origin_phase
         transaction["phase"] = "rolled_back"
         self.store.write(transaction)
         return {
