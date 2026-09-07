@@ -179,7 +179,8 @@ but do not replace independent review or authorize live mutation.
   non-CAS final read-to-`rm` race. Mitigations are the integration lock, complete
   immediate inventory re-read, exact target hash, disabled/inactive checks, and
   a controlled window with no external managed-cron mutation.
-- `COMMIT`: pending exact-reviewed local commit.
+- `COMMIT`: exact-reviewed implementation candidate `9f14f61`; this security
+  closeout record is committed separately after recording that immutable hash.
 - `RELEASE_DECISION`: `LOCAL_COMMIT_PASS`; live integration remains
   `HUMAN_GATE`. No live cron mutation, deployment, or customer-data mutation is
   authorized by this closeout.
