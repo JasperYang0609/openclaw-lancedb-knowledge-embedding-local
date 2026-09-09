@@ -87,4 +87,8 @@ python3 openclaw-lancedb-knowledge-local/scripts/bootstrap_openclaw_lancedb.py \
 
 Then run `npm test`, `npm run scan`, `npm run index`, and `npm run search -- "your query"`. The default table, data directory, cache identity and state are Qwen-specific and do not reuse Gemini vectors.
 
+## Development CI policy
+
+Before pushing, accumulate a reviewable change and run `bash scripts/check_push.sh`. Non-main branches run the same focused Branch Check on GitHub. Pull requests and `main` run the complete CI suite. When a branch already has an open pull request, the branch workflow exits after a read-only PR lookup so the same commit is not tested twice. Newer runs cancel older runs on the same branch or pull request; genuine failures remain visible and notified.
+
 Historical Qwen/Gemini comparison reports under `docs/reports/` are selection evidence only; they are not runtime dependencies.
